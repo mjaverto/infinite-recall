@@ -38,6 +38,30 @@ async fn get_pending_work(pool: &crate::db::SqlitePool) -> Value {
 
     // Fetch from DB on a blocking thread.
     let result = with_conn(pool, |c| {
+        // The `pending_work` table is created by the Swift app's GRDB
+        // migration (commit c0d94a2). The Rust API opens the DB read-only,
+        // so until the app has launched once with the new code, the table
+        // doesn't exist. Detect that case explicitly and return zeros with
+        // `"migrated": false` so the health endpoint stays useful — bubbling
+        // up "no such table" as "query failed" hides the real status.
+        let table_exists: bool = c
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_work'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !table_exists {
+            return Ok(json!({
+                "queued":  0,
+                "claimed": 0,
+                "failed":  0,
+                "dead":    0,
+                "oldest_queued_seconds": null,
+                "migrated": false,
+            }));
+        }
+
         // Status counts.
         let mut queued: i64 = 0;
         let mut claimed: i64 = 0;
@@ -96,6 +120,7 @@ async fn get_pending_work(pool: &crate::db::SqlitePool) -> Value {
             "failed":  failed,
             "dead":    dead,
             "oldest_queued_seconds": oldest_sec,
+            "migrated": true,
         }))
     })
     .await;
