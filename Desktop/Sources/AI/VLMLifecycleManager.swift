@@ -76,7 +76,7 @@ final class VLMLifecycleManager: ObservableObject {
   func refreshSync() {
     let fm = FileManager.default
     self.agentInstalled = fm.fileExists(atPath: Self.installedPlistURL.path)
-    self.modelPresent = fm.fileExists(atPath: Self.defaultModelCacheURL.path)
+    self.modelPresent = Self.installedCacheURL(for: Self.activeModelID) != nil
     self.hasRefreshedAtLeastOnce = true
   }
 
@@ -105,8 +105,37 @@ final class VLMLifecycleManager: ObservableObject {
   // MARK: - Per-model install state
 
   func isModelInstalled(modelId: String) -> Bool {
-    FileManager.default.fileExists(
-      atPath: Self.modelCacheURL(for: modelId).path)
+    Self.installedCacheURL(for: modelId) != nil
+  }
+
+  // MARK: - Disk-size + delete helpers
+  //
+  // Vision models follow the same on-disk layout as text models, so we share
+  // `MLXLifecycleManager`'s implementation rather than duplicating the
+  // FileManager.enumerator walk.
+
+  /// Both possible on-disk locations for `modelId`. Mirrors the text tier so
+  /// vision and text caches share a single defensive guard.
+  static func candidateCacheURLs(for modelId: String) -> [URL] {
+    MLXLifecycleManager.candidateCacheURLs(for: modelId)
+  }
+
+  static func installedCacheURL(for modelId: String) -> URL? {
+    MLXLifecycleManager.installedCacheURL(for: modelId)
+  }
+
+  /// Total bytes consumed by a vision model's cache. Delegates to the shared
+  /// helper; same canonical paths apply (HF puts every model under the same
+  /// root regardless of pipeline).
+  static func modelCacheSizeBytes(for modelId: String) -> Int64 {
+    MLXLifecycleManager.modelCacheSizeBytes(for: modelId)
+  }
+
+  /// Recursively delete a vision model's cache. See
+  /// `MLXLifecycleManager.deleteModel(_:)` for the defensive guard.
+  @discardableResult
+  static func deleteModel(_ modelId: String) -> Bool {
+    MLXLifecycleManager.deleteModel(modelId)
   }
 
   // MARK: - launchctl commands

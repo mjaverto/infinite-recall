@@ -101,7 +101,7 @@ final class MLXLifecycleManager: ObservableObject {
   func refreshSync() {
     let fm = FileManager.default
     self.agentInstalled = fm.fileExists(atPath: Self.installedPlistURL.path)
-    self.modelPresent = fm.fileExists(atPath: Self.defaultModelCacheURL.path)
+    self.modelPresent = Self.installedCacheURL(for: Self.activeModelID) != nil
     self.hasRefreshedAtLeastOnce = true
   }
 
@@ -137,8 +137,116 @@ final class MLXLifecycleManager: ObservableObject {
   /// for the default model. Doesn't validate that the snapshot is complete
   /// or unbroken; HF's `snapshot_download` does that lazily on launch.
   func isModelInstalled(modelId: String) -> Bool {
-    FileManager.default.fileExists(
-      atPath: Self.modelCacheURL(for: modelId).path)
+    Self.installedCacheURL(for: modelId) != nil
+  }
+
+  // MARK: - Disk-size + delete helpers
+
+  /// Root directory under which all HF model caches live. Used as a defensive
+  /// guard so `deleteModel(_:)` will never recurse outside this prefix even
+  /// if a malicious / mistyped model id contains `..` segments.
+  static var modelsCacheRoot: URL {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    return home.appendingPathComponent(".cache/huggingface/hub")
+  }
+
+  /// Alternate `~/Documents/huggingface/models/` layout some users have on
+  /// disk. We check both when computing size / deleting so wherever the
+  /// snapshot landed gets cleaned up.
+  static var alternateModelsCacheRoot: URL {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    return home.appendingPathComponent("Documents/huggingface/models")
+  }
+
+  /// Both possible on-disk locations for `modelId` (canonical HF hub layout
+  /// + the `~/Documents/huggingface/models/` variant).
+  static func candidateCacheURLs(for modelId: String) -> [URL] {
+    let slug = modelId.replacingOccurrences(of: "/", with: "--")
+    return [
+      modelCacheURL(for: modelId),
+      alternateModelsCacheRoot.appendingPathComponent(slug),
+    ]
+  }
+
+  /// First candidate URL that actually exists on disk, or nil if none do.
+  static func installedCacheURL(for modelId: String) -> URL? {
+    let fm = FileManager.default
+    return candidateCacheURLs(for: modelId)
+      .first(where: { fm.fileExists(atPath: $0.path) })
+  }
+
+  /// Total bytes consumed by a model's cache directory. Returns 0 if not
+  /// installed. Walks the directory recursively via `FileManager.enumerator`
+  /// and sums each file's `totalFileAllocatedSize` (falling back to
+  /// `fileSize`). Symlinks are not followed so we don't double-count HF's
+  /// blobs/snapshots structure.
+  static func modelCacheSizeBytes(for modelId: String) -> Int64 {
+    guard let root = installedCacheURL(for: modelId) else { return 0 }
+    return directorySizeBytes(at: root)
+  }
+
+  /// Recursively delete a model's cache directory. Returns true on success.
+  /// Defensive: only deletes paths that resolve inside one of the known
+  /// model cache roots, so a poisoned model id can never escape.
+  @discardableResult
+  static func deleteModel(_ modelId: String) -> Bool {
+    guard let root = installedCacheURL(for: modelId) else { return false }
+    guard isPathInsideKnownCacheRoot(root) else { return false }
+    do {
+      try FileManager.default.removeItem(at: root)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /// Defensive guard: returns true only if `url` is contained inside one of
+  /// the known cache roots. Resolves symlinks before comparing so a symlink
+  /// trick can't smuggle a path elsewhere.
+  static func isPathInsideKnownCacheRoot(_ url: URL) -> Bool {
+    let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
+    let candidates = [
+      modelsCacheRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+      alternateModelsCacheRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+    ]
+    for root in candidates {
+      // Require that resolved is strictly inside root (not equal to it,
+      // not just a prefix-string match).
+      let prefix = root.hasSuffix("/") ? root : root + "/"
+      if resolved.hasPrefix(prefix) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /// Recursively sum file sizes under `root`. Internal — exposed via
+  /// `modelCacheSizeBytes(for:)`. Lives here (rather than free function)
+  /// so `VLMLifecycleManager` can call into it without duplication.
+  static func directorySizeBytes(at root: URL) -> Int64 {
+    let fm = FileManager.default
+    let keys: [URLResourceKey] = [
+      .isRegularFileKey, .totalFileAllocatedSizeKey, .fileSizeKey,
+    ]
+    guard let enumerator = fm.enumerator(
+      at: root,
+      includingPropertiesForKeys: keys,
+      options: [.skipsHiddenFiles],
+      errorHandler: { _, _ in true }
+    ) else { return 0 }
+
+    var total: Int64 = 0
+    for case let url as URL in enumerator {
+      guard let values = try? url.resourceValues(forKeys: Set(keys)),
+            values.isRegularFile == true
+      else { continue }
+      if let allocated = values.totalFileAllocatedSize {
+        total += Int64(allocated)
+      } else if let fileSize = values.fileSize {
+        total += Int64(fileSize)
+      }
+    }
+    return total
   }
 
   // MARK: - Plist regeneration for active model

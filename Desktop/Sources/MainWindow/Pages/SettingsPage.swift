@@ -3,6 +3,23 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
+/// Carrier for the "you just switched models — delete the previous weights?"
+/// confirmation dialog. Snapshotted at switch time so the body text can
+/// reference the right names + size even if the picker re-renders.
+fileprivate struct PostSwitchPrompt: Equatable {
+  let previousModelId: String
+  let previousDisplayName: String
+  let newDisplayName: String
+  let freedBytes: Int64
+}
+
+/// Carrier for the per-row "Delete this model?" confirmation dialog.
+fileprivate struct DeletePrompt: Equatable {
+  let modelId: String
+  let displayName: String
+  let bytes: Int64
+}
+
 /// Settings page that wraps SettingsView with proper dark theme styling for the main window
 struct SettingsPage: View {
   @ObservedObject var appState: AppState
@@ -321,6 +338,30 @@ struct SettingsContentView: View {
   @State private var localModelPickerExpanded: Bool = false
   @State private var localModelPickerSelection: String? = nil
   @State private var localModelSwitchInFlight: Bool = false
+
+  // Post-switch prompt: "Delete the old model to free X GB?". Holds the
+  // previous (now-inactive) model id, the new active id, and the freed-bytes
+  // figure so the dialog body can be specific.
+  @State private var localModelPostSwitchPrompt: PostSwitchPrompt? = nil
+  @State private var localModelPostSwitchDialogVisible: Bool = false
+
+  // Per-row "Delete" confirmation. Holds the id we're about to delete plus
+  // its disk-size-on-delete figure for the dialog body.
+  @State private var localModelDeletePrompt: DeletePrompt? = nil
+  @State private var localModelDeleteDialogVisible: Bool = false
+
+  // True while a delete is in flight (rm -rf of an 18 GB tree takes a couple
+  // seconds — show a spinner in the row).
+  @State private var localModelDeleteInFlightId: String? = nil
+
+  // Transient toast: "Freed 18.0 GB". Cleared after a few seconds.
+  @State private var localModelDeleteToast: String? = nil
+
+  // Cached actual on-disk size per installed model id, populated lazily on
+  // appear + after install/delete. Drives the "Installed · 4.3 GB on disk"
+  // line so we show the *real* size (which can differ from the catalog
+  // approximation by a few hundred MB).
+  @State private var localModelDiskSizes: [String: Int64] = [:]
 
   // MCP API card — expandable response viewer + transient "copied" feedback.
   @State private var mcpAPIShowResponse: Bool = false
@@ -2129,9 +2170,17 @@ struct SettingsContentView: View {
         Image(systemName: "checkmark.circle.fill")
           .scaledFont(size: 11)
           .foregroundColor(OmiColors.success)
-        Text("Installed (\(formatGB(active.approxDiskGB)))")
-          .scaledFont(size: 12)
-          .foregroundColor(OmiColors.textSecondary)
+        // Prefer the real on-disk figure if we've measured it; fall back to
+        // the catalog approximation otherwise.
+        if let bytes = localModelDiskSizes[active.id], bytes > 0 {
+          Text("Installed (\(formatBytes(bytes)) on disk)")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+        } else {
+          Text("Installed (\(formatGB(active.approxDiskGB)))")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+        }
       } else {
         Image(systemName: "exclamationmark.circle")
           .scaledFont(size: 11)
@@ -2197,7 +2246,81 @@ struct SettingsContentView: View {
       if localModelPickerSelection == nil {
         localModelPickerSelection = activeLocalModelID
       }
+      refreshAllLocalModelDiskSizes()
     }
+    .onChange(of: localModelPickerExpanded) { _, expanded in
+      if expanded { refreshAllLocalModelDiskSizes() }
+    }
+    // Post-switch: "Switched to X. Delete previous model Y to free Z?"
+    .confirmationDialog(
+      postSwitchDialogTitle,
+      isPresented: $localModelPostSwitchDialogVisible,
+      titleVisibility: .visible,
+      presenting: localModelPostSwitchPrompt
+    ) { _ in
+      // Default ("first") button is Keep — never auto-delete.
+      Button("Keep", role: .cancel) {
+        localModelPostSwitchPrompt = nil
+      }
+      Button("Delete", role: .destructive) {
+        confirmPostSwitchDelete()
+      }
+    } message: { prompt in
+      Text(
+        "Free \(formatBytes(prompt.freedBytes)) by deleting "
+          + "\(prompt.previousDisplayName). You can re-download from "
+          + "this panel anytime.")
+    }
+    // Per-row delete confirmation.
+    .confirmationDialog(
+      rowDeleteDialogTitle,
+      isPresented: $localModelDeleteDialogVisible,
+      titleVisibility: .visible,
+      presenting: localModelDeletePrompt
+    ) { _ in
+      Button("Cancel", role: .cancel) {
+        localModelDeletePrompt = nil
+      }
+      Button("Delete", role: .destructive) {
+        confirmRowDelete()
+      }
+    } message: { prompt in
+      Text(
+        "This frees \(formatBytes(prompt.bytes)). You can re-download "
+          + "from this panel anytime.")
+    }
+    .overlay(alignment: .bottom) {
+      if let toast = localModelDeleteToast {
+        Text(toast)
+          .scaledFont(size: 12, weight: .medium)
+          .foregroundColor(OmiColors.textPrimary)
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+          .background(
+            RoundedRectangle(cornerRadius: 6)
+              .fill(OmiColors.backgroundTertiary)
+          )
+          .padding(.bottom, 4)
+          .transition(.opacity)
+      }
+    }
+  }
+
+  /// Title for the post-switch dialog. Uses the prompt payload when present.
+  private var postSwitchDialogTitle: String {
+    guard let prompt = localModelPostSwitchPrompt else {
+      return "Delete previous model?"
+    }
+    return "Switched to \(prompt.newDisplayName). "
+      + "Delete \(prompt.previousDisplayName)?"
+  }
+
+  /// Title for the per-row delete dialog.
+  private var rowDeleteDialogTitle: String {
+    guard let prompt = localModelDeletePrompt else {
+      return "Delete model?"
+    }
+    return "Delete \(prompt.displayName)?"
   }
 
   /// One radio-style row for a `LocalModelOption`. Tap the row to "select"
@@ -2244,14 +2367,41 @@ struct SettingsContentView: View {
               Image(systemName: "checkmark.circle.fill")
                 .scaledFont(size: 10)
                 .foregroundColor(OmiColors.success)
-              Text("Installed")
-                .scaledFont(size: 11)
-                .foregroundColor(OmiColors.textSecondary)
+              if let bytes = localModelDiskSizes[option.id], bytes > 0 {
+                Text("Installed · \(formatBytes(bytes)) on disk")
+                  .scaledFont(size: 11)
+                  .foregroundColor(OmiColors.textSecondary)
+              } else {
+                Text("Installed")
+                  .scaledFont(size: 11)
+                  .foregroundColor(OmiColors.textSecondary)
+              }
             }
             if isActive {
               Text("· Currently active")
                 .scaledFont(size: 11)
                 .foregroundColor(OmiColors.textTertiary)
+            }
+            Spacer()
+            // Per-row Delete button: only on non-active installed rows.
+            // Active model can't be deleted while it's selected — user
+            // has to switch first.
+            if !isActive {
+              if localModelDeleteInFlightId == option.id {
+                HStack(spacing: 4) {
+                  ProgressView().controlSize(.small)
+                  Text("Deleting…")
+                    .scaledFont(size: 11)
+                    .foregroundColor(OmiColors.textTertiary)
+                }
+              } else {
+                Button("Delete") {
+                  askDeleteLocalModel(option)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(localModelDeleteInFlightId != nil)
+              }
             }
           } else {
             Text("Not installed")
@@ -2263,8 +2413,8 @@ struct SettingsContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            Spacer()
           }
-          Spacer()
         }
       }
     }
@@ -2307,9 +2457,19 @@ struct SettingsContentView: View {
   /// to point at the new model, reloads the agent, and starts it back up.
   /// All on the main actor since we mutate `@AppStorage` + `@Published`
   /// state via `MLXLifecycleManager`.
+  ///
+  /// On success, if the *previous* model is still installed and is a
+  /// different id, surfaces a confirmation dialog asking the user whether
+  /// to delete the now-stale weights. Default action is "Keep" — we never
+  /// auto-delete.
   private func setActiveModel(_ modelId: String) {
     guard !localModelSwitchInFlight else { return }
     localModelSwitchInFlight = true
+
+    // Snapshot the previous active id BEFORE we mutate `@AppStorage`. We
+    // use this to compute the freed-bytes prompt below.
+    let previousId = activeLocalModelID
+
     Task {
       defer { localModelSwitchInFlight = false }
 
@@ -2336,6 +2496,123 @@ struct SettingsContentView: View {
 
       // 6. Re-poll so the UI reflects the new state.
       await lifecycle.refresh()
+
+      // 7. Refresh on-disk size cache for the new model so the row label
+      //    flips from "Installed" to "Installed · X GB on disk".
+      refreshLocalModelDiskSize(for: modelId)
+
+      // 8. If the *previous* model is still on disk and is a different id,
+      //    prompt the user to free that space. We never auto-delete; the
+      //    dialog defaults to "Keep".
+      if previousId != modelId,
+         lifecycle.isModelInstalled(modelId: previousId)
+      {
+        let bytes = MLXLifecycleManager.modelCacheSizeBytes(for: previousId)
+        let prevName = LocalModelCatalog.option(forId: previousId)?.displayName
+          ?? previousId
+        let newName = LocalModelCatalog.option(forId: modelId)?.displayName
+          ?? modelId
+        localModelPostSwitchPrompt = PostSwitchPrompt(
+          previousModelId: previousId,
+          previousDisplayName: prevName,
+          newDisplayName: newName,
+          freedBytes: bytes)
+        localModelPostSwitchDialogVisible = true
+      }
+    }
+  }
+
+  // MARK: Local Model — disk-size cache + delete plumbing
+
+  /// Re-reads on-disk size for one model id and stores it in
+  /// `localModelDiskSizes`. Cheap (single directory walk) but synchronous —
+  /// callers should hop off the main thread for very large trees if it
+  /// becomes a hot path. 18 GB tree walks in a few hundred ms on SSD.
+  private func refreshLocalModelDiskSize(for modelId: String) {
+    let bytes = MLXLifecycleManager.modelCacheSizeBytes(for: modelId)
+    if bytes > 0 {
+      localModelDiskSizes[modelId] = bytes
+    } else {
+      localModelDiskSizes.removeValue(forKey: modelId)
+    }
+  }
+
+  /// Refreshes on-disk sizes for every catalog entry. Called when the
+  /// picker disclosure expands so we have fresh figures for each row.
+  private func refreshAllLocalModelDiskSizes() {
+    for option in LocalModelCatalog.all {
+      refreshLocalModelDiskSize(for: option.id)
+    }
+  }
+
+  /// Format bytes for display. Wraps `ByteCountFormatter` so we get
+  /// "4.3 GB" / "18.0 GB" with locale-correct separators.
+  private func formatBytes(_ bytes: Int64) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    formatter.allowedUnits = [.useGB, .useMB]
+    return formatter.string(fromByteCount: bytes)
+  }
+
+  /// User confirmed the post-switch delete prompt. Tear down the previous
+  /// model's weights and refresh the picker.
+  private func confirmPostSwitchDelete() {
+    guard let prompt = localModelPostSwitchPrompt else { return }
+    localModelPostSwitchPrompt = nil
+    performLocalModelDelete(
+      modelId: prompt.previousModelId,
+      displayName: prompt.previousDisplayName,
+      bytes: prompt.freedBytes)
+  }
+
+  /// User opened the per-row delete confirmation. Stage state, then flip
+  /// the dialog flag.
+  private func askDeleteLocalModel(_ option: LocalModelOption) {
+    let bytes = MLXLifecycleManager.modelCacheSizeBytes(for: option.id)
+    localModelDeletePrompt = DeletePrompt(
+      modelId: option.id,
+      displayName: option.displayName,
+      bytes: bytes)
+    localModelDeleteDialogVisible = true
+  }
+
+  /// Per-row delete confirmation: actually delete.
+  private func confirmRowDelete() {
+    guard let prompt = localModelDeletePrompt else { return }
+    localModelDeletePrompt = nil
+    performLocalModelDelete(
+      modelId: prompt.modelId,
+      displayName: prompt.displayName,
+      bytes: prompt.bytes)
+  }
+
+  /// Shared delete path. Hops to a background queue for the actual
+  /// `removeItem(at:)` so we don't stall the main thread on big trees.
+  private func performLocalModelDelete(
+    modelId: String, displayName: String, bytes: Int64
+  ) {
+    guard localModelDeleteInFlightId == nil else { return }
+    localModelDeleteInFlightId = modelId
+    Task.detached(priority: .userInitiated) {
+      let ok = MLXLifecycleManager.deleteModel(modelId)
+      await MainActor.run {
+        self.localModelDeleteInFlightId = nil
+        self.refreshLocalModelDiskSize(for: modelId)
+        self.mlxLifecycle.refreshSync()
+        if ok {
+          self.localModelDeleteToast = "Freed \(self.formatBytes(bytes))"
+          // Auto-clear the toast after 3 seconds.
+          Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if self.localModelDeleteToast == "Freed \(self.formatBytes(bytes))" {
+              self.localModelDeleteToast = nil
+            }
+          }
+        } else {
+          self.localModelDeleteToast =
+            "Couldn't delete \(displayName). See logs."
+        }
+      }
     }
   }
 
