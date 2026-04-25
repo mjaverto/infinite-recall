@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Infinite Recall — launchd agent template for mlx-lm.server.
+  Placeholders are replaced by scripts/setup-mlx-server.sh:
+    __USER_HOME__  -> $HOME
+    __UV_BIN__     -> absolute path to `uv`
+    __MODEL__      -> Hugging Face model id
+    __HOST__       -> bind host (default 127.0.0.1)
+    __PORT__       -> bind port (default 8080)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.infiniterecall.mlx</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_BIN__</string>
+    <string>tool</string>
+    <string>run</string>
+    <string>--from</string>
+    <string>mlx-lm</string>
+    <string>mlx_lm.server</string>
+    <string>--model</string>
+    <string>__MODEL__</string>
+    <string>--host</string>
+    <string>__HOST__</string>
+    <string>--port</string>
+    <string>__PORT__</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>__USER_HOME__/Library/Logs/InfiniteRecall/mlx.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__USER_HOME__/Library/Logs/InfiniteRecall/mlx.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
