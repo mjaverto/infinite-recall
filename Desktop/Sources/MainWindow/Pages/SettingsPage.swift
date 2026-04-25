@@ -6545,11 +6545,19 @@ struct SettingsContentView: View {
   }
 
   private func toggleTranscription(enabled: Bool) {
-    // Check microphone permission
-    if enabled && !appState.hasMicrophonePermission {
-      transcriptionError = "Microphone permission required"
-      isTranscribing = false
-      return
+    // Check microphone permission — refresh from OS first because the cached
+    // state may be stale when onboarding was skipped (Infinite Recall fork
+    // boots straight into the main UI without the onboarding mic prompt).
+    if enabled {
+      appState.checkMicrophonePermission()
+      if !appState.hasMicrophonePermission {
+        // Fire the OS prompt if status is .notDetermined; no-op if already
+        // .denied (user must grant via System Settings → Privacy → Microphone).
+        appState.requestMicrophonePermission()
+        transcriptionError = "Click again after granting microphone access"
+        isTranscribing = false
+        return
+      }
     }
 
     transcriptionError = nil
