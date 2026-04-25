@@ -124,26 +124,12 @@ struct SettingsSearchItem: Identifiable {
 
     // Privacy
     SettingsSearchItem(
-      name: "Privacy", subtitle: "Control your data and privacy settings",
-      keywords: ["data", "encryption", "cloud sync", "recordings"], section: .privacy,
-      icon: "lock.shield", settingId: "privacy.privacy"),
-    SettingsSearchItem(
-      name: "Store Recordings",
-      subtitle: "Allow Infinite Recall to store audio recordings of your conversations",
-      keywords: ["store", "save recordings", "audio storage"], section: .privacy,
-      icon: "lock.shield", settingId: "privacy.storerecordings"),
-    SettingsSearchItem(
-      name: "Private Cloud Sync", subtitle: "Sync your data securely to your private cloud storage",
-      keywords: ["cloud", "sync", "private cloud"], section: .privacy, icon: "lock.shield",
-      settingId: "privacy.cloudsync"),
-    SettingsSearchItem(
-      name: "Encryption", subtitle: "Server-side encryption for your data",
-      keywords: ["encrypt", "security", "end to end"], section: .privacy, icon: "lock.shield",
-      settingId: "privacy.encryption"),
-    SettingsSearchItem(
-      name: "What We Track", subtitle: "View analytics and telemetry data we collect",
-      keywords: ["tracking", "analytics", "telemetry", "data collection"], section: .privacy,
-      icon: "lock.shield", settingId: "privacy.tracking"),
+      name: "Privacy", subtitle: "Local-first storage on this Mac",
+      keywords: [
+        "privacy", "local", "local-first", "data location", "filevault", "encryption", "no cloud",
+        "no sync", "no telemetry",
+      ], section: .privacy,
+      icon: "lock.shield", settingId: "privacy.localfirst"),
 
     // Account
     SettingsSearchItem(
