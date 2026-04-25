@@ -82,9 +82,10 @@ struct SettingsSearchItem: Identifiable {
       subtitle: "Improve recognition of names, brands, and technical terms",
       keywords: ["vocabulary", "words", "custom words", "dictionary"], section: .transcription,
       icon: "waveform", settingId: "transcription.vocabulary"),
+    // Infinite Recall fork: dropped "deepgram"/"cost" keywords — local-only WhisperKit.
     SettingsSearchItem(
-      name: "Local VAD Gate", subtitle: "Skip silence to reduce transcription cost",
-      keywords: ["vad", "silence", "gate", "cost", "deepgram"], section: .transcription,
+      name: "Local VAD Gate", subtitle: "Skip silence in local transcription",
+      keywords: ["vad", "silence", "gate"], section: .transcription,
       icon: "waveform", settingId: "transcription.vadgate"),
 
     // Notifications
@@ -148,14 +149,7 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["local", "mlx", "qwen", "model", "server", "launchd", "download"],
       section: .aiModels, icon: "cpu", settingId: "ai.localmodel"),
 
-    // Account
-    SettingsSearchItem(
-      name: "Account", subtitle: "Your profile and email", keywords: ["profile", "email"],
-      section: .account, icon: "person.circle", settingId: "account.account"),
-    SettingsSearchItem(
-      name: "Sign Out", subtitle: "Sign out of your Infinite Recall account",
-      keywords: ["sign out", "log out", "logout", "signout"], section: .account,
-      icon: "person.circle", settingId: "account.signout"),
+    // Infinite Recall fork: removed Account search items — no accounts in local-first build.
 
     // About
     SettingsSearchItem(
@@ -171,18 +165,12 @@ struct SettingsSearchItem: Identifiable {
       subtitle: "Automatically download and install updates when available",
       keywords: ["auto install", "automatic install", "download updates", "install updates"],
       section: .about, icon: "info.circle", settingId: "about.autoinstall"),
-    SettingsSearchItem(
-      name: "Update Channel", subtitle: "Choose between stable and beta update channels",
-      keywords: ["channel", "beta", "stable", "release channel"], section: .about,
-      icon: "info.circle", settingId: "about.channel"),
+    // Infinite Recall fork: removed Beta update-channel picker (Sparkle is disabled at runtime).
     SettingsSearchItem(
       name: "Version Info", subtitle: "Current app version and build number",
       keywords: ["version", "build", "app version", "build number"], section: .about,
       icon: "info.circle", settingId: "about.version"),
-    SettingsSearchItem(
-      name: "Report an Issue", subtitle: "Help us improve Infinite Recall",
-      keywords: ["bug", "feedback", "report", "issue"], section: .about, icon: "info.circle",
-      settingId: "about.reportissue"),
+    // Infinite Recall fork: removed "Report an Issue" — was a Send-to-Omi feedback form.
 
     // Advanced subsections
     SettingsSearchItem(
@@ -281,10 +269,7 @@ struct SettingsSearchItem: Identifiable {
       name: "Launch at Login", subtitle: "Start Infinite Recall automatically when you log in",
       keywords: ["startup", "login", "boot"], section: .advanced, icon: "slider.horizontal.3",
       settingId: "advanced.preferences.launchatlogin"),
-    SettingsSearchItem(
-      name: "Report Issue", subtitle: "Send app logs and report a problem",
-      keywords: ["bug", "feedback", "logs", "report"], section: .advanced,
-      icon: "wrench.and.screwdriver", settingId: "advanced.troubleshooting.reportissue"),
+    // Infinite Recall fork: removed Report-Issue search entry (no upstream to send logs to).
     SettingsSearchItem(
       name: "Rescan Files", subtitle: "Re-index your files and update your AI profile",
       keywords: ["index", "reindex", "rescan", "files", "scan", "file indexing", "profile"],
@@ -305,6 +290,7 @@ struct SettingsSidebar: View {
 
   private let expandedWidth: CGFloat = 260
   private let iconWidth: CGFloat = 20
+  // Infinite Recall fork: removed `.account` — no accounts in local-first build.
   private let visibleSections: [SettingsContentView.SettingsSection] = [
     .general,
     .rewind,
@@ -312,7 +298,6 @@ struct SettingsSidebar: View {
     .notifications,
     .privacy,
     .aiModels,
-    .account,
     .floatingBar,
     .shortcuts,
     .advanced,

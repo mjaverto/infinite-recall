@@ -464,10 +464,9 @@ struct SettingsContentView: View {
           privacySection
         case .aiModels:
           aiModelsSection
-        case .account:
-          accountSection
-        case .aiChat:
-          aiChatSection
+        // Infinite Recall fork: redirect orphan `.account` / `.aiChat` selections to General.
+        case .account, .aiChat:
+          generalSection
         case .floatingBar:
           floatingBarSection
         case .shortcuts:
@@ -483,8 +482,12 @@ struct SettingsContentView: View {
       .animation(.easeInOut(duration: 0.15), value: selectedSection)
     }
     .onAppear {
+      // Infinite Recall fork: redirect deprecated sections (.aiChat, .account) to .advanced / .general.
       if selectedSection == .aiChat {
         selectedSection = .advanced
+      }
+      if selectedSection == .account {
+        selectedSection = .general
       }
       loadBackendSettings()
       loadSubscriptionInfo()
@@ -508,8 +511,13 @@ struct SettingsContentView: View {
       isTranscribing = newValue
     }
     .onChange(of: selectedSection) { _, newValue in
+      // Infinite Recall fork: bounce away from deprecated sections.
       if newValue == .aiChat {
         selectedSection = .advanced
+        return
+      }
+      if newValue == .account {
+        selectedSection = .general
         return
       }
     }
@@ -1254,8 +1262,9 @@ struct SettingsContentView: View {
                 .scaledFont(size: 15, weight: .medium)
                 .foregroundColor(OmiColors.textPrimary)
 
+              // Infinite Recall fork: removed Deepgram/cost copy — local-only WhisperKit.
               Text(
-                "Uses on-device voice activity detection to skip silence, reducing Deepgram API usage. May save ~40% on transcription costs."
+                "Uses on-device voice activity detection to skip silence, reducing CPU and battery cost during long quiet stretches."
               )
               .scaledFont(size: 13)
               .foregroundColor(OmiColors.textTertiary)
@@ -1542,122 +1551,9 @@ struct SettingsContentView: View {
 
   // MARK: - Account Section
 
-  private var accountSection: some View {
-    VStack(spacing: 20) {
-      settingsCard(settingId: "account.account") {
-        VStack(alignment: .leading, spacing: 14) {
-          HStack(spacing: 16) {
-            Image(systemName: "person.circle.fill")
-              .scaledFont(size: 40)
-              .foregroundColor(OmiColors.textTertiary)
-
-            VStack(alignment: .leading, spacing: 4) {
-              Text(AuthService.shared.displayName.isEmpty ? "User" : AuthService.shared.displayName)
-                .scaledFont(size: 16, weight: .semibold)
-                .foregroundColor(OmiColors.textPrimary)
-
-              if let email = AuthState.shared.userEmail {
-                Text(email)
-                  .scaledFont(size: 13)
-                  .foregroundColor(OmiColors.textTertiary)
-              }
-            }
-
-            Spacer()
-
-            Button("Sign Out") {
-              appState.stopTranscription()
-              ProactiveAssistantsPlugin.shared.stopMonitoring()
-              try? AuthService.shared.signOut()
-            }
-            .buttonStyle(.bordered)
-            .disabled(isDeletingAccount)
-          }
-
-          Divider()
-            .overlay(OmiColors.backgroundQuaternary)
-
-          HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-              Text("Delete Account & Data")
-                .scaledFont(size: 15, weight: .semibold)
-                .foregroundColor(OmiColors.error)
-
-              Text(
-                "Permanently deletes server data, clears local data for this account, resets onboarding, and signs you out."
-              )
-              .scaledFont(size: 13)
-              .foregroundColor(OmiColors.textTertiary)
-            }
-
-            Spacer()
-
-            Button(action: {
-              AnalyticsManager.shared.deleteAccountClicked()
-              showDeleteAccountAlert = true
-            }) {
-              if isDeletingAccount {
-                ProgressView()
-                  .controlSize(.small)
-              } else {
-                Text("Delete")
-                  .scaledFont(size: 13, weight: .semibold)
-              }
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(OmiColors.error)
-            .disabled(isDeletingAccount)
-          }
-
-          if let deleteAccountError {
-            Text(deleteAccountError)
-              .scaledFont(size: 12)
-              .foregroundColor(OmiColors.warning)
-          }
-        }
-      }
-      .alert("Delete Account and Data?", isPresented: $showDeleteAccountAlert) {
-        Button("Cancel", role: .cancel) {
-          AnalyticsManager.shared.deleteAccountCancelled()
-        }
-        Button("Delete Permanently", role: .destructive) {
-          deleteAccountAndData()
-        }
-      } message: {
-        Text(
-          "This cannot be undone. Your account, chat history, and all server data will be permanently deleted. Local data for this account will be cleared and you'll return to onboarding."
-        )
-      }
-
-      //            settingsCard {
-      //                HStack(spacing: 16) {
-      //                    Image(systemName: "bolt.fill")
-      //                        .scaledFont(size: 16)
-      //                        .foregroundColor(.yellow)
-      //
-      //                    VStack(alignment: .leading, spacing: 4) {
-      //                        Text("Upgrade to Pro")
-      //                            .scaledFont(size: 15, weight: .medium)
-      //                            .foregroundColor(OmiColors.textPrimary)
-      //
-      //                        Text("Unlock all features and unlimited usage")
-      //                            .scaledFont(size: 13)
-      //                            .foregroundColor(OmiColors.textTertiary)
-      //                    }
-      //
-      //                    Spacer()
-      //
-      //                    Button("Upgrade") {
-      //                        if let url = URL(string: "https://omi.me/pricing") {
-      //                            NSWorkspace.shared.open(url)
-      //                        }
-      //                    }
-      //                    .buttonStyle(.borderedProminent)
-      //                    .tint(OmiColors.purplePrimary)
-      //                }
-      //            }
-    }
-  }
+  // Infinite Recall fork: Account section removed entirely (no accounts, sign-in, billing,
+  // or "Delete Account" in this local-first build). The dispatcher above redirects
+  // any lingering `.account` selection to `.general`.
 
 
   private func openBYOKSettings() {
@@ -3133,8 +3029,10 @@ struct SettingsContentView: View {
       preferencesSubsection
       advancedCategoryHeader(title: "Troubleshooting", icon: "wrench.and.screwdriver")
       troubleshootingSubsection
-      advancedCategoryHeader(title: "Developer API Keys", icon: "key")
-      developerKeysSubsection
+
+      // Infinite Recall fork: removed "Developer API Keys" / BYOK section — keys for
+      // Anthropic and OpenAI now live in the AI / Models section (local-friendly UX).
+      // Gemini + Deepgram aren't used in this local-only build.
 
       advancedCategoryHeader(title: "Dev Tools", icon: "hammer")
       devToolsSubsection
@@ -4828,42 +4726,9 @@ struct SettingsContentView: View {
 
   private var troubleshootingSubsection: some View {
     VStack(spacing: 20) {
-      // Report Issue
-      settingsCard(settingId: "advanced.troubleshooting.reportissue") {
-        HStack(spacing: 16) {
-          Image(systemName: "exclamationmark.bubble")
-            .scaledFont(size: 16)
-            .foregroundColor(OmiColors.textSecondary)
-            .frame(width: 24, height: 24)
-
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Report Issue")
-              .scaledFont(size: 16, weight: .semibold)
-              .foregroundColor(OmiColors.textPrimary)
-
-            Text("Send app logs and report a problem")
-              .scaledFont(size: 13)
-              .foregroundColor(OmiColors.textTertiary)
-          }
-
-          Spacer()
-
-          Button(action: {
-            FeedbackWindow.show(userEmail: AuthState.shared.userEmail)
-          }) {
-            Text("Report")
-              .scaledFont(size: 13, weight: .medium)
-              .foregroundColor(.white)
-              .padding(.horizontal, 14)
-              .padding(.vertical, 6)
-              .background(
-                RoundedRectangle(cornerRadius: 6)
-                  .fill(OmiColors.purplePrimary)
-              )
-          }
-          .buttonStyle(.plain)
-        }
-      }
+      // Infinite Recall fork: removed "Report Issue" card (was FeedbackWindow → Omi
+      // backend). Logs live at ~/Library/Logs/InfiniteRecall — see "Open Logs" in
+      // AI / Models for fast access.
 
       // Rescan Files
       settingsCard(settingId: "advanced.troubleshooting.rescanfiles") {
@@ -5749,14 +5614,14 @@ struct SettingsContentView: View {
           Divider()
             .background(OmiColors.backgroundQuaternary)
 
-          // Links
-          linkRow(title: "Visit Website", url: "https://omi.me")
-          linkRow(title: "Help Center", url: "https://help.omi.me")
+          // Infinite Recall fork: replaced Omi marketing/help/terms links with a single
+          // "Source on GitHub" link, plus the still-bundled local Privacy panel.
+          linkRow(title: "Source on GitHub", url: "https://github.com/mjaverto/infinite-recall")
           Button(action: {
             selectedSection = .privacy
           }) {
             HStack {
-              Text("Privacy Policy")
+              Text("Privacy")
                 .scaledFont(size: 14)
                 .foregroundColor(OmiColors.textSecondary)
 
@@ -5768,7 +5633,15 @@ struct SettingsContentView: View {
             }
           }
           .buttonStyle(.plain)
-          linkRow(title: "Terms of Service", url: "https://omi.me/terms")
+
+          Divider()
+            .background(OmiColors.backgroundQuaternary)
+
+          // Infinite Recall fork: attribution to upstream Omi project (MIT).
+          Text("Forked from Omi — github.com/BasedHardware/omi (MIT). See ATTRIBUTION.md.")
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
         }
       }
 
@@ -5841,78 +5714,13 @@ struct SettingsContentView: View {
             .foregroundColor(OmiColors.textTertiary)
           }
 
-          Divider()
-            .background(OmiColors.backgroundQuaternary)
-
-          settingRow(
-            title: "Update Channel", subtitle: updaterViewModel.updateChannel.description,
-            settingId: "about.channel"
-          ) {
-            Picker(
-              "",
-              selection: Binding(
-                get: { updaterViewModel.updateChannel },
-                set: { newChannel in
-                  // Switching beta → stable with a newer build: confirm first
-                  if updaterViewModel.updateChannel == .beta && newChannel == .stable
-                    && updaterViewModel.isDowngradeToStable
-                  {
-                    showDowngradeAlert = true
-                  } else {
-                    updaterViewModel.updateChannel = newChannel
-                  }
-                }
-              )
-            ) {
-              ForEach(UpdateChannel.allCases, id: \.self) { channel in
-                Text(channel.displayName).tag(channel)
-              }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .frame(width: 100)
-          }
+          // Infinite Recall fork: removed Beta/Stable channel picker — Sparkle is
+          // disabled at runtime in this build, so flipping channels does nothing.
         }
       }
-      .alert("Switch to Stable Channel?", isPresented: $showDowngradeAlert) {
-        Button("Stay on Beta", role: .cancel) {}
-        Button("Switch to Stable") {
-          updaterViewModel.updateChannel = .stable
-          if let url = URL(string: "https://macos.omi.me") {
-            NSWorkspace.shared.open(url)
-          }
-        }
-      } message: {
-        let stableVersion = updaterViewModel.latestStableVersionString ?? "an older version"
-        Text(
-          "You're on a newer beta build (\(updaterViewModel.currentVersion)). The latest stable release is \(stableVersion).\n\nSwitching to Stable means you won't receive new updates until a stable release surpasses your current version. You can also download the stable version now."
-        )
-      }
 
-      settingsCard(settingId: "about.reportissue") {
-        HStack(spacing: 16) {
-          Image(systemName: "exclamationmark.bubble.fill")
-            .scaledFont(size: 16)
-            .foregroundColor(OmiColors.purplePrimary)
-
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Report an Issue")
-              .scaledFont(size: 15, weight: .medium)
-              .foregroundColor(OmiColors.textPrimary)
-
-            Text("Help us improve Infinite Recall")
-              .scaledFont(size: 13)
-              .foregroundColor(OmiColors.textTertiary)
-          }
-
-          Spacer()
-
-          Button("Report") {
-            FeedbackWindow.show(userEmail: AuthState.shared.userEmail)
-          }
-          .buttonStyle(.bordered)
-        }
-      }
+      // Infinite Recall fork: removed "Report an Issue" card — was a Send-to-Omi
+      // feedback form (FeedbackWindow). No upstream to send logs to in a local-only build.
     }
   }
 
@@ -7191,36 +6999,7 @@ struct SettingsContentView: View {
     }
   }
 
-  private func deleteAccountAndData() {
-    guard !isDeletingAccount else { return }
-
-    deleteAccountError = nil
-    isDeletingAccount = true
-    AnalyticsManager.shared.deleteAccountConfirmed()
-
-    Task {
-      do {
-        try await APIClient.shared.deleteAccount()
-        await MainActor.run {
-          appState.stopTranscription()
-          ProactiveAssistantsPlugin.shared.stopMonitoring()
-          do {
-            try AuthService.shared.signOut()
-            isDeletingAccount = false
-          } catch {
-            deleteAccountError =
-              "Account deleted, but sign out failed: \(error.localizedDescription)"
-            isDeletingAccount = false
-          }
-        }
-      } catch {
-        await MainActor.run {
-          deleteAccountError = "Failed to delete account: \(error.localizedDescription)"
-          isDeletingAccount = false
-        }
-      }
-    }
-  }
+  // Infinite Recall fork: deleteAccountAndData() removed — there's no account to delete.
 
 }
 
