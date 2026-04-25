@@ -570,7 +570,7 @@ struct SidebarView: View {
         if !isCollapsed {
           // Text content
           VStack(alignment: .leading, spacing: 2) {
-            Text("Get omi Device")
+            Text("Get Infinite Recall Device")
               .scaledFont(size: 13, weight: .semibold)
               .foregroundColor(OmiColors.textPrimary)
 
@@ -607,7 +607,7 @@ struct SidebarView: View {
       )
     }
     .buttonStyle(.plain)
-    .help(isCollapsed ? "Get omi Device" : "")
+    .help(isCollapsed ? "Get Infinite Recall Device" : "")
   }
 
   // MARK: - Update Available Widget

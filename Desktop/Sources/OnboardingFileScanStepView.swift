@@ -17,7 +17,7 @@ struct OnboardingFileScanStepView: View {
       totalSteps: totalSteps,
       eyebrow: "Discovery",
       title: "Start building your profile.",
-      description: "Omi scans projects and recent files.",
+      description: "Infinite Recall scans projects and recent files.",
       showsSkip: true,
       onSkip: onSkip,
       onForceComplete: onForceComplete

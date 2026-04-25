@@ -31,10 +31,10 @@ struct ShortcutsSettingsSection: View {
   private var askOmiKeyCard: some View {
     VStack(alignment: .leading, spacing: 16) {
       VStack(alignment: .leading, spacing: 4) {
-        Text("Ask omi Shortcut")
+        Text("Ask Infinite Recall Shortcut")
           .scaledFont(size: 16, weight: .semibold)
           .foregroundColor(OmiColors.textPrimary)
-        Text("Global shortcut to open Ask omi from anywhere.")
+        Text("Global shortcut to open Ask Infinite Recall from anywhere.")
           .scaledFont(size: 13)
           .foregroundColor(OmiColors.textSecondary)
       }
@@ -212,7 +212,7 @@ struct ShortcutsSettingsSection: View {
         .foregroundColor(OmiColors.textPrimary)
 
       shortcutRow(
-        label: "Ask omi",
+        label: "Ask Infinite Recall",
         keys: settings.askOmiEnabled ? settings.askOmiShortcut.displayLabel : "Disabled")
       shortcutRow(label: "Toggle floating bar", keys: "\u{2318}\\")
       shortcutRow(

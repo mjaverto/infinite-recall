@@ -154,9 +154,9 @@ struct OnboardingChatView: View {
             .foregroundColor(.white)
             .scaledToFit()
             .frame(width: 52, height: 18)
-            .accessibilityLabel("omi")
+            .accessibilityLabel("Infinite Recall")
         } else {
-          Text("omi")
+          Text("Infinite Recall")
             .font(.system(size: 18, weight: .semibold))
             .foregroundColor(.white)
         }
@@ -491,7 +491,7 @@ struct OnboardingChatView: View {
       Button("Skip anyway", role: .destructive) { onSkip() }
       Button("Continue setup", role: .cancel) {}
     } message: {
-      Text("Omi won't be useful for you if it doesn't know enough about you.")
+      Text("Infinite Recall won't be useful for you if it doesn't know enough about you.")
     }
   }
 
@@ -1563,7 +1563,7 @@ struct OnboardingChatView: View {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
       NSApp.activate()
       for window in NSApp.windows {
-        if window.title.hasPrefix("Omi") {
+        if window.title.hasPrefix("Infinite Recall") {
           window.makeKeyAndOrderFront(nil)
           window.orderFrontRegardless()
         }

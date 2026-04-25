@@ -1497,7 +1497,7 @@ struct SettingsContentView: View {
           privacyToggleRow(
             icon: "mic.fill",
             title: "Store Recordings",
-            subtitle: "Allow omi to store audio recordings of your conversations",
+            subtitle: "Allow Infinite Recall to store audio recordings of your conversations",
             isOn: $recordingPermissionEnabled
           ) { newValue in
             updateRecordingPermission(newValue)
@@ -2016,7 +2016,7 @@ struct SettingsContentView: View {
             .scaledFont(size: 20)
             .foregroundColor(OmiColors.purplePrimary)
           VStack(alignment: .leading, spacing: 2) {
-            Text(APIKeyService.isByokActive ? "Free plan active" : "Use Omi free forever")
+            Text(APIKeyService.isByokActive ? "Free plan active" : "Use Infinite Recall free forever")
               .scaledFont(size: 15, weight: .semibold)
               .foregroundColor(OmiColors.textPrimary)
             Text(
@@ -5263,7 +5263,7 @@ struct SettingsContentView: View {
         Image(systemName: hasAllBYOKKeys ? "checkmark.seal.fill" : "key.fill")
           .foregroundColor(hasAllBYOKKeys ? OmiColors.success : OmiColors.textTertiary)
         VStack(alignment: .leading, spacing: 4) {
-          Text(hasAllBYOKKeys ? "Free plan active" : "Use Omi free forever")
+          Text(hasAllBYOKKeys ? "Free plan active" : "Use Infinite Recall free forever")
             .scaledFont(size: 14, weight: .semibold)
             .foregroundColor(OmiColors.textPrimary)
           Text(
@@ -5688,7 +5688,7 @@ struct SettingsContentView: View {
 
             VStack(alignment: .leading, spacing: 4) {
               HStack(spacing: 6) {
-                Text("omi")
+                Text("Infinite Recall")
                   .scaledFont(size: 18, weight: .bold)
                   .foregroundColor(OmiColors.textPrimary)
 
@@ -5862,7 +5862,7 @@ struct SettingsContentView: View {
               .scaledFont(size: 15, weight: .medium)
               .foregroundColor(OmiColors.textPrimary)
 
-            Text("Help us improve omi")
+            Text("Help us improve Infinite Recall")
               .scaledFont(size: 13)
               .foregroundColor(OmiColors.textTertiary)
           }

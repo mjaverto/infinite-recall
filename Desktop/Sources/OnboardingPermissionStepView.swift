@@ -72,7 +72,7 @@ struct OnboardingPermissionStepView: View {
             .lineSpacing(4)
 
           if permissionType == "screen_recording", appState.isScreenRecordingStale {
-            Text("macOS still isn’t granting screen capture to this build. In Screen & System Audio Recording, toggle Omi Dev off, then on again, then quit and reopen the app.")
+            Text("macOS still isn’t granting screen capture to this build. In Screen & System Audio Recording, toggle Infinite Recall Dev off, then on again, then quit and reopen the app.")
               .font(.system(size: 13, weight: .medium))
               .foregroundColor(OmiColors.warning)
               .fixedSize(horizontal: false, vertical: true)

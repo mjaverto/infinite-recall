@@ -68,7 +68,7 @@ struct OnboardingNotificationStepView: View {
                         .font(.system(size: 24, weight: .bold))
                         .foregroundColor(OmiColors.textPrimary)
 
-                    Text("omi watches your screen and catches things you'd miss —\nwrong recipients, stale data, hidden shortcuts.")
+                    Text("Infinite Recall watches your screen and catches things you'd miss —\nwrong recipients, stale data, hidden shortcuts.")
                         .font(.system(size: 14))
                         .foregroundColor(OmiColors.textSecondary)
                         .multilineTextAlignment(.center)
@@ -95,7 +95,7 @@ struct OnboardingNotificationStepView: View {
                         Image(systemName: "bell.badge.fill")
                             .foregroundColor(Color.white)
                             .font(.system(size: 12))
-                        Text("Notification shown below Ask omi")
+                        Text("Notification shown below Ask Infinite Recall")
                             .font(.system(size: 12))
                             .foregroundColor(OmiColors.textTertiary)
                     }
@@ -160,14 +160,14 @@ struct OnboardingNotificationStepView: View {
                     )
                     .frame(width: 36, height: 36)
 
-                Text("omi")
+                Text("IR")
                     .font(.system(size: 11, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text("omi")
+                    Text("Infinite Recall")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.black)
 

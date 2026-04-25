@@ -173,8 +173,8 @@ struct OnboardingView: View {
           stepIndex: 4,
           totalSteps: OnboardingFlow.introStepCount,
           eyebrow: "Permission",
-          title: "Let Omi read your screen.",
-          description: "Screen Recording lets Omi see what you're working on.",
+          title: "Let Infinite Recall read your screen.",
+          description: "Screen Recording lets Infinite Recall see what you're working on.",
           permissionType: "screen_recording",
           icon: "display.and.arrow.down",
           reasonTitle: "Screen Recording",
@@ -201,8 +201,8 @@ struct OnboardingView: View {
           stepIndex: 5,
           totalSteps: OnboardingFlow.introStepCount,
           eyebrow: "Access",
-          title: "Let Omi scan your work.",
-          description: "File access lets Omi map your projects and files.",
+          title: "Let Infinite Recall scan your work.",
+          description: "File access lets Infinite Recall map your projects and files.",
           permissionType: "full_disk_access",
           icon: "externaldrive.fill.badge.person.crop",
           reasonTitle: "Disk Access",
@@ -245,8 +245,8 @@ struct OnboardingView: View {
           stepIndex: 7,
           totalSteps: OnboardingFlow.introStepCount,
           eyebrow: "Permission",
-          title: "Let Omi use your mic.",
-          description: "Microphone lets Omi transcribe meetings.",
+          title: "Let Infinite Recall use your mic.",
+          description: "Microphone lets Infinite Recall transcribe meetings.",
           permissionType: "microphone",
           icon: "mic.fill",
           reasonTitle: "Microphone",
@@ -271,8 +271,8 @@ struct OnboardingView: View {
           stepIndex: 8,
           totalSteps: OnboardingFlow.introStepCount,
           eyebrow: "Permission",
-          title: "Let Omi see the active app.",
-          description: "Accessibility lets Omi know which app is active.",
+          title: "Let Infinite Recall see the active app.",
+          description: "Accessibility lets Infinite Recall know which app is active.",
           permissionType: "accessibility",
           icon: "figure.wave",
           reasonTitle: "Accessibility",
@@ -298,8 +298,8 @@ struct OnboardingView: View {
           stepIndex: 9,
           totalSteps: OnboardingFlow.introStepCount,
           eyebrow: "Permission",
-          title: "Let Omi act when asked.",
-          description: "Automation lets Omi take actions for you.",
+          title: "Let Infinite Recall act when asked.",
+          description: "Automation lets Infinite Recall take actions for you.",
           permissionType: "automation",
           icon: "bolt.horizontal.circle.fill",
           reasonTitle: "Automation",
@@ -562,7 +562,7 @@ struct OnboardingTrustPreviewCard: View {
           .font(.system(size: 17, weight: .medium))
           .foregroundColor(OmiColors.textSecondary)
           .lineLimit(1)
-        Text("omi protects your data")
+        Text("Infinite Recall protects your data")
           .font(.system(size: 15, weight: .regular))
           .foregroundColor(OmiColors.textTertiary)
           .lineLimit(1)

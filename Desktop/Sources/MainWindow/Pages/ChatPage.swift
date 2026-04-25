@@ -215,7 +215,7 @@ struct ChatPage: View {
         chatProvider.showOmiThresholdAlert = false
       }
     } message: {
-      Text("Upgrade to Omi Pro for $199/month to continue chatting.")
+      Text("Upgrade to Infinite Recall Pro for $199/month to continue chatting.")
     }
     .overlay {
       // Loading overlay when fetching citation
@@ -331,8 +331,8 @@ struct ChatPage: View {
                 .foregroundColor(OmiColors.textTertiary)
             }
           } else {
-            // Default OMI assistant
-            Text("omi")
+            // Default assistant
+            Text("Infinite Recall")
               .scaledFont(size: 14, weight: .medium)
               .foregroundColor(OmiColors.textPrimary)
           }
@@ -501,7 +501,7 @@ struct ChatPage: View {
             .frame(width: 48, height: 48)
         }
 
-        Text("Chat with omi")
+        Text("Chat with Infinite Recall")
           .scaledFont(size: 18, weight: .semibold)
           .foregroundColor(OmiColors.textPrimary)
 
@@ -1380,7 +1380,7 @@ struct DefaultOmiRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
 
-        Text("omi")
+        Text("Infinite Recall")
           .scaledFont(size: 13, weight: .medium)
           .foregroundColor(OmiColors.textPrimary)
 

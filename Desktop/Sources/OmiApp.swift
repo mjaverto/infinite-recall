@@ -90,7 +90,7 @@ struct OMIApp: App {
 
     let version =
       Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-    let baseName = Self.launchMode == .rewind ? "omi Rewind" : UpdateChannel.appDisplayName
+    let baseName = Self.launchMode == .rewind ? "Infinite Recall Rewind" : UpdateChannel.appDisplayName
     return version.isEmpty ? baseName : "\(baseName) v\(version)"
   }
 
@@ -499,7 +499,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       var foundOmiWindow = false
       for window in NSApp.windows {
         log("AppDelegate: Window title='\(window.title)', isVisible=\(window.isVisible)")
-        if window.title.hasPrefix("Omi") {
+        if window.title.hasPrefix("Infinite Recall") {
           foundOmiWindow = true
           window.makeKeyAndOrderFront(nil)
           window.appearance = NSAppearance(named: .darkAqua)
@@ -509,7 +509,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
       }
       if !foundOmiWindow {
-        log("AppDelegate: WARNING - 'Omi' window not found!")
+        log("AppDelegate: WARNING - 'Infinite Recall' window not found!")
       }
     }
 
@@ -643,7 +643,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
           NSApp.activate()
           // Find and show main window
           for window in NSApp.windows {
-            if window.title.hasPrefix("Omi") {
+            if window.title.hasPrefix("Infinite Recall") {
               window.makeKeyAndOrderFront(nil)
               break
             }
@@ -1062,7 +1062,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool
   {
     // Always try to show the main Omi window when dock icon is clicked
-    for window in sender.windows where window.title.hasPrefix("Omi") {
+    for window in sender.windows where window.title.hasPrefix("Infinite Recall") {
       if window.isMiniaturized {
         window.deminiaturize(nil)
       }

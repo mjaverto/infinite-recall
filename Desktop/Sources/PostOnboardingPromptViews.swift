@@ -76,7 +76,7 @@ struct TryAskingPopupView: View {
           .fill(calloutAmber.opacity(0.14))
       )
 
-      Text("What would you like to ask omi first?")
+      Text("What would you like to ask Infinite Recall first?")
         .font(.system(size: 32, weight: .semibold, design: .serif))
         .foregroundColor(OmiColors.textPrimary)
 
@@ -168,7 +168,7 @@ struct PromptSuggestionBanner: View {
     VStack(alignment: .leading, spacing: 14) {
       Button(action: onOpen) {
         VStack(alignment: .leading, spacing: 12) {
-          Text("Next step -> Ask omi")
+          Text("Next step -> Ask Infinite Recall")
             .font(.system(size: 20, weight: .semibold, design: .serif))
             .foregroundColor(bannerPrimaryText)
 

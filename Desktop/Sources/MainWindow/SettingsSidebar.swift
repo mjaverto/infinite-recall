@@ -26,7 +26,7 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["alerts", "notify"], section: .general, icon: "gearshape",
       settingId: "general.notifications"),
     SettingsSearchItem(
-      name: "Ask omi", subtitle: "Show or hide the floating chat bar",
+      name: "Ask Infinite Recall", subtitle: "Show or hide the floating chat bar",
       keywords: ["floating bar", "chat bar"], section: .general, icon: "gearshape",
       settingId: "general.askomi"),
     SettingsSearchItem(
@@ -129,7 +129,7 @@ struct SettingsSearchItem: Identifiable {
       icon: "lock.shield", settingId: "privacy.privacy"),
     SettingsSearchItem(
       name: "Store Recordings",
-      subtitle: "Allow omi to store audio recordings of your conversations",
+      subtitle: "Allow Infinite Recall to store audio recordings of your conversations",
       keywords: ["store", "save recordings", "audio storage"], section: .privacy,
       icon: "lock.shield", settingId: "privacy.storerecordings"),
     SettingsSearchItem(
@@ -150,7 +150,7 @@ struct SettingsSearchItem: Identifiable {
       name: "Account", subtitle: "Your profile and email", keywords: ["profile", "email"],
       section: .account, icon: "person.circle", settingId: "account.account"),
     SettingsSearchItem(
-      name: "Sign Out", subtitle: "Sign out of your omi account",
+      name: "Sign Out", subtitle: "Sign out of your Infinite Recall account",
       keywords: ["sign out", "log out", "logout", "signout"], section: .account,
       icon: "person.circle", settingId: "account.signout"),
 
@@ -191,7 +191,7 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["version", "build", "app version", "build number"], section: .about,
       icon: "info.circle", settingId: "about.version"),
     SettingsSearchItem(
-      name: "Report an Issue", subtitle: "Help us improve omi",
+      name: "Report an Issue", subtitle: "Help us improve Infinite Recall",
       keywords: ["bug", "feedback", "report", "issue"], section: .about, icon: "info.circle",
       settingId: "about.reportissue"),
 
@@ -209,7 +209,7 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["statistics", "conversations", "usage"], section: .advanced, icon: "chart.bar",
       settingId: "advanced.stats"),
     SettingsSearchItem(
-      name: "AI Provider", subtitle: "Choose between your omi account and Claude for desktop chat",
+      name: "AI Provider", subtitle: "Choose between your Infinite Recall account and Claude for desktop chat",
       keywords: ["provider", "agent sdk", "claude code", "acp", "bridge mode"], section: .advanced,
       icon: "cpu", settingId: "aichat.provider"),
     SettingsSearchItem(
@@ -236,9 +236,9 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["auto generate", "suggest goals", "daily goals"], section: .advanced,
       icon: "target", settingId: "advanced.goals.autogenerate"),
     SettingsSearchItem(
-      name: "Ask omi Floating Bar",
+      name: "Ask Infinite Recall Floating Bar",
       subtitle: "Configure the floating bar appearance and visibility",
-      keywords: ["floating bar", "ask omi", "show bar"], section: .floatingBar, icon: "sparkles",
+      keywords: ["floating bar", "ask infinite recall", "ask omi", "show bar"], section: .floatingBar, icon: "sparkles",
       settingId: "floatingbar.show"),
     SettingsSearchItem(
       name: "Background Style", subtitle: "Toggle between solid and transparent background",
@@ -263,11 +263,11 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["voice speed", "speech speed", "playback speed", "tts speed"],
       section: .floatingBar, icon: "sparkles", settingId: "floatingbar.voicespeed"),
     SettingsSearchItem(
-      name: "Shortcuts", subtitle: "Configure Ask omi and push-to-talk keyboard shortcuts",
+      name: "Shortcuts", subtitle: "Configure Ask Infinite Recall and push-to-talk keyboard shortcuts",
       keywords: ["shortcuts", "keyboard", "hotkeys", "push to talk"], section: .shortcuts,
       icon: "keyboard", settingId: "floatingbar.shortcut"),
     SettingsSearchItem(
-      name: "Ask omi Shortcut", subtitle: "Global shortcut to open Ask omi from anywhere",
+      name: "Ask Infinite Recall Shortcut", subtitle: "Global shortcut to open Ask Infinite Recall from anywhere",
       keywords: ["shortcut", "hotkey", "keyboard", "global shortcut"], section: .shortcuts,
       icon: "keyboard", settingId: "floatingbar.shortcut"),
     SettingsSearchItem(
@@ -289,7 +289,7 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["multi chat", "threads"], section: .advanced, icon: "slider.horizontal.3",
       settingId: "advanced.preferences.multichat"),
     SettingsSearchItem(
-      name: "Launch at Login", subtitle: "Start omi automatically when you log in",
+      name: "Launch at Login", subtitle: "Start Infinite Recall automatically when you log in",
       keywords: ["startup", "login", "boot"], section: .advanced, icon: "slider.horizontal.3",
       settingId: "advanced.preferences.launchatlogin"),
     SettingsSearchItem(

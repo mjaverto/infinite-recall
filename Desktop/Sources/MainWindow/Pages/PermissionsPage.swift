@@ -20,7 +20,7 @@ struct PermissionsPage: View {
                             .foregroundColor(OmiColors.textPrimary)
                     }
 
-                    Text("omi needs the following permissions to work properly.")
+                    Text("Infinite Recall needs the following permissions to work properly.")
                         .scaledFont(size: 14)
                         .foregroundColor(OmiColors.textSecondary)
                 }
@@ -45,7 +45,7 @@ struct PermissionsPage: View {
                             .scaledFont(size: 20)
                             .foregroundColor(.green)
 
-                        Text("All permissions granted! omi is ready to use.")
+                        Text("All permissions granted! Infinite Recall is ready to use.")
                             .scaledFont(size: 15, weight: .medium)
                             .foregroundColor(OmiColors.textPrimary)
                     }
@@ -317,7 +317,7 @@ struct MicrophonePermissionSection: View {
                         .foregroundColor(OmiColors.textSecondary)
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Find \"omi\" and toggle it ON")
+                        Text("Find \"Infinite Recall\" and toggle it ON")
                             .scaledFont(size: 13)
                             .foregroundColor(OmiColors.textSecondary)
 
@@ -558,7 +558,7 @@ struct ScreenRecordingPermissionSection: View {
                         .background(Circle().fill(OmiColors.purplePrimary))
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Come back to omi and grant the permission")
+                        Text("Come back to Infinite Recall and grant the permission")
                             .scaledFont(size: 13)
                             .foregroundColor(OmiColors.textSecondary)
 
@@ -822,7 +822,7 @@ struct NotificationPermissionSection: View {
             VStack(alignment: .leading, spacing: 12) {
                 instructionStep(number: 1, text: "Click \"Grant Access\" below - a system dialog will appear")
                 instructionStep(number: 2, text: "Click \"Allow\" to enable notifications")
-                instructionStep(number: 3, text: "Tip: In System Settings > Notifications > omi, set style to \"Banners\" to see visual alerts")
+                instructionStep(number: 3, text: "Tip: In System Settings > Notifications > Infinite Recall, set style to \"Banners\" to see visual alerts")
             }
 
             Button(action: {

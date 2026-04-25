@@ -31,7 +31,7 @@ struct OnboardingHowDidYouHearStepView: View {
       stepIndex: stepIndex,
       totalSteps: totalSteps,
       eyebrow: "Quick question",
-      title: "How did you hear\nabout Omi?",
+      title: "How did you hear\nabout Infinite Recall?",
       description: "",
       onForceComplete: onForceComplete
     ) {
