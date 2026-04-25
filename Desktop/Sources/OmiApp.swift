@@ -373,6 +373,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // every 5s so the AI / Models settings panel can show fresh state.
     Task { @MainActor in
       MLXLifecycleManager.shared.startPolling()
+      // Same cadence for the local REST API (powers MCP integrations).
+      MCPAPIService.shared.startPolling(interval: 5)
     }
 
     // Tier gating: migrate old boolean key to new 6-tier system
@@ -1362,6 +1364,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Stop MLX status polling
     Task { @MainActor in
       MLXLifecycleManager.shared.stopPolling()
+      MCPAPIService.shared.stopPolling()
     }
 
     // Remove window observers
