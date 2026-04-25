@@ -34,7 +34,7 @@ struct ActionItemRecord: Codable, FetchableRecord, PersistableRecord, Identifiab
     var contextSummary: String?
     var currentActivity: String?
     var metadataJson: String?           // Additional extraction metadata
-    var embedding: Data?                // 3072 Float32s for vector search (Gemini embedding-001)
+    var embedding: Data?                // EmbeddingService.embeddingDimension Float32s (NLEmbedding on-device; legacy 3072-dim blobs filtered at read time)
 
     // Ordering (synced to backend)
     var sortOrder: Int?                  // Sort position within category

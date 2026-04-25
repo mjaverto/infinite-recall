@@ -1394,7 +1394,7 @@ actor RewindDatabase {
         // Migration 18: Add embedding column to action_items for vector search
         migrator.registerMigration("addActionItemEmbedding") { db in
             try db.alter(table: "action_items") { t in
-                t.add(column: "embedding", .blob)  // 3072 Float32s = 12288 bytes (Gemini embedding-001)
+                t.add(column: "embedding", .blob)  // EmbeddingService.embeddingDimension Float32s (now 512 via NLEmbedding; legacy 3072-dim Gemini blobs are filtered at search time)
             }
         }
 
@@ -2040,7 +2040,7 @@ actor RewindDatabase {
                 t.column("sender", .text).notNull()           // "user" or "ai"
                 t.column("messageText", .text).notNull()
                 t.column("contentBlocksJson", .text)          // JSON-encoded ChatContentBlock array
-                t.column("embedding", .blob)                  // 3072 Float32s for vector search
+                t.column("embedding", .blob)                  // EmbeddingService.embeddingDimension Float32s (NLEmbedding, on-device)
                 t.column("createdAt", .datetime).notNull()
                 t.column("updatedAt", .datetime).notNull()
                 t.column("backendSynced", .boolean).notNull().defaults(to: false)

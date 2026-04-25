@@ -14,7 +14,7 @@ struct TaskChatMessageRecord: Codable, FetchableRecord, PersistableRecord, Ident
     var sender: String                    // "user" or "ai"
     var messageText: String
     var contentBlocksJson: String?        // JSON-encoded content blocks for AI messages
-    var embedding: Data?                  // 3072 Float32s for vector search (Gemini)
+    var embedding: Data?                  // EmbeddingService.embeddingDimension Float32s (NLEmbedding on-device)
 
     var createdAt: Date
     var updatedAt: Date
