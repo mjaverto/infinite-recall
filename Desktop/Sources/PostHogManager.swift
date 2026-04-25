@@ -2,6 +2,9 @@ import Foundation
 import PostHog
 import FirebaseAuth
 
+// Infinite Recall fork: telemetry disabled. All public methods are no-ops.
+// SDK imports are kept so the rest of the codebase compiles.
+
 /// Singleton manager for PostHog analytics with Session Replay
 /// Complements MixpanelManager - both track the same events
 @MainActor
@@ -10,7 +13,7 @@ class PostHogManager {
 
     private var isInitialized = false
 
-    // PostHog configuration
+    // PostHog configuration (kept for reference; never used in this fork)
     private let apiKey = "phc_z3qUFhGUgYIOMYnfxVSrLmYISQvbgph8iREQv3sez3Y"
     private let host = "https://us.i.posthog.com"
 
@@ -20,139 +23,82 @@ class PostHogManager {
 
     /// Initialize PostHog with analytics
     func initialize() {
-        guard !isInitialized else { return }
-
-        let config = PostHogConfig(apiKey: apiKey, host: host)
-
-        // Disable automatic lifecycle events — PostHog's observer calls setResourceValues(isExcludedFromBackupKey:)
-        // synchronously on the main thread (via NSApplicationDidFinishLaunchingNotification), which XPCs to the
-        // mds (Spotlight) daemon and can hang for 2000ms+ when the daemon is slow. We already track lifecycle
-        // events manually via AnalyticsManager.shared.appLaunched() / appBecameActive() etc.
-        config.captureApplicationLifecycleEvents = false
-        config.captureScreenViews = true
-        config.preloadFeatureFlags = true
-
-        PostHogSDK.shared.setup(config)
-
-        isInitialized = true
-        log("PostHog: Initialized successfully")
+        log("[telemetry-stripped] PostHogManager.initialize: no-op (Infinite Recall is local-first)")
+        // Disabled for local-first fork: let config = PostHogConfig(apiKey: apiKey, host: host)
+        // Disabled for local-first fork: config.captureApplicationLifecycleEvents = false
+        // Disabled for local-first fork: config.captureScreenViews = true
+        // Disabled for local-first fork: config.preloadFeatureFlags = true
+        // Disabled for local-first fork: PostHogSDK.shared.setup(config)
+        return
     }
 
     // MARK: - User Identification
 
     /// Identify the current user after sign-in
     func identify() {
-        guard isInitialized else { return }
-
-        var userId: String?
-        var email: String?
-        var name: String?
-
-        // Try Firebase Auth first
-        if let user = Auth.auth().currentUser {
-            userId = user.uid
-            email = user.email
-            name = user.displayName
-        } else if AuthState.shared.isSignedIn, let storedUserId = AuthState.shared.userId {
-            // Fall back to stored auth state (when Firebase SDK auth failed but REST API auth succeeded)
-            userId = storedUserId
-            email = AuthState.shared.userEmail
-            name = AuthService.shared.displayName.isEmpty ? nil : AuthService.shared.displayName
-            log("PostHog: Using stored auth state (Firebase SDK auth not available)")
-        }
-
-        guard let uid = userId else {
-            log("PostHog: Cannot identify - no user signed in")
-            return
-        }
-
-        var properties: [String: Any] = [
-            "platform": "macos",
-            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
-        ]
-
-        if let email = email {
-            properties["email"] = email
-        }
-
-        if let name = name {
-            properties["name"] = name
-        }
-
-        PostHogSDK.shared.identify(uid, userProperties: properties)
-        log("PostHog: Identified user \(uid)")
+        // Disabled for local-first fork: PostHogSDK.shared.identify(uid, userProperties: properties)
     }
 
     /// Set a specific user property
     func setUserProperty(key: String, value: Any) {
-        guard isInitialized else { return }
-        PostHogSDK.shared.identify(PostHogSDK.shared.getDistinctId(), userProperties: [key: value])
+        // Disabled for local-first fork: PostHogSDK.shared.identify(PostHogSDK.shared.getDistinctId(), userProperties: [key: value])
     }
 
     // MARK: - Event Tracking
 
     /// Track an event with optional properties
     func track(_ eventName: String, properties: [String: Any]? = nil) {
-        guard isInitialized else { return }
-        PostHogSDK.shared.capture(eventName, properties: properties)
-        log("PostHog: Tracked event '\(eventName)'")
+        // Disabled for local-first fork: PostHogSDK.shared.capture(eventName, properties: properties)
     }
 
     // MARK: - Screen Tracking
 
     /// Track a screen view
     func screen(_ screenName: String, properties: [String: Any]? = nil) {
-        guard isInitialized else { return }
-        PostHogSDK.shared.screen(screenName, properties: properties)
+        // Disabled for local-first fork: PostHogSDK.shared.screen(screenName, properties: properties)
     }
 
     // MARK: - Opt In/Out
 
     /// Opt in to tracking
     func optIn() {
-        guard isInitialized else { return }
-        PostHogSDK.shared.optIn()
+        // Disabled for local-first fork: PostHogSDK.shared.optIn()
     }
 
     /// Opt out of tracking
     func optOut() {
-        guard isInitialized else { return }
-        PostHogSDK.shared.optOut()
+        // Disabled for local-first fork: PostHogSDK.shared.optOut()
     }
 
     /// Check if tracking is opted out
     var hasOptedOut: Bool {
-        guard isInitialized else { return true }
-        return !PostHogSDK.shared.isOptOut()
+        return true
     }
 
     // MARK: - Reset
 
     /// Reset the user (call on sign out)
     func reset() {
-        guard isInitialized else { return }
-        PostHogSDK.shared.reset()
-        log("PostHog: Reset user")
+        // Disabled for local-first fork: PostHogSDK.shared.reset()
     }
 
     // MARK: - Feature Flags
 
     /// Check if a feature flag is enabled
     func isFeatureEnabled(_ flag: String) -> Bool {
-        guard isInitialized else { return false }
-        return PostHogSDK.shared.isFeatureEnabled(flag)
+        // Disabled for local-first fork: return PostHogSDK.shared.isFeatureEnabled(flag)
+        return false
     }
 
     /// Get feature flag value
     func getFeatureFlag(_ flag: String) -> Any? {
-        guard isInitialized else { return nil }
-        return PostHogSDK.shared.getFeatureFlag(flag)
+        // Disabled for local-first fork: return PostHogSDK.shared.getFeatureFlag(flag)
+        return nil
     }
 
     /// Reload feature flags
     func reloadFeatureFlags() {
-        guard isInitialized else { return }
-        PostHogSDK.shared.reloadFeatureFlags()
+        // Disabled for local-first fork: PostHogSDK.shared.reloadFeatureFlags()
     }
 }
 
@@ -162,145 +108,46 @@ extension PostHogManager {
 
     // MARK: - Onboarding Events
 
-    func onboardingStepCompleted(step: Int, stepName: String) {
-        track("Onboarding Step \(stepName) Completed", properties: [
-            "step": step
-        ])
-    }
-
-    func onboardingCompleted() {
-        track("Onboarding Completed")
-    }
+    func onboardingStepCompleted(step: Int, stepName: String) {}
+    func onboardingCompleted() {}
 
     // MARK: - Authentication Events
 
-    func signInStarted(provider: String) {
-        track("Sign In Started", properties: [
-            "provider": provider
-        ])
-    }
-
-    func signInCompleted(provider: String) {
-        track("Sign In Completed", properties: [
-            "provider": provider
-        ])
-    }
-
-    func signInFailed(provider: String, error: String) {
-        track("Sign In Failed", properties: [
-            "provider": provider,
-            "error": error
-        ])
-    }
-
-    func signedOut() {
-        track("Signed Out")
-    }
+    func signInStarted(provider: String) {}
+    func signInCompleted(provider: String) {}
+    func signInFailed(provider: String, error: String) {}
+    func signedOut() {}
 
     // MARK: - Monitoring Events
 
-    func monitoringStarted() {
-        track("Monitoring Started")
-    }
-
-    func monitoringStopped() {
-        track("Monitoring Stopped")
-    }
-
-    func distractionDetected(app: String, windowTitle: String?) {
-        var properties: [String: Any] = [
-            "app": app
-        ]
-        if let title = windowTitle {
-            properties["window_title"] = title
-        }
-        track("Distraction Detected", properties: properties)
-    }
-
-    func focusRestored(app: String) {
-        track("Focus Restored", properties: [
-            "app": app
-        ])
-    }
+    func monitoringStarted() {}
+    func monitoringStopped() {}
+    func distractionDetected(app: String, windowTitle: String?) {}
+    func focusRestored(app: String) {}
 
     // MARK: - Recording Events
 
-    func transcriptionStarted() {
-        track("Phone Mic Recording Started")
-    }
-
-    func transcriptionStopped(wordCount: Int) {
-        track("Phone Mic Recording Stopped", properties: [
-            "word_count": wordCount
-        ])
-    }
-
-    func recordingError(error: String) {
-        track("Phone Mic Recording Error", properties: [
-            "error": error
-        ])
-    }
+    func transcriptionStarted() {}
+    func transcriptionStopped(wordCount: Int) {}
+    func recordingError(error: String) {}
 
     // MARK: - Permission Events
 
-    func permissionRequested(permission: String, extraProperties: [String: Any] = [:]) {
-        var props: [String: Any] = ["permission": permission]
-        for (key, value) in extraProperties {
-            props[key] = value
-        }
-        track("Permission Requested", properties: props)
-    }
-
-    func permissionGranted(permission: String, extraProperties: [String: Any] = [:]) {
-        var props: [String: Any] = ["permission": permission]
-        for (key, value) in extraProperties {
-            props[key] = value
-        }
-        track("Permission Granted", properties: props)
-    }
-
-    func permissionDenied(permission: String, extraProperties: [String: Any] = [:]) {
-        var props: [String: Any] = ["permission": permission]
-        for (key, value) in extraProperties {
-            props[key] = value
-        }
-        track("Permission Denied", properties: props)
-    }
-
-    func permissionSkipped(permission: String, extraProperties: [String: Any] = [:]) {
-        var props: [String: Any] = ["permission": permission]
-        for (key, value) in extraProperties {
-            props[key] = value
-        }
-        track("Permission Skipped", properties: props)
-    }
+    func permissionRequested(permission: String, extraProperties: [String: Any] = [:]) {}
+    func permissionGranted(permission: String, extraProperties: [String: Any] = [:]) {}
+    func permissionDenied(permission: String, extraProperties: [String: Any] = [:]) {}
+    func permissionSkipped(permission: String, extraProperties: [String: Any] = [:]) {}
 
     /// Track when ScreenCaptureKit broken state is detected
-    func screenCaptureBrokenDetected() {
-        track("Screen Capture Broken Detected", properties: [:])
-    }
+    func screenCaptureBrokenDetected() {}
 
     /// Track when user clicks reset button or notification
-    func screenCaptureResetClicked(source: String) {
-        track("Screen Capture Reset Clicked", properties: [
-            "source": source
-        ])
-    }
+    func screenCaptureResetClicked(source: String) {}
 
     /// Track when screen capture reset completes
-    func screenCaptureResetCompleted(success: Bool) {
-        track("Screen Capture Reset Completed", properties: [
-            "success": success
-        ])
-    }
+    func screenCaptureResetCompleted(success: Bool) {}
 
-    func notificationRepairTriggered(reason: String, previousStatus: String, currentStatus: String) {
-        track("Notification Repair Triggered", properties: [
-            "reason": reason,
-            "previous_status": previousStatus,
-            "current_status": currentStatus
-        ])
-    }
+    func notificationRepairTriggered(reason: String, previousStatus: String, currentStatus: String) {}
 
     func notificationSettingsChecked(
         authStatus: String,
@@ -308,424 +155,136 @@ extension PostHogManager {
         soundEnabled: Bool,
         badgeEnabled: Bool,
         bannersDisabled: Bool
-    ) {
-        track("Notification Settings Checked", properties: [
-            "auth_status": authStatus,
-            "alert_style": alertStyle,
-            "sound_enabled": soundEnabled,
-            "badge_enabled": badgeEnabled,
-            "banners_disabled": bannersDisabled
-        ])
-    }
+    ) {}
 
     // MARK: - App Lifecycle Events
 
-    func appLaunched() {
-        track("App Launched", properties: [
-            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
-            "os_version": ProcessInfo.processInfo.operatingSystemVersionString
-        ])
-    }
+    func appLaunched() {}
 
     /// Track first launch with comprehensive system diagnostics
-    func firstLaunch(diagnostics: [String: Any]) {
-        track("First Launch", properties: diagnostics)
-    }
+    func firstLaunch(diagnostics: [String: Any]) {}
 
-    func appBecameActive() {
-        track("App Became Active")
-    }
-
-    func appResignedActive() {
-        track("App Resigned Active")
-    }
+    func appBecameActive() {}
+    func appResignedActive() {}
 
     // MARK: - Page/Screen Views (PostHog specific)
 
-    func pageViewed(_ pageName: String) {
-        screen(pageName)
-        track("Page Viewed", properties: ["page": pageName])
-    }
+    func pageViewed(_ pageName: String) {}
 
     // MARK: - Conversation Events
-    // Note: The event is named "Memory Created" in analytics for historical reasons,
-    // but it actually tracks when a conversation/recording is created, not a "memory".
-    // This matches Flutter's naming for analytics consistency.
 
-    func conversationCreated(conversationId: String, source: String, durationSeconds: Int? = nil) {
-        var properties: [String: Any] = [
-            "conversation_id": conversationId,
-            "source": source
-        ]
-        if let duration = durationSeconds {
-            properties["duration_seconds"] = duration
-        }
-        track("Memory Created", properties: properties)
-    }
-
-    func memoryDeleted(conversationId: String) {
-        track("Memory Deleted", properties: [
-            "conversation_id": conversationId
-        ])
-    }
-
-    func memoryShareButtonClicked(conversationId: String) {
-        track("Memory Share Button Clicked", properties: [
-            "conversation_id": conversationId
-        ])
-    }
-
-    func memoryListItemClicked(conversationId: String) {
-        track("Memory List Item Clicked", properties: [
-            "conversation_id": conversationId
-        ])
-    }
+    func conversationCreated(conversationId: String, source: String, durationSeconds: Int? = nil) {}
+    func memoryDeleted(conversationId: String) {}
+    func memoryShareButtonClicked(conversationId: String) {}
+    func memoryListItemClicked(conversationId: String) {}
 
     // MARK: - Chat Events
 
-    func chatMessageSent(messageLength: Int, hasContext: Bool = false, source: String) {
-        track("Chat Message Sent", properties: [
-            "message_length": messageLength,
-            "has_context": hasContext,
-            "source": source
-        ])
-    }
+    func chatMessageSent(messageLength: Int, hasContext: Bool = false, source: String) {}
 
     // MARK: - Search Events
 
-    func searchQueryEntered(query: String) {
-        track("Search Query Entered", properties: [
-            "query_length": query.count
-        ])
-    }
-
-    func searchBarFocused() {
-        track("Search Bar Focused")
-    }
+    func searchQueryEntered(query: String) {}
+    func searchBarFocused() {}
 
     // MARK: - Settings Events
 
-    func settingsPageOpened() {
-        track("Settings Page Opened")
-    }
+    func settingsPageOpened() {}
 
     // MARK: - Account Events
 
-    func deleteAccountClicked() {
-        track("Delete Account Clicked")
-    }
-
-    func deleteAccountConfirmed() {
-        track("Delete Account Confirmed")
-    }
-
-    func deleteAccountCancelled() {
-        track("Delete Account Cancelled")
-    }
+    func deleteAccountClicked() {}
+    func deleteAccountConfirmed() {}
+    func deleteAccountCancelled() {}
 
     // MARK: - Navigation Events
 
-    func tabChanged(tabName: String) {
-        track("Tab Changed", properties: [
-            "tab_name": tabName
-        ])
-    }
-
-    func conversationDetailOpened(conversationId: String) {
-        track("Conversation Detail Opened", properties: [
-            "conversation_id": conversationId
-        ])
-    }
+    func tabChanged(tabName: String) {}
+    func conversationDetailOpened(conversationId: String) {}
 
     // MARK: - Chat Events (Additional)
 
-    func chatAppSelected(appId: String?, appName: String?) {
-        var properties: [String: Any] = [:]
-        if let id = appId { properties["app_id"] = id }
-        if let name = appName { properties["app_name"] = name }
-        track("Chat App Selected", properties: properties.isEmpty ? nil : properties)
-    }
-
-    func chatCleared() {
-        track("Chat Cleared")
-    }
+    func chatAppSelected(appId: String?, appName: String?) {}
+    func chatCleared() {}
 
     // MARK: - Conversation Events (Additional)
 
-    func conversationReprocessed(conversationId: String, appId: String) {
-        track("Conversation Reprocessed", properties: [
-            "conversation_id": conversationId,
-            "app_id": appId
-        ])
-    }
+    func conversationReprocessed(conversationId: String, appId: String) {}
 
     // MARK: - Settings Events (Additional)
 
-    func settingToggled(setting: String, enabled: Bool) {
-        track("Setting Toggled", properties: [
-            "setting": setting,
-            "enabled": enabled
-        ])
-    }
-
-    func languageChanged(language: String) {
-        track("Language Changed", properties: [
-            "language": language
-        ])
-    }
+    func settingToggled(setting: String, enabled: Bool) {}
+    func languageChanged(language: String) {}
 
     // MARK: - Launch At Login Events
 
-    func launchAtLoginStatusChecked(enabled: Bool) {
-        track("Launch At Login Status", properties: [
-            "enabled": enabled
-        ])
-    }
-
-    func launchAtLoginChanged(enabled: Bool, source: String) {
-        track("Launch At Login Changed", properties: [
-            "enabled": enabled,
-            "source": source
-        ])
-    }
+    func launchAtLoginStatusChecked(enabled: Bool) {}
+    func launchAtLoginChanged(enabled: Bool, source: String) {}
 
     // MARK: - Feedback Events
 
-    func feedbackOpened() {
-        track("Feedback Opened")
-    }
-
-    func feedbackSubmitted(feedbackLength: Int) {
-        track("Feedback Submitted", properties: [
-            "feedback_length": feedbackLength
-        ])
-    }
+    func feedbackOpened() {}
+    func feedbackSubmitted(feedbackLength: Int) {}
 
     // MARK: - Rewind Events (Desktop-specific)
 
-    func rewindSearchPerformed(queryLength: Int) {
-        track("Rewind Search Performed", properties: [
-            "query_length": queryLength
-        ])
-    }
-
-    func rewindScreenshotViewed(timestamp: Date) {
-        track("Rewind Screenshot Viewed", properties: [
-            "timestamp": ISO8601DateFormatter().string(from: timestamp)
-        ])
-    }
-
-    func ffmpegResolved(source: String, path: String) {
-        track("FFmpeg Resolved", properties: [
-            "source": source,
-            "path": path
-        ])
-    }
-
-    func rewindTimelineNavigated(direction: String) {
-        track("Rewind Timeline Navigated", properties: [
-            "direction": direction
-        ])
-    }
+    func rewindSearchPerformed(queryLength: Int) {}
+    func rewindScreenshotViewed(timestamp: Date) {}
+    func ffmpegResolved(source: String, path: String) {}
+    func rewindTimelineNavigated(direction: String) {}
 
     // MARK: - Proactive Assistant Events (Desktop-specific)
 
-    func focusAlertShown(app: String) {
-        track("Focus Alert Shown", properties: [
-            "app": app
-        ])
-    }
-
-    func focusAlertDismissed(app: String, action: String) {
-        track("Focus Alert Dismissed", properties: [
-            "app": app,
-            "action": action
-        ])
-    }
-
-    func taskExtracted(taskCount: Int) {
-        track("Task Extracted", properties: [
-            "task_count": taskCount
-        ])
-    }
-
-    func taskPromoted(taskCount: Int) {
-        track("Task Promoted", properties: [
-            "task_count": taskCount
-        ])
-    }
-
-    func taskCompleted(source: String?) {
-        track("Task Completed", properties: [
-            "source": source ?? "unknown"
-        ])
-    }
-
-    func taskDeleted(source: String?) {
-        track("Task Deleted", properties: [
-            "source": source ?? "unknown"
-        ])
-    }
-
-    func taskAdded() {
-        track("Task Added")
-    }
-
-    func memoryExtracted(memoryCount: Int) {
-        track("Memory Extracted", properties: [
-            "memory_count": memoryCount
-        ])
-    }
-
-    func insightGenerated(category: String?) {
-        var properties: [String: Any] = [:]
-        if let cat = category { properties["category"] = cat }
-        track("Advice Generated", properties: properties.isEmpty ? nil : properties)
-    }
+    func focusAlertShown(app: String) {}
+    func focusAlertDismissed(app: String, action: String) {}
+    func taskExtracted(taskCount: Int) {}
+    func taskPromoted(taskCount: Int) {}
+    func taskCompleted(source: String?) {}
+    func taskDeleted(source: String?) {}
+    func taskAdded() {}
+    func memoryExtracted(memoryCount: Int) {}
+    func insightGenerated(category: String?) {}
 
     // MARK: - Apps Events
 
-    func appEnabled(appId: String, appName: String) {
-        track("App Enabled", properties: [
-            "app_id": appId,
-            "app_name": appName
-        ])
-    }
-
-    func appDisabled(appId: String, appName: String) {
-        track("App Disabled", properties: [
-            "app_id": appId,
-            "app_name": appName
-        ])
-    }
-
-    func appDetailViewed(appId: String, appName: String) {
-        track("App Detail Viewed", properties: [
-            "app_id": appId,
-            "app_name": appName
-        ])
-    }
+    func appEnabled(appId: String, appName: String) {}
+    func appDisabled(appId: String, appName: String) {}
+    func appDetailViewed(appId: String, appName: String) {}
 
     // MARK: - Update Events
 
-    func updateCheckStarted() {
-        track("Update Check Started")
-    }
-
-    func updateAvailable(version: String) {
-        track("Update Available", properties: [
-            "version": version
-        ])
-    }
-
-    func updateInstalled(version: String) {
-        track("Update Installed", properties: [
-            "version": version
-        ])
-    }
-
-    func updateNotFound() {
-        track("Update Not Found")
-    }
-
-    func updateCheckFailed(error: String, errorDomain: String, errorCode: Int, underlyingError: String? = nil, underlyingDomain: String? = nil, underlyingCode: Int? = nil) {
-        var props: [String: Any] = [
-            "error": error,
-            "error_domain": errorDomain,
-            "error_code": errorCode
-        ]
-        if let underlyingError { props["underlying_error"] = underlyingError }
-        if let underlyingDomain { props["underlying_domain"] = underlyingDomain }
-        if let underlyingCode { props["underlying_code"] = underlyingCode }
-        track("Update Check Failed", properties: props)
-    }
+    func updateCheckStarted() {}
+    func updateAvailable(version: String) {}
+    func updateInstalled(version: String) {}
+    func updateNotFound() {}
+    func updateCheckFailed(error: String, errorDomain: String, errorCode: Int, underlyingError: String? = nil, underlyingDomain: String? = nil, underlyingCode: Int? = nil) {}
 
     // MARK: - Notification Events
 
-    func notificationSent(notificationId: String, title: String, assistantId: String, surface: String) {
-        track("Notification Sent", properties: [
-            "notification_id": notificationId,
-            "title": title,
-            "assistant_id": assistantId,
-            "notification_surface": surface
-        ])
-    }
-
-    func notificationClicked(notificationId: String, title: String, assistantId: String, surface: String) {
-        track("Notification Clicked", properties: [
-            "notification_id": notificationId,
-            "title": title,
-            "assistant_id": assistantId,
-            "notification_surface": surface
-        ])
-    }
-
-    func notificationDismissed(notificationId: String, title: String, assistantId: String, surface: String) {
-        track("Notification Dismissed", properties: [
-            "notification_id": notificationId,
-            "title": title,
-            "assistant_id": assistantId,
-            "notification_surface": surface
-        ])
-    }
-
-    func notificationWillPresent(notificationId: String, title: String) {
-        track("Notification Will Present", properties: [
-            "notification_id": notificationId,
-            "title": title
-        ])
-    }
-
-    func notificationDelegateReady() {
-        track("Notification Delegate Ready")
-    }
+    func notificationSent(notificationId: String, title: String, assistantId: String, surface: String) {}
+    func notificationClicked(notificationId: String, title: String, assistantId: String, surface: String) {}
+    func notificationDismissed(notificationId: String, title: String, assistantId: String, surface: String) {}
+    func notificationWillPresent(notificationId: String, title: String) {}
+    func notificationDelegateReady() {}
 
     // MARK: - Menu Bar Events
 
-    func menuBarOpened() {
-        track("Menu Bar Opened")
-    }
-
-    func menuBarActionClicked(action: String) {
-        track("Menu Bar Action Clicked", properties: [
-            "action": action
-        ])
-    }
+    func menuBarOpened() {}
+    func menuBarActionClicked(action: String) {}
 
     // MARK: - Tier Events
 
-    func tierChanged(tier: Int, reason: String) {
-        track("Tier Changed", properties: [
-            "tier": tier,
-            "reason": reason
-        ])
-    }
-
-    func chatBridgeModeChanged(from oldMode: String, to newMode: String) {
-        track("chat_bridge_mode_changed", properties: [
-            "from": oldMode,
-            "to": newMode
-        ])
-    }
+    func tierChanged(tier: Int, reason: String) {}
+    func chatBridgeModeChanged(from oldMode: String, to newMode: String) {}
 
     // MARK: - Settings State
 
-    func settingsStateTracked(screenshotsEnabled: Bool, memoryExtractionEnabled: Bool, memoryNotificationsEnabled: Bool) {
-        track("Settings State", properties: [
-            "screenshots_enabled": screenshotsEnabled,
-            "memory_extraction_enabled": memoryExtractionEnabled,
-            "memory_notifications_enabled": memoryNotificationsEnabled
-        ])
-    }
+    func settingsStateTracked(screenshotsEnabled: Bool, memoryExtractionEnabled: Bool, memoryNotificationsEnabled: Bool) {}
 
     /// Comprehensive all-settings snapshot (fired on app launch, at most once per day)
-    func allSettingsStateTracked(properties: [String: Any]) {
-        track("All Settings State", properties: properties)
-    }
+    func allSettingsStateTracked(properties: [String: Any]) {}
 
     // MARK: - Display Info
 
-    func displayInfoTracked(info: [String: Any]) {
-        track("Display Info", properties: info)
-    }
+    func displayInfoTracked(info: [String: Any]) {}
 }

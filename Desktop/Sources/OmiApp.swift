@@ -287,57 +287,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     _ = UpdaterViewModel.shared
     UpdaterViewModel.shared.checkForUpdatesImmediatelyAfterLaunchIfNeeded()
 
-    // Initialize Sentry for crash reporting and error tracking (including dev builds)
+    // Infinite Recall fork: Sentry crash reporting / error tracking is telemetry — disabled.
+    // The SentrySDK.start(...) call below is commented out so the SDK never initializes.
+    // Other SentrySDK.* calls scattered across the codebase (addBreadcrumb, capture, setUser)
+    // become safe no-ops automatically because the SDK is never started. We keep the
+    // `import Sentry` statements and the SPM dependency in place so the rest of the code
+    // continues to compile.
     let isDev = AnalyticsManager.isDevBuild
-    SentrySDK.start { options in
-      options.dsn =
-        "https://bbffa02d948c81ea4dccd36246c7bd20@o4511085999816704.ingest.us.sentry.io/4511086024851456"
-      options.debug = false
-      options.enableAutoSessionTracking = true
-      options.environment = isDev ? "development" : "production"
-      // Disable automatic HTTP client error capture — the SDK creates noisy events
-      // for every 4xx/5xx response (e.g. Cloud Run 503 cold starts on /v1/crisp/unread).
-      // App code already handles HTTP errors and reports meaningful ones explicitly.
-      options.enableCaptureFailedRequests = false
-      options.maxBreadcrumbs = 100
-      options.beforeSend = { event in
-        // Allow user feedback through from all builds (dev + prod)
-        if event.message?.formatted.hasPrefix("User Report") == true { return event }
-        // Never send other events from dev builds — they pollute production Sentry data
-        if isDev { return nil }
-        // Filter out HTTP errors targeting dev/local URLs — noise when tunnels or local backends are down
-        if let urlTag = event.tags?["url"],
-          urlTag.contains("localhost") || urlTag.contains("127.0.0.1")
-            || urlTag.contains("trycloudflare.com")
-        {
-          return nil
-        }
-        // Filter out NSURLErrorCancelled (-999) — these are intentional cancellations
-        // (e.g. proactive assistants cancelling in-flight Gemini requests on context switch)
-        if let exceptions = event.exceptions,
-          exceptions.contains(where: { exc in
-            let value = exc.value ?? ""
-            return exc.type == "NSURLErrorDomain" && (
-              value.contains("Code=-999") || value.contains("Code: -999")
-            )
-          })
-        {
-          return nil
-        }
-        // Filter out AuthError.notSignedIn — this is thrown when token refresh transiently
-        // fails (network blip, expired token mid-refresh). The user is still signed in per
-        // UserDefaults; the 30s refresh timer will retry. Not actionable as a Sentry error.
-        if let exceptions = event.exceptions,
-          exceptions.contains(where: { exc in
-            exc.type == "Omi_Computer.AuthError" && (exc.value ?? "").contains("notSignedIn")
-          })
-        {
-          return nil
-        }
-        return event
-      }
-    }
-    log("Sentry initialized (environment: \(isDev ? "development" : "production"))")
+    // Disabled for local-first fork: SentrySDK.start { options in
+    //   options.dsn =
+    //     "https://bbffa02d948c81ea4dccd36246c7bd20@o4511085999816704.ingest.us.sentry.io/4511086024851456"
+    //   options.debug = false
+    //   options.enableAutoSessionTracking = true
+    //   options.environment = isDev ? "development" : "production"
+    //   options.enableCaptureFailedRequests = false
+    //   options.maxBreadcrumbs = 100
+    //   options.beforeSend = { event in
+    //     if event.message?.formatted.hasPrefix("User Report") == true { return event }
+    //     if isDev { return nil }
+    //     if let urlTag = event.tags?["url"],
+    //       urlTag.contains("localhost") || urlTag.contains("127.0.0.1")
+    //         || urlTag.contains("trycloudflare.com")
+    //     { return nil }
+    //     if let exceptions = event.exceptions,
+    //       exceptions.contains(where: { exc in
+    //         let value = exc.value ?? ""
+    //         return exc.type == "NSURLErrorDomain" && (
+    //           value.contains("Code=-999") || value.contains("Code: -999")
+    //         )
+    //       })
+    //     { return nil }
+    //     if let exceptions = event.exceptions,
+    //       exceptions.contains(where: { exc in
+    //         exc.type == "Omi_Computer.AuthError" && (exc.value ?? "").contains("notSignedIn")
+    //       })
+    //     { return nil }
+    //     return event
+    //   }
+    // }
+    log("[telemetry-stripped] Sentry init skipped (Infinite Recall is local-first; isDev=\(isDev))")
 
     // Initialize Firebase
     let plistPath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist")
