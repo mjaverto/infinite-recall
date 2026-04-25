@@ -770,9 +770,21 @@ struct ServerConversation: Codable, Identifiable, Equatable {
     self.inputDeviceName = inputDeviceName
   }
 
-  /// Returns the title from structured data, or a fallback
+  /// Returns the title from structured data, or a derived one from the overview.
+  /// LLM extraction may not have run yet (mlx-lm offline, in-progress recording,
+  /// or fresh import) — in that case use the first sentence of the overview as
+  /// the visible title. Falls back to "Untitled Conversation" only when both are empty.
   var title: String {
-    structured.title.isEmpty ? "Untitled Conversation" : structured.title
+    if !structured.title.isEmpty {
+      return structured.title
+    }
+    let overview = structured.overview.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !overview.isEmpty {
+      let firstSentence = overview.components(separatedBy: CharacterSet(charactersIn: ".!?")).first ?? overview
+      let trimmed = firstSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.count > 80 ? String(trimmed.prefix(80)) + "…" : trimmed
+    }
+    return "Untitled Conversation"
   }
 
   /// Returns the overview/summary from structured data
