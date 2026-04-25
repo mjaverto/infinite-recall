@@ -2,6 +2,9 @@ import Foundation
 import HeapSwiftCore
 import FirebaseAuth
 
+// Infinite Recall fork: telemetry disabled. All public methods are no-ops.
+// SDK imports are kept so the rest of the codebase compiles.
+
 /// Singleton manager for Heap analytics — tracks signup/k-factor events only.
 /// Complements MixpanelManager and PostHogManager via AnalyticsManager dispatch.
 @MainActor
@@ -16,65 +19,27 @@ class HeapManager {
     // MARK: - Initialization
 
     func initialize() {
-        guard !isInitialized else { return }
-        Heap.shared.startRecording(appId)
-        isInitialized = true
-        log("Heap: Initialized successfully")
+        log("[telemetry-stripped] HeapManager.initialize: no-op (Infinite Recall is local-first)")
+        // Disabled for local-first fork: Heap.shared.startRecording(appId)
+        return
     }
 
     // MARK: - User Identification
 
     func identify() {
-        guard isInitialized else { return }
-
-        var userId: String?
-        var email: String?
-        var name: String?
-
-        if let user = Auth.auth().currentUser {
-            userId = user.uid
-            email = user.email
-            name = user.displayName
-        } else if AuthState.shared.isSignedIn, let storedUserId = AuthState.shared.userId {
-            userId = storedUserId
-            email = AuthState.shared.userEmail
-            name = AuthService.shared.displayName.isEmpty ? nil : AuthService.shared.displayName
-        }
-
-        guard let uid = userId else {
-            log("Heap: Cannot identify - no user signed in")
-            return
-        }
-
-        Heap.shared.identify(uid)
-
-        var properties: [String: String] = [
-            "platform": "macos",
-            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
-        ]
-        if let email = email { properties["email"] = email }
-        if let name = name { properties["name"] = name }
-
-        Heap.shared.addUserProperties(properties)
-        log("Heap: Identified user \(uid)")
+        // Disabled for local-first fork: Heap.shared.identify(uid)
+        // Disabled for local-first fork: Heap.shared.addUserProperties(properties)
     }
 
     // MARK: - Reset
 
     func reset() {
-        guard isInitialized else { return }
-        Heap.shared.resetIdentity()
-        log("Heap: Reset identity")
+        // Disabled for local-first fork: Heap.shared.resetIdentity()
     }
 
     // MARK: - Event Tracking
 
     func track(_ eventName: String, properties: [String: String]? = nil) {
-        guard isInitialized else { return }
-        if let properties = properties {
-            Heap.shared.track(eventName, properties: properties)
-        } else {
-            Heap.shared.track(eventName)
-        }
+        // Disabled for local-first fork: Heap.shared.track(eventName, properties: properties)
     }
 }
