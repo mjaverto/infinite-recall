@@ -484,6 +484,100 @@ actor TranscriptionStorage {
         }
     }
 
+    /// Get audio_chunks count for a session.
+    /// Note: audio_chunks uses `transcriptionSessionId` (not `sessionId`).
+    func getAudioChunkCount(sessionId: Int64) async throws -> Int {
+        let db = try await ensureInitialized()
+
+        return try await db.read { database in
+            try Int.fetchOne(
+                database,
+                sql: "SELECT COUNT(*) FROM audio_chunks WHERE transcriptionSessionId = ?",
+                arguments: [sessionId]
+            ) ?? 0
+        }
+    }
+
+    /// Retrospectively delete sessions that produced no segments AND no
+    /// audio_chunks — these are 0-second artifacts from sessions that were
+    /// started but where no audio actually flowed (e.g. brief launches,
+    /// permission-denied, mid-launch failures).
+    ///
+    /// Only purges sessions in `recording` or `pending_upload` status.
+    /// Active recordings are protected by a 30s grace window — there's a
+    /// race where capture has started but no segments have arrived yet.
+    /// Returns the number of rows deleted.
+    @discardableResult
+    func purgeEmptySessions() async throws -> Int {
+        let db = try await ensureInitialized()
+        // 30-second grace window: don't kill sessions that just started.
+        let cutoff = Date().addingTimeInterval(-30)
+
+        return try await db.write { database -> Int in
+            try database.execute(
+                sql: """
+                    DELETE FROM transcription_sessions
+                    WHERE id NOT IN (
+                        SELECT DISTINCT sessionId FROM transcription_segments
+                        WHERE sessionId IS NOT NULL
+                    )
+                      AND id NOT IN (
+                        SELECT DISTINCT transcriptionSessionId FROM audio_chunks
+                        WHERE transcriptionSessionId IS NOT NULL
+                      )
+                      AND status IN ('recording', 'pending_upload')
+                      AND NOT (status = 'recording' AND createdAt > ?)
+                    """,
+                arguments: [cutoff]
+            )
+            return database.changesCount
+        }
+    }
+
+    /// Fetch the first segment's text per session in a single SQL pass.
+    /// Used by the Conversations list to render a 1-2 line inline preview
+    /// without paying for the full segment fetch on every row.
+    /// Returns a map of sessionId -> trimmed text (WhisperKit special
+    /// tokens like <|0.00|> stripped defensively).
+    func getFirstSegmentTexts(sessionIds: [Int64]) async throws -> [Int64: String] {
+        guard !sessionIds.isEmpty else { return [:] }
+        let db = try await ensureInitialized()
+
+        // Use a correlated subquery that picks the lowest segmentOrder per
+        // session — this returns one row per session in a single pass.
+        let placeholders = sessionIds.map { _ in "?" }.joined(separator: ", ")
+        let sql = """
+            SELECT s.sessionId, s.text
+              FROM transcription_segments s
+              JOIN (
+                  SELECT sessionId, MIN(segmentOrder) AS minOrder
+                    FROM transcription_segments
+                   WHERE sessionId IN (\(placeholders))
+                   GROUP BY sessionId
+              ) m
+                ON m.sessionId = s.sessionId AND m.minOrder = s.segmentOrder
+            """
+        let args = StatementArguments(sessionIds)
+
+        return try await db.read { database -> [Int64: String] in
+            var out: [Int64: String] = [:]
+            let rows = try Row.fetchAll(database, sql: sql, arguments: args)
+            for row in rows {
+                guard let sid: Int64 = row["sessionId"], let text: String = row["text"] else { continue }
+                let stripped = text.replacingOccurrences(
+                    of: #"<\|[^|>]+\|>"#,
+                    with: "",
+                    options: .regularExpression
+                )
+                let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    out[sid] = trimmed
+                }
+            }
+            return out
+        }
+    }
+
     // MARK: - Queries
 
     /// Get a session by ID
