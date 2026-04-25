@@ -1,15 +1,21 @@
-// Infinite Recall fork: idle-unload for the local mlx-lm.server.
+// Infinite Recall fork: idle-unload for both local AI sidecars.
 //
 // IdleAIController watches both system input idle (via Quartz CGEventSource)
 // and time-since-last-AI-call. When both exceed `idleTimeoutMinutes` AND the
-// user has the feature enabled, the local LLM server is asked to stop. The
-// server is auto-restarted on the next user-initiated AI call (chat / complete)
-// via `recordAICall()`, which is invoked by `LocalLLMClient` before each HTTP
-// issue.
+// user has the feature enabled, both the text LLM (mlx-lm.server) and the
+// vision LLM (mlx-vlm.server) are asked to stop. Servers are auto-restarted
+// on the next user-initiated AI call (chat / complete / describe) via
+// `recordAICall()`, which is invoked by `LocalLLMClient` and `VisionLLMClient`
+// callers before each HTTP issue.
 //
-// The mlx-lm.server holds ~20 GB resident; on a 36 GB machine that's worth
-// reclaiming when the user steps away. Cold-start cost is ~30s, which the user
-// has explicitly accepted.
+// The mlx-lm.server holds ~7-9 GB resident; mlx-vlm.server holds ~6-8 GB.
+// On a 36 GB machine reclaiming both when the user steps away is worth the
+// ~30s cold-start cost the user has explicitly accepted.
+//
+// INVARIANT: `VisionLLMClient.isReachable()` must NEVER call `recordAICall()`.
+// It is used as the polling probe inside `VLMLifecycleManager.ensureServerRunning()`
+// and would pin the VLM server alive indefinitely if instrumented. Same lesson
+// as Sprint BB for the text tier (`LocalLLMClient.isReachable()`).
 
 import AppKit
 import Combine
@@ -41,10 +47,14 @@ final class IdleAIController: ObservableObject {
   /// Wall-clock of the last user-initiated AI call (chat / complete).
   @Published private(set) var lastAICall: Date = Date()
 
-  /// True iff we (this controller) stopped the server because of idle.
+  /// True iff we (this controller) stopped the text LLM server because of idle.
   /// Used to decide whether to auto-start it on the next AI call, and to
   /// drive the Settings UI status line.
   @Published private(set) var serverStoppedByIdle: Bool = false
+
+  /// True iff we (this controller) stopped the vision LLM server because of idle.
+  /// Mirrors `serverStoppedByIdle` for the VLM tier.
+  @Published private(set) var vlmStoppedByIdle: Bool = false
 
   /// Briefly true while we're issuing a restart/stop, for UI status.
   @Published private(set) var isTransitioning: Bool = false
@@ -120,41 +130,67 @@ final class IdleAIController: ObservableObject {
     // Refresh published activity timestamp from the system idle reading.
     lastUserActivity = Date().addingTimeInterval(-sysIdle)
 
-    let serverRunning = MLXLifecycleManager.shared.serverRunning
-    guard serverRunning else { return }
+    guard sysIdle >= threshold && aiIdle >= threshold else { return }
 
-    if sysIdle >= threshold && aiIdle >= threshold {
+    // ── Text tier ────────────────────────────────────────────────────────────
+    if MLXLifecycleManager.shared.serverRunning {
       log(
         "IdleAIController: idle thresholds met (sys=\(Int(sysIdle))s, ai=\(Int(aiIdle))s, threshold=\(Int(threshold))s) — stopping local LLM server"
       )
       isTransitioning = true
       let ok = await MLXLifecycleManager.shared.stopServer()
-      // Force a refresh so `serverRunning` flips to false promptly for UI.
       await MLXLifecycleManager.shared.refresh()
       isTransitioning = false
       if ok {
         serverStoppedByIdle = true
         log("IdleAIController: local LLM server stopped (idle).")
       } else {
-        log("IdleAIController: stopServer() returned false — leaving state alone.")
+        log("IdleAIController: stopServer() (text) returned false — leaving state alone.")
+      }
+    }
+
+    // ── Vision tier ──────────────────────────────────────────────────────────
+    if VLMLifecycleManager.shared.serverRunning {
+      log(
+        "IdleAIController: idle thresholds met — stopping vision LLM server"
+      )
+      isTransitioning = true
+      let okVLM = await VLMLifecycleManager.shared.stopServer()
+      await VLMLifecycleManager.shared.refresh()
+      isTransitioning = false
+      if okVLM {
+        vlmStoppedByIdle = true
+        log("IdleAIController: vision LLM server stopped (idle).")
+      } else {
+        log("IdleAIController: stopServer() (vision) returned false — leaving state alone.")
       }
     }
   }
 
   // MARK: - Public hooks
 
-  /// Called by `LocalLLMClient` at the start of every public method that
-  /// issues an HTTP call. Bumps `lastAICall` and, if we previously stopped
-  /// the server due to idle, awaits a restart before returning so the caller
-  /// can issue the HTTP request against a live server.
+  /// Called by `LocalLLMClient` (and VisionLLMClient callers) at the start of
+  /// every public method that issues an HTTP call. Bumps `lastAICall` and, if
+  /// we previously stopped either server due to idle, awaits a restart before
+  /// returning so the caller can issue the HTTP request against a live server.
   ///
   /// Re-entrancy: the polling inside `ensureServerRunning()` calls
   /// `LocalLLMClient.isReachable()` directly, which is intentionally NOT
   /// instrumented to call back into `recordAICall()` — otherwise we'd loop.
+  ///
+  /// INVARIANT: `VisionLLMClient.isReachable()` must NEVER be wired to call
+  /// `recordAICall()`. It is the polling probe inside
+  /// `VLMLifecycleManager.ensureServerRunning()` and calling back here would
+  /// pin the vision server alive indefinitely, defeating idle eviction.
   func recordAICall() async {
     lastAICall = Date()
     if serverStoppedByIdle && !ensuringServer {
       await ensureServerRunning()
+    }
+    // Mirror for the vision tier — restart if we were the ones who stopped it.
+    if vlmStoppedByIdle {
+      await VLMLifecycleManager.shared.ensureServerRunning()
+      vlmStoppedByIdle = false
     }
   }
 
