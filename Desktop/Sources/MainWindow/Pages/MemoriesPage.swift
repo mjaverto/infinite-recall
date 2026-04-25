@@ -939,6 +939,7 @@ struct MemoriesPage: View {
   @State private var categorySearchText = ""
   @State private var pendingSelectedTags: Set<MemoryTag> = []
   @State private var showManagementMenu = false
+  @State private var presentingInstallSheet = false
 
   var body: some View {
     Group {
@@ -957,6 +958,9 @@ struct MemoriesPage: View {
 
   private var mainMemoriesView: some View {
     VStack(spacing: 0) {
+      // Local AI status banner (only visible when LLM is unreachable)
+      LocalAIStatusBanner(onSetUpTapped: { presentingInstallSheet = true })
+
       // Header (includes search, filters, and action buttons)
       header
 
@@ -974,6 +978,9 @@ struct MemoriesPage: View {
       }
     }
     .background(Color.clear)
+    .sheet(isPresented: $presentingInstallSheet) {
+      LocalAIInstallSheet()
+    }
     .dismissableSheet(isPresented: $viewModel.showingAddMemory) {
       AddMemorySheet(viewModel: viewModel, onDismiss: { viewModel.showingAddMemory = false })
         .frame(width: 400)

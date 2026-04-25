@@ -59,6 +59,11 @@ final class MLXLifecycleManager: ObservableObject {
   /// Last poll error, if any (for surfacing in UI).
   @Published private(set) var lastError: String? = nil
 
+  /// True after the first `refresh()` or `refreshSync()` completes. Lets UI
+  /// suppress "AI not set up" banners during the brief startup window before
+  /// we have any real signal.
+  @Published private(set) var hasRefreshedAtLeastOnce: Bool = false
+
   // MARK: - Polling
 
   private var pollTask: Task<Void, Never>?
@@ -72,6 +77,7 @@ final class MLXLifecycleManager: ObservableObject {
     let fm = FileManager.default
     self.agentInstalled = fm.fileExists(atPath: Self.installedPlistURL.path)
     self.modelPresent = fm.fileExists(atPath: Self.defaultModelCacheURL.path)
+    self.hasRefreshedAtLeastOnce = true
   }
 
   /// Async refresh including a reachability ping.
@@ -79,6 +85,7 @@ final class MLXLifecycleManager: ObservableObject {
     refreshSync()
     let reachable = await LocalLLMClient.shared.isReachable()
     self.serverRunning = reachable
+    self.hasRefreshedAtLeastOnce = true
   }
 
   /// Start a background poller that refreshes state every `interval` seconds.

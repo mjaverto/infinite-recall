@@ -2164,6 +2164,9 @@ struct TasksPage: View {
     @State private var isDraggingDivider = false
     @State private var dragStartWidth: Double = 0
 
+    // Local AI install sheet
+    @State private var presentingInstallSheet = false
+
     init(viewModel: TasksViewModel, chatCoordinator: TaskChatCoordinator, chatProvider: ChatProvider? = nil) {
         self.viewModel = viewModel
         self.chatCoordinator = chatCoordinator
@@ -2229,6 +2232,9 @@ struct TasksPage: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
+        .sheet(isPresented: $presentingInstallSheet) {
+            LocalAIInstallSheet()
+        }
         // Modal creation sheet removed — Cmd+N now creates inline at top
         .onAppear {
             // Restore panel UI if coordinator was open when we navigated away
@@ -2359,6 +2365,9 @@ struct TasksPage: View {
 
     private var tasksContent: some View {
         VStack(spacing: 0) {
+            // Local AI status banner (only visible when LLM is unreachable)
+            LocalAIStatusBanner(onSetUpTapped: { presentingInstallSheet = true })
+
             // Header with filter toggle and sort
             headerView
 
