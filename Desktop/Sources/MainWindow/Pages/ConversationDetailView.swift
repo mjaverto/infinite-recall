@@ -178,27 +178,29 @@ struct ConversationDetailView: View {
             if conversation.transcriptSegments.isEmpty {
                 isLoadingConversation = true
                 do {
-                    // First try local database (faster, works offline)
-                    if let session = try await TranscriptionStorage.shared.getSessionByBackendId(conversation.id) {
-                        let segmentRecords = try await TranscriptionStorage.shared.getSegments(sessionId: session.id!)
-                        if !segmentRecords.isEmpty {
-                            // Convert local records to TranscriptSegments and update conversation
-                            let segments = segmentRecords.map { $0.toTranscriptSegment() }
-                            var updatedConversation = conversation
-                            updatedConversation.transcriptSegments = segments
-                            loadedConversation = updatedConversation
-                            log("ConversationDetail: Loaded \(segments.count) segments from local database")
-                        } else {
-                            // No local segments, fetch from API
-                            let fullConversation = try await APIClient.shared.getConversation(id: conversation.id)
-                            loadedConversation = fullConversation
-                            log("ConversationDetail: Loaded \(fullConversation.transcriptSegments.count) segments from API")
-                        }
+                    // Infinite Recall fork: when conversation.id is a synthesized
+                    // "local-<rowId>" string (set by toServerConversation when no
+                    // backendId exists), look up the session by row id instead of
+                    // backendId. The original getSessionByBackendId path returned
+                    // nil for every local session and fell through to APIClient,
+                    // which always throws localOnlyMode in this fork.
+                    let session: TranscriptionSessionRecord?
+                    if conversation.id.hasPrefix("local-"),
+                       let rowId = Int64(conversation.id.dropFirst("local-".count)) {
+                        session = try await TranscriptionStorage.shared.getSession(id: rowId)
                     } else {
-                        // No local session found, fetch from API
-                        let fullConversation = try await APIClient.shared.getConversation(id: conversation.id)
-                        loadedConversation = fullConversation
-                        log("ConversationDetail: Loaded \(fullConversation.transcriptSegments.count) segments from API (no local session)")
+                        session = try await TranscriptionStorage.shared.getSessionByBackendId(conversation.id)
+                    }
+
+                    if let session, let sessionRowId = session.id {
+                        let segmentRecords = try await TranscriptionStorage.shared.getSegments(sessionId: sessionRowId)
+                        let segments = segmentRecords.map { $0.toTranscriptSegment() }
+                        var updatedConversation = conversation
+                        updatedConversation.transcriptSegments = segments
+                        loadedConversation = updatedConversation
+                        log("ConversationDetail: Loaded \(segments.count) segments from local database")
+                    } else {
+                        log("ConversationDetail: No local session for \(conversation.id) — leaving empty")
                     }
                 } catch {
                     logError("ConversationDetail: Failed to load conversation segments", error: error)
