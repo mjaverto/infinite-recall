@@ -300,11 +300,17 @@ struct SettingsContentView: View {
   // AI / Models — provider registry + MLX server lifecycle
   @ObservedObject private var aiProviderRegistry = AIProviderRegistry.shared
   @ObservedObject private var mlxLifecycle = MLXLifecycleManager.shared
+  @ObservedObject private var vlmLifecycle = VLMLifecycleManager.shared
   @ObservedObject private var mcpAPI = MCPAPIService.shared
   @ObservedObject private var idleController = IdleAIController.shared
 
   // In-app installer sheet (replaces the prior Terminal-launch flow).
   @State private var presentingInstallSheet: Bool = false
+  // Vision-tier installer sheet — mirrors the MLX flow but for mlx-vlm.
+  @State private var presentingVLMInstallSheet: Bool = false
+  // Transient feedback from the "Test connection" button on the Vision Model card.
+  @State private var vlmTestResult: String? = nil
+  @State private var vlmTestInFlight: Bool = false
 
   // Local Model picker — tracks the user's currently selected model and
   // whether the "Show all models" disclosure is expanded. Active model id
@@ -1625,11 +1631,14 @@ struct SettingsContentView: View {
       aiProviderCard
       aiAPIKeysCard
       aiLocalModelCard
+      aiVisionModelCard
       aiMCPAPICard
     }
     .onAppear {
       mlxLifecycle.refreshSync()
       Task { await mlxLifecycle.refresh() }
+      vlmLifecycle.refreshSync()
+      Task { await vlmLifecycle.refresh() }
       mcpAPI.refreshSync()
       Task { await mcpAPI.refresh() }
     }
@@ -1955,6 +1964,151 @@ struct SettingsContentView: View {
         LocalAIInstallSheet()
       }
     }
+  }
+
+  // MARK: Vision Model card (mlx-vlm sidecar on :8081)
+
+  /// "Vision Model" card. Sits below the Local Model card and drives the
+  /// mlx-vlm tier (image-text-to-text) on 127.0.0.1:8081. Same install /
+  /// start / stop / status / test surface as the text tier, but pointed at
+  /// `VLMLifecycleManager` and `VisionLLMClient`.
+  private var aiVisionModelCard: some View {
+    settingsCard(settingId: "ai.visionmodel") {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 10) {
+          Image(systemName: "eye.fill")
+            .scaledFont(size: 14)
+            .foregroundColor(OmiColors.purplePrimary)
+            .frame(width: 20)
+
+          Text("Vision Model")
+            .scaledFont(size: 14, weight: .medium)
+            .foregroundColor(OmiColors.textPrimary)
+
+          Spacer()
+        }
+
+        Text("Analyzes screenshots and screen frames (scene changes, app switches).")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+        // Default-model summary line.
+        HStack(spacing: 8) {
+          Text("Active:")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textTertiary)
+          Text("Qwen3-VL-8B-Instruct (4-bit)")
+            .scaledFont(size: 12, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+          if vlmLifecycle.modelPresent {
+            Image(systemName: "checkmark.circle.fill")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.success)
+            Text("Installed")
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textSecondary)
+          } else {
+            Image(systemName: "exclamationmark.circle")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.warning)
+            Text("Not installed")
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textSecondary)
+          }
+          Spacer()
+        }
+
+        if let err = vlmLifecycle.lastError, !err.isEmpty {
+          Text(err)
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.warning)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+
+        // Install button — enabled until the agent + model are both present.
+        if !vlmLifecycle.agentInstalled || !vlmLifecycle.modelPresent {
+          HStack {
+            Button(action: { presentingVLMInstallSheet = true }) {
+              Text(vlmLifecycle.modelPresent ? "Register Service" : "Install (~5–6 GB)")
+                .scaledFont(size: 12, weight: .semibold)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(OmiColors.purplePrimary)
+            .controlSize(.small)
+            Spacer()
+          }
+        }
+
+        Divider().overlay(OmiColors.backgroundQuaternary)
+
+        // Server + logs action row.
+        HStack(spacing: 8) {
+          statusRow(
+            ok: vlmLifecycle.serverRunning,
+            okText: "Server: Running",
+            failText: "Server: Stopped"
+          )
+          .layoutPriority(1)
+
+          Button("Restart") {
+            Task {
+              await vlmLifecycle.startServer()
+              await vlmLifecycle.refresh()
+            }
+          }
+          .buttonStyle(.bordered)
+          .controlSize(.small)
+          .disabled(!vlmLifecycle.agentInstalled)
+
+          Button("Stop") {
+            Task {
+              await vlmLifecycle.stopServer()
+              await vlmLifecycle.refresh()
+            }
+          }
+          .buttonStyle(.bordered)
+          .controlSize(.small)
+          .disabled(!vlmLifecycle.agentInstalled || !vlmLifecycle.serverRunning)
+
+          Button(vlmTestInFlight ? "Testing…" : "Test") {
+            Task { await runVLMTestConnection() }
+          }
+          .buttonStyle(.bordered)
+          .controlSize(.small)
+          .disabled(vlmTestInFlight || !vlmLifecycle.agentInstalled)
+
+          Button("Open Logs") {
+            openLogsFolder()
+          }
+          .buttonStyle(.bordered)
+          .controlSize(.small)
+        }
+
+        if let result = vlmTestResult, !result.isEmpty {
+          Text(result)
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .sheet(isPresented: $presentingVLMInstallSheet) {
+        LocalAIInstallSheet(kind: .vlm)
+      }
+    }
+  }
+
+  /// Probe the local VLM server's `/v1/models` endpoint and surface the result.
+  /// Doesn't actually issue a vision query — just verifies reachability so the
+  /// user gets immediate, cheap feedback.
+  private func runVLMTestConnection() async {
+    vlmTestInFlight = true
+    vlmTestResult = nil
+    let reachable = await VisionLLMClient.shared.isReachable()
+    vlmTestInFlight = false
+    vlmTestResult = reachable
+      ? "Reachable on http://127.0.0.1:8081"
+      : "Not reachable. Check that the agent is running."
   }
 
   // MARK: Active model summary (top of card)
