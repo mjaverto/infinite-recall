@@ -1481,140 +1481,48 @@ struct SettingsContentView: View {
 
   private var privacySection: some View {
     VStack(spacing: 20) {
-      // Data Controls
-      settingsCard(settingId: "privacy.storerecordings") {
-        VStack(alignment: .leading, spacing: 16) {
-          Text("Data Controls")
-            .scaledFont(size: 15, weight: .semibold)
-            .foregroundColor(OmiColors.textPrimary)
-
-          privacyToggleRow(
-            icon: "mic.fill",
-            title: "Store Recordings",
-            subtitle: "Allow Infinite Recall to store audio recordings of your conversations",
-            isOn: $recordingPermissionEnabled
-          ) { newValue in
-            updateRecordingPermission(newValue)
-          }
-
-          Divider()
-
-          privacyToggleRow(
-            icon: "cloud.fill",
-            title: "Private Cloud Sync",
-            subtitle: "Sync your data securely to your private cloud storage",
-            isOn: $privateCloudSyncEnabled
-          ) { newValue in
-            updatePrivateCloudSync(newValue)
-          }
-        }
-      }
-
-      // Encryption
-      settingsCard(settingId: "privacy.encryption") {
+      settingsCard(settingId: "privacy.localfirst") {
         VStack(alignment: .leading, spacing: 14) {
           HStack(spacing: 10) {
-            Image(systemName: "shield.lefthalf.filled")
+            Image(systemName: "lock.fill")
               .scaledFont(size: 14)
               .foregroundColor(OmiColors.purplePrimary)
               .frame(width: 20)
 
-            Text("Encryption")
+            Text("Local-First by Design")
               .scaledFont(size: 14, weight: .medium)
               .foregroundColor(OmiColors.textPrimary)
           }
 
-          HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
+          Text(
+            "Infinite Recall stores everything on this Mac and never connects to a remote server. There is no account, no sync, no telemetry."
+          )
+          .scaledFont(size: 13)
+          .foregroundColor(OmiColors.textSecondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Data location")
+              .scaledFont(size: 12, weight: .semibold)
+              .foregroundColor(OmiColors.textPrimary)
+
+            Text("~/Library/Application Support/InfiniteRecall/")
               .scaledFont(size: 12)
-              .foregroundColor(.green)
-              .frame(width: 20, alignment: .leading)
-
-            Text("Server-side encryption")
-              .scaledFont(size: 13)
               .foregroundColor(OmiColors.textSecondary)
-
-            Text("Active")
-              .scaledFont(size: 10, weight: .semibold)
-              .foregroundColor(.green)
-              .padding(.horizontal, 5)
-              .padding(.vertical, 1)
-              .background(Color.green.opacity(0.15))
-              .cornerRadius(3)
+              .textSelection(.enabled)
           }
 
-          Text("Your data is encrypted and stored securely with Google Cloud infrastructure.")
-            .scaledFont(size: 12)
-            .foregroundColor(OmiColors.textTertiary)
-        }
-      }
-
-      // What We Track
-      settingsCard(settingId: "privacy.tracking") {
-        VStack(alignment: .leading, spacing: 12) {
-          Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-              isTrackingExpanded.toggle()
-            }
-          }) {
-            HStack(spacing: 10) {
-              Image(systemName: "list.bullet")
-                .scaledFont(size: 14)
-                .foregroundColor(OmiColors.purplePrimary)
-                .frame(width: 20)
-
-              Text("What We Track")
-                .scaledFont(size: 14, weight: .medium)
-                .foregroundColor(OmiColors.textPrimary)
-
-              Spacer()
-
-              Image(systemName: "chevron.right")
-                .scaledFont(size: 11, weight: .semibold)
-                .foregroundColor(OmiColors.textTertiary)
-                .rotationEffect(.degrees(isTrackingExpanded ? 90 : 0))
-            }
-          }
-          .buttonStyle(.plain)
-
-          if isTrackingExpanded {
-            VStack(alignment: .leading, spacing: 6) {
-              trackingItem("Onboarding steps completed")
-              trackingItem("Settings changes")
-              trackingItem("App installations and usage")
-              trackingItem("Device connection status")
-              trackingItem("Transcript processing events")
-              trackingItem("Conversation creation and updates")
-              trackingItem("Memory extraction events")
-              trackingItem("Chat interactions")
-              trackingItem("Speech profile creation")
-              trackingItem("Focus session events")
-              trackingItem("App open/close events")
-            }
-            .transition(.opacity)
-          }
-        }
-      }
-
-      // Privacy Guarantees
-      settingsCard(settingId: "privacy.privacy") {
-        VStack(alignment: .leading, spacing: 10) {
-          HStack(spacing: 10) {
-            Image(systemName: "hand.raised.fill")
-              .scaledFont(size: 14)
-              .foregroundColor(OmiColors.purplePrimary)
-              .frame(width: 20)
-
-            Text("Privacy Guarantees")
-              .scaledFont(size: 14, weight: .medium)
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Encryption")
+              .scaledFont(size: 12, weight: .semibold)
               .foregroundColor(OmiColors.textPrimary)
-          }
 
-          VStack(alignment: .leading, spacing: 6) {
-            privacyBullet("Anonymous tracking with randomly generated IDs")
-            privacyBullet("No personal info stored in analytics")
-            privacyBullet("Data is never sold or shared with third parties")
-            privacyBullet("Opt out of tracking at any time")
+            Text(
+              "Files are protected by macOS FileVault if you have it enabled. The app does not add a separate encryption layer in v1."
+            )
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
           }
         }
       }
