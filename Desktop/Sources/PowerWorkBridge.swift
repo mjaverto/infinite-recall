@@ -49,6 +49,9 @@ final class PowerWorkBridge {
             try await PowerWorkBridge.handleOCR(work)
         }
 
+        // Start the periodic sweeper that reclaims expired leases and GCs old rows.
+        PendingWorkSweeper.shared.start()
+
         log("PowerWorkBridge: Started — registered .transcribe and .ocr handlers")
     }
 

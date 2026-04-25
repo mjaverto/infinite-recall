@@ -2309,6 +2309,71 @@ actor RewindDatabase {
                 """)
         }
 
+        // Migration #62: Persistent pending_work queue (lease + retry + dedup).
+        // Replaces the in-memory [PendingWork] array on BatteryAwareScheduler.
+        // See Desktop/Sources/Rewind/Core/PendingWorkStorage.swift for the actor layer.
+        migrator.registerMigration("createPendingWork") { db in
+            try db.create(table: "pending_work") { t in
+                t.autoIncrementedPrimaryKey("id")
+
+                // Discriminator — matches PendingWork.Kind raw values:
+                // "transcribe", "ocr", "extractMemory", "extractActionItems", "summarize".
+                // String (not enum) for forward-compatibility with new kinds without
+                // a schema migration.
+                t.column("workType", .text).notNull()
+
+                // Caller-supplied opaque payload. Keep as Data (JSON today) so the
+                // queue stays kind-agnostic — same contract as PendingWork.payload.
+                t.column("payload", .blob).notNull()
+
+                // queued | claimed | done | failed | dead
+                t.column("status", .text).notNull().defaults(to: "queued")
+
+                // Lease bookkeeping — null when status != claimed.
+                t.column("claimedAt", .datetime)
+                t.column("claimedBy", .text)       // process/worker tag, e.g. "PowerWorkBridge#<pid>"
+                t.column("leaseExpiresAt", .datetime)
+
+                // Retry bookkeeping
+                t.column("attempts", .integer).notNull().defaults(to: 0)
+                t.column("maxAttempts", .integer).notNull().defaults(to: 8)
+                t.column("lastError", .text)       // truncated to ~2 KB at write time
+
+                // Backoff: don't claim before this timestamp.
+                t.column("scheduledFor", .datetime).notNull()
+
+                // Optional natural-key for producer-side dedup.
+                t.column("dedupKey", .text)
+
+                // Bookkeeping
+                t.column("createdAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+                t.column("updatedAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+            }
+
+            // Hot path: finding next claimable item (partial keeps it small).
+            try db.execute(sql: """
+                CREATE INDEX idx_pending_work_claimable
+                ON pending_work(scheduledFor, id)
+                WHERE status IN ('queued', 'failed')
+            """)
+
+            // Lease expiry sweep
+            try db.create(index: "idx_pending_work_lease",
+                          on: "pending_work", columns: ["leaseExpiresAt"])
+
+            // Observability
+            try db.create(index: "idx_pending_work_status_type",
+                          on: "pending_work", columns: ["status", "workType"])
+
+            // Producer-side dedup (partial unique on non-null keys for active rows only).
+            // Once a row is done/dead the same key can be re-enqueued.
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_pending_work_dedup
+                ON pending_work(dedupKey)
+                WHERE dedupKey IS NOT NULL AND status IN ('queued', 'claimed', 'failed')
+            """)
+        }
+
         try migrator.migrate(queue)
     }
 

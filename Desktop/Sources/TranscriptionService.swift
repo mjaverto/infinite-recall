@@ -377,10 +377,17 @@ class TranscriptionService: @unchecked Sendable {
         guard let data = try? JSONSerialization.data(withJSONObject: payloadDict, options: []) else {
             return
         }
+        // dedupKey: same wall-clock window + language is idempotent (design doc §3.4)
+        let startedAtISO = ISO8601DateFormatter().string(from: started)
+        let endedAtISO   = ISO8601DateFormatter().string(from: ended)
+        let dedupKey = "transcribe:\(startedAtISO)..\(endedAtISO):\(language)"
         await MainActor.run {
-            BatteryAwareScheduler.shared.enqueue(
-                PendingWork(kind: .transcribe, payload: data)
-            )
+            Task { @MainActor in
+                await BatteryAwareScheduler.shared.enqueue(
+                    PendingWork(kind: .transcribe, payload: data),
+                    dedupKey: dedupKey
+                )
+            }
         }
     }
 

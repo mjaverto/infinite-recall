@@ -156,10 +156,15 @@ actor RewindIndexer {
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
             return
         }
+        // dedupKey: one screenshot, one OCR pass (design doc §3.4)
+        let dedupKey = "ocr:\(screenshotId)"
         await MainActor.run {
-            BatteryAwareScheduler.shared.enqueue(
-                PendingWork(kind: .ocr, payload: data)
-            )
+            Task { @MainActor in
+                await BatteryAwareScheduler.shared.enqueue(
+                    PendingWork(kind: .ocr, payload: data),
+                    dedupKey: dedupKey
+                )
+            }
         }
     }
 

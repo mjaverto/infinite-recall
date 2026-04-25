@@ -5,8 +5,9 @@ import Combine
 #endif
 
 /// A unit of deferred heavy work — Whisper inference, Vision OCR, local
-/// LLM extraction, summarisation, etc. The scheduler holds these in memory
-/// (v1) and lets consumers drain them when the machine is on AC.
+/// LLM extraction, summarisation, etc. The scheduler persists these in
+/// `pending_work` (SQLite-backed via `PendingWorkStorage`) so they survive
+/// app crash / quit / forced reboot.
 ///
 /// `payload` is intentionally opaque `Data`. Each consumer (transcription
 /// service, OCR pipeline, assistants) decides its own envelope so the
@@ -25,22 +26,26 @@ public struct PendingWork: Identifiable, Equatable, Sendable {
   public let kind: Kind
   public let payload: Data
   public let queuedAt: Date
+  /// Row ID in `pending_work` table. Nil for legacy in-memory items (tests only).
+  public let storageId: Int64?
 
   public init(
     id: UUID = UUID(),
     kind: Kind,
     payload: Data,
-    queuedAt: Date = Date()
+    queuedAt: Date = Date(),
+    storageId: Int64? = nil
   ) {
     self.id = id
     self.kind = kind
     self.payload = payload
     self.queuedAt = queuedAt
+    self.storageId = storageId
   }
 }
 
 /// Tells callers when the machine has the headroom to do heavy ML work, and
-/// holds a small in-memory queue of work that's been deferred.
+/// drains a persistent SQLite-backed queue of deferred work.
 ///
 /// **Decision logic** (see `allowHeavyWork`):
 /// 1. If the user has flipped the override toggle, always allow. (Power
@@ -53,6 +58,11 @@ public struct PendingWork: Identifiable, Equatable, Sendable {
 /// stop accepting new drains but in-flight handlers run to natural
 /// completion — interrupting an in-progress Whisper pass would just waste
 /// the work we already did.
+///
+/// **Queue persistence**: `enqueue(_:)` is now `async` and stores items in
+/// `pending_work` (GRDB). Items survive crash/quit/reboot. The `drain()` loop
+/// calls `PendingWorkStorage.shared.claimNext()` for atomic lease acquisition,
+/// then `ack()` or `fail()` based on handler result.
 @MainActor
 public final class BatteryAwareScheduler: ObservableObject {
   public static let shared = BatteryAwareScheduler()
@@ -105,12 +115,15 @@ public final class BatteryAwareScheduler: ObservableObject {
     return "\(pendingWorkCount) \(noun) waiting (\(qualifier))"
   }
 
-  // MARK: - Internal queue
+  // MARK: - Internal state
 
-  private var queue: [PendingWork] = []
   private var handlers: [PendingWork.Kind: Handler] = [:]
   private var monitorTask: Task<Void, Never>?
+  private var countPollerTask: Task<Void, Never>?
   private var lastAllow: Bool = true
+
+  /// Worker tag embedded in `claimedBy` column so sweeper can identify orphans.
+  private var workerTag: String { "PowerWorkBridge#\(ProcessInfo.processInfo.processIdentifier)" }
 
   private init() {}
 
@@ -141,12 +154,24 @@ public final class BatteryAwareScheduler: ObservableObject {
         self.handlePossibleTransition()
       }
     }
+
+    // 5-second count poller (design doc §7 open question: poll not ValueObservation)
+    countPollerTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        let count = await PendingWorkStorage.shared.pendingCount()
+        self.pendingWorkCount = count
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+      }
+    }
   }
 
   /// Stop watching for transitions. Mainly for tests.
   public func stop() {
     monitorTask?.cancel()
     monitorTask = nil
+    countPollerTask?.cancel()
+    countPollerTask = nil
   }
 
   // MARK: - Handler registration
@@ -159,11 +184,26 @@ public final class BatteryAwareScheduler: ObservableObject {
 
   // MARK: - Queue API
 
-  /// Enqueue a unit of deferred work. If the machine currently has
-  /// headroom we kick off `drain()` immediately.
-  public func enqueue(_ work: PendingWork) {
-    queue.append(work)
-    pendingWorkCount = queue.count
+  /// Enqueue a unit of deferred work. Stores it persistently in `pending_work`.
+  /// If the machine currently has headroom we kick off `drain()` immediately.
+  ///
+  /// - Parameters:
+  ///   - work: The work item to enqueue.
+  ///   - dedupKey: Optional natural key; duplicate active rows are silently ignored.
+  public func enqueue(_ work: PendingWork, dedupKey: String? = nil) async {
+    do {
+      try await PendingWorkStorage.shared.enqueue(
+        workType: work.kind.rawValue,
+        payload: work.payload,
+        dedupKey: dedupKey
+      )
+      // Refresh count immediately rather than waiting for the 5s poller.
+      let count = await PendingWorkStorage.shared.pendingCount()
+      pendingWorkCount = count
+    } catch {
+      logError("BatteryAwareScheduler: enqueue failed", error: error)
+    }
+
     if allowHeavyWork && !isDraining {
       Task { @MainActor in
         await self.drain()
@@ -171,32 +211,48 @@ public final class BatteryAwareScheduler: ObservableObject {
     }
   }
 
-  /// Drain the queue, calling registered handlers in FIFO order. Stops
-  /// early if `allowHeavyWork` flips back to false partway through.
-  /// In-flight handler calls are NOT cancelled — they run to completion.
+  /// Drain the queue by claiming and executing items one at a time.
+  ///
+  /// Stops when:
+  /// - `claimNext()` returns nil (queue empty or all future-scheduled), or
+  /// - `allowHeavyWork` flips false.
+  ///
+  /// On handler success → `ack()`. On handler throw → `fail()` (backoff + retry).
+  /// In-flight handlers are NOT cancelled on `allowHeavyWork` flip — they run
+  /// to completion.
   public func drain() async {
     guard !isDraining else { return }
     isDraining = true
-    defer { isDraining = false }
+    defer {
+      isDraining = false
+      Task { @MainActor [weak self] in
+        let count = await PendingWorkStorage.shared.pendingCount()
+        self?.pendingWorkCount = count
+      }
+    }
 
-    while allowHeavyWork, let work = queue.first {
-      guard let handler = handlers[work.kind] else {
-        // No registered consumer for this kind yet; leave it in the queue
-        // so when the consumer registers later it can be picked up.
-        // But to avoid an infinite loop, break out now.
+    let tag = workerTag
+    while allowHeavyWork {
+      guard let work = try? await PendingWorkStorage.shared.claimNext(claimedBy: tag) else {
         break
       }
+      guard let handler = handlers[work.kind] else {
+        // No registered consumer for this kind yet — leave it claimed; sweeper
+        // will reclaim after lease expiry. Break to avoid tight loop.
+        log("BatteryAwareScheduler: no handler for \(work.kind.rawValue), leaving claimed")
+        break
+      }
+      guard let storageId = work.storageId else {
+        log("BatteryAwareScheduler: claimed item missing storageId, skipping")
+        continue
+      }
+
       do {
         try await handler(work)
-        // Handler succeeded — drop from queue. Use ID match in case the
-        // queue mutated during the await (e.g. another enqueue).
-        if let idx = queue.firstIndex(where: { $0.id == work.id }) {
-          queue.remove(at: idx)
-        }
-        pendingWorkCount = queue.count
+        try? await PendingWorkStorage.shared.ack(storageId: storageId)
       } catch {
-        // Handler threw — leave the item in place and stop draining for
-        // now. The next state transition or explicit drain() can retry.
+        try? await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
+        // Stop draining; next state transition or explicit drain() can retry.
         break
       }
     }
@@ -211,7 +267,7 @@ public final class BatteryAwareScheduler: ObservableObject {
     let now = allowHeavyWork
     let was = lastAllow
     lastAllow = now
-    if !was && now && !queue.isEmpty {
+    if !was && now {
       Task { @MainActor in
         await self.drain()
       }
