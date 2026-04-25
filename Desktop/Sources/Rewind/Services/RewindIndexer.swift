@@ -67,6 +67,13 @@ actor RewindIndexer {
             await OCREmbeddingService.shared.backfillIfNeeded()
         }
 
+        // Re-embed historical rows that have empty/zero embeddings from before
+        // Sprint Q wired NLEmbedding into the pipeline.  Idempotent; guarded by
+        // UserDefaults flag "embeddingBackfillCompleted_v1".
+        Task(priority: .background) {
+            await EmbeddingBackfillService.shared.runIfNeeded()
+        }
+
         // Reduce ocrDataJson float precision for existing rows (one-time migration)
         Task(priority: .background) {
             await RewindDatabase.shared.reduceOCRDataPrecisionIfNeeded()
