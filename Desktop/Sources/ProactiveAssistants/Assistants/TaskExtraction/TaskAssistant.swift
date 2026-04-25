@@ -1,7 +1,10 @@
 import Foundation
+import GRDB
 
-/// Task extraction assistant that identifies tasks and action items from screen content
-/// Uses single-stage Gemini tool calling with vector + FTS5 search for deduplication
+/// Task extraction assistant that identifies tasks and action items from screen content.
+/// Local-fork: drives a JSON-mode tool loop on the local LLM (no vision); decision
+/// tools are search_similar / search_keywords / read_screenshot_ocr / extract_task /
+/// reject_task / no_task_found.
 actor TaskAssistant: ProactiveAssistant {
     // MARK: - ProactiveAssistant Protocol
 
@@ -144,12 +147,11 @@ actor TaskAssistant: ProactiveAssistant {
 
     init(apiKey: String? = nil) throws {
         // Infinite Recall fork: LLM client is resolved lazily per-call via
-        // AIProviderRegistry; constructor never fails on missing provider.
-        // NOTE: this assistant relies on multi-turn tool calling + vision, which
-        // the v1 local provider doesn't yet support. The processing loop logs
-        // and skips extraction until tool-calling support lands.
-        // TODO(local-tools): wire the search_similar / extract_task tool loop
-        // through a local function-calling model.
+        // AIProviderRegistry. The legacy Gemini search-loop (vision + function
+        // calling) is replaced with a JSON-mode tool loop driven by
+        // `LLMBridge.runToolLoop`. The local model doesn't see the screenshot;
+        // it relies on the screenshot's window title + active task list +
+        // search tools to decide whether to extract a task.
 
         let (stream, continuation) = AsyncStream.makeStream(of: TriggerEvent.self, bufferingPolicy: .bufferingNewest(1))
         self.triggerStream = stream
@@ -229,7 +231,7 @@ actor TaskAssistant: ProactiveAssistant {
     /// Used by the test runner to replay past screenshots.
     /// Returns (result, searchCount) where searchCount is the number of search tool calls made.
     func testAnalyze(jpegData: Data, appName: String) async throws -> (TaskExtractionResult?, Int) {
-        return try await extractTaskSingleStage(from: jpegData, appName: appName)
+        return try await extractTaskSingleStage(from: jpegData, appName: appName, windowTitle: nil, screenshotId: nil)
     }
 
     // MARK: - ProactiveAssistant Protocol Methods
@@ -582,7 +584,7 @@ actor TaskAssistant: ProactiveAssistant {
 
         log("Task: Analyzing frame from \(frame.appName)...")
         do {
-            let (result, searchCount) = try await extractTaskSingleStage(from: frame.jpegData, appName: frame.appName)
+            let (result, searchCount) = try await extractTaskSingleStage(from: frame.jpegData, appName: frame.appName, windowTitle: frame.windowTitle, screenshotId: frame.screenshotId)
             guard let result = result else {
                 log("Task: Analysis returned no result")
                 return
@@ -600,20 +602,489 @@ actor TaskAssistant: ProactiveAssistant {
         }
     }
 
-    /// Loop-based extraction: image analysis + iterative tool calling for search + terminal tool for decision
-    /// Returns (result, searchCount) where searchCount is the number of search tool calls made.
-    private func extractTaskSingleStage(from jpegData: Data, appName: String) async throws -> (TaskExtractionResult?, Int) {
-        // Infinite Recall fork: this flow requires multi-turn tool calling
-        // (search_similar / search_keywords / extract_task) plus vision, which
-        // the v1 local LLM provider doesn't expose. Bail out cleanly until a
-        // tool-capable provider lands in AIProviderRegistry.
-        // TODO(local-tools): re-implement with a local function-calling model.
+    /// Loop-based extraction running against the local JSON-mode tool loop.
+    ///
+    /// Local Qwen 2.5-32B has no vision, so the model decides task extraction
+    /// from the active task list (passed in the prompt for dedup) plus
+    /// `search_similar` / `search_keywords` results plus the screenshot's
+    /// OCR text (fetched on demand via the screenshot id). Decision tools are
+    /// `extract_task`, `reject_task`, or `no_task_found`.
+    ///
+    /// `jpegData` is currently ignored — wired through only so the call sites
+    /// keep working unchanged.
+    /// Returns (result, searchCount).
+    private func extractTaskSingleStage(
+        from jpegData: Data,
+        appName: String,
+        windowTitle: String?,
+        screenshotId: Int64?
+    ) async throws -> (TaskExtractionResult?, Int) {
         guard await LLMBridge.currentClient() != nil else {
             log("[TaskAssistant] no LLM client available — skipping task extraction")
             return (nil, 0)
         }
-        log("[TaskAssistant] tool-calling not supported by current LLM provider — skipping task extraction (TODO: local tool calls)")
-        return (nil, 0)
+
+        // 1) Gather context (active / completed / deleted tasks, goals).
+        let context = await refreshContext()
+
+        // 2) Build user prompt mirroring the legacy phrasing.
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd (EEEE)"
+        let todayStr = dateFormatter.string(from: Date())
+
+        var prompt = "Screenshot from \(appName)."
+        if let wt = windowTitle, !wt.isEmpty {
+            prompt += " Window: \"\(wt)\"."
+        }
+        prompt += " Today is \(todayStr). Analyze for any unaddressed request directed at the user.\n\n"
+
+        let messagingApps: Set<String> = ["Telegram", "WhatsApp", "\u{200E}WhatsApp", "Messages", "Slack", "Discord"]
+        if messagingApps.contains(appName) {
+            prompt += """
+            REMINDER — THIS IS A MESSAGING APP:
+            - If the screenshot likely shows a chat sidebar/conversation list rather than an open conversation, call no_task_found.
+            - If it shows an open conversation, look for where the user AGREED or COMMITTED to doing something the other person asked.
+            - Also look for incoming requests the user hasn't responded to yet.
+            - The task title should describe what was asked for, naming the other person in the conversation.
+
+            """
+        }
+
+        if let profile = await AIUserProfileService.shared.getLatestProfile() {
+            prompt += "USER PROFILE (who this user is — use for context, not as a task source):\n"
+            prompt += profile.profileText + "\n\n"
+        }
+
+        if !context.activeTasks.isEmpty {
+            let scoreRange = try? await ActionItemStorage.shared.getRelevanceScoreRange()
+            let rangeStr = scoreRange.map { "Score range: \($0.min)–\($0.max). " } ?? ""
+            prompt += "ACTIVE TASKS (user is already tracking these — relevance_score 1 = most important):\n"
+            prompt += "\(rangeStr)Use these scores to place any new task appropriately.\n"
+            for (i, task) in context.activeTasks.enumerated() {
+                let pri = task.priority.map { " [\($0)]" } ?? ""
+                let score = task.relevanceScore.map { " [score:\($0)]" } ?? ""
+                prompt += "\(i + 1).\(score) \(task.description)\(pri)\n"
+            }
+            prompt += "\n"
+        }
+
+        if !context.completedTasks.isEmpty {
+            prompt += "RECENTLY COMPLETED TASKS (similar shapes are good — just don't dup):\n"
+            for (i, task) in context.completedTasks.enumerated() {
+                prompt += "\(i + 1). \(task.description)\n"
+            }
+            prompt += "\n"
+        }
+
+        if !context.deletedTasks.isEmpty {
+            prompt += "USER-DELETED TASKS (user explicitly rejected these — do not re-extract similar):\n"
+            for (i, task) in context.deletedTasks.enumerated() {
+                prompt += "\(i + 1). \(task.description)\n"
+            }
+            prompt += "\n"
+        }
+
+        if !context.goals.isEmpty {
+            prompt += "ACTIVE GOALS:\n"
+            for (i, goal) in context.goals.enumerated() {
+                prompt += "\(i + 1). \(goal.title)"
+                if let desc = goal.description {
+                    prompt += " — \(desc)"
+                }
+                prompt += "\n"
+            }
+            prompt += "\n"
+        }
+
+        prompt += """
+
+            You don't see the image directly. To inspect what was on screen, call read_screenshot_ocr \
+            (returns OCR text + window title). If you see a potential request, search for duplicates \
+            via search_similar / search_keywords first. If clearly no request (~90% of screenshots), \
+            call no_task_found immediately.
+            """
+
+        // 3) Tools — local JSON-mode catalog mirroring the legacy 5 tools plus
+        //    a read_screenshot_ocr replacement for the missing vision path.
+        let tools = buildLocalTaskTools(hasScreenshotId: screenshotId != nil)
+
+        // 4) Drive the loop. Like Insight, terminal tools (extract_task /
+        //    reject_task / no_task_found) stash a result and ack the model.
+        var searchCount = 0
+        var terminalResult: TaskExtractionResult?
+        let frameAppName = appName
+        let capturedScreenshotId = screenshotId
+
+        let answer: String?
+        do {
+            answer = try await LLMBridge.runToolLoop(
+                systemPrompt: await systemPrompt,
+                userPrompt: prompt,
+                tools: tools,
+                maxIterations: 6,
+                executeTool: { [weak self] name, args in
+                    guard let self else { return "" }
+                    switch name {
+                    case "search_similar":
+                        let query = args["query"] as? String ?? ""
+                        searchCount += 1
+                        log("Task: search_similar \"\(query)\"")
+                        let results = await self.executeVectorSearch(query: query)
+                        return Self.encodeSearchResults(results)
+
+                    case "search_keywords":
+                        let query = args["query"] as? String ?? ""
+                        searchCount += 1
+                        log("Task: search_keywords \"\(query)\"")
+                        let results = await self.executeKeywordSearch(query: query)
+                        return Self.encodeSearchResults(results)
+
+                    case "read_screenshot_ocr":
+                        guard let sid = capturedScreenshotId else {
+                            return "No screenshot id available for this frame."
+                        }
+                        return await Self.readScreenshotOcr(id: sid)
+
+                    case "no_task_found":
+                        let cs = args["context_summary"] as? String ?? "No task on screen"
+                        let ca = args["current_activity"] as? String ?? "Unknown"
+                        log("Task: no_task_found — \(cs)")
+                        terminalResult = TaskExtractionResult(
+                            hasNewTask: false,
+                            task: nil,
+                            contextSummary: cs,
+                            currentActivity: ca
+                        )
+                        return "ACK. Now respond with {\"action\":\"final_answer\",\"text\":\"done\"}."
+
+                    case "reject_task":
+                        let reason = args["reason"] as? String ?? "Unknown"
+                        let cs = args["context_summary"] as? String ?? ""
+                        let ca = args["current_activity"] as? String ?? ""
+                        log("Task: reject_task — \(reason)")
+                        terminalResult = TaskExtractionResult(
+                            hasNewTask: false,
+                            task: nil,
+                            contextSummary: cs,
+                            currentActivity: ca
+                        )
+                        return "ACK. Now respond with {\"action\":\"final_answer\",\"text\":\"done\"}."
+
+                    case "extract_task":
+                        if let parsed = await self.parseExtractTaskArgs(args, fallbackApp: frameAppName) {
+                            terminalResult = parsed
+                            return "ACK: task recorded. Now respond with {\"action\":\"final_answer\",\"text\":\"done\"}."
+                        } else {
+                            // Validation failure — feed back to model to retry.
+                            let title = args["title"] as? String ?? ""
+                            let words = title.split(separator: " ").count
+                            let err = Self.validateTaskTitle(title, wordCount: words) ?? "title validation failed"
+                            return """
+                                REJECTED: \(err). Your title was: "\(title)" (\(words) words). \
+                                Either rewrite with 6+ words including a specific person/project name and concrete action, \
+                                or call no_task_found if you cannot be more specific.
+                                """
+                        }
+
+                    default:
+                        return "Error: unknown tool '\(name)'"
+                    }
+                }
+            )
+        } catch {
+            log("[TaskAssistant] tool loop threw: \(error.localizedDescription)")
+            return (nil, searchCount)
+        }
+
+        if answer == nil && terminalResult == nil {
+            log("[TaskAssistant] tool loop produced no terminal result (malformed JSON or maxIterations)")
+            return (nil, searchCount)
+        }
+
+        return (terminalResult, searchCount)
+    }
+
+    // MARK: - Local tool catalog (JSON-mode)
+
+    /// Tool catalog for the local task-extraction loop. Mirrors the 5
+    /// legacy Gemini tools plus a `read_screenshot_ocr` helper that exposes
+    /// the screenshot's OCR text in lieu of vision.
+    private func buildLocalTaskTools(hasScreenshotId: Bool) -> [ToolDefinition] {
+        let priorityEnum: [Any] = ["high", "medium", "low"]
+        let sourceCategoryEnum: [Any] = [
+            "direct_request", "self_generated", "calendar_driven",
+            "reactive", "external_system", "other"
+        ]
+        let sourceSubcategoryEnum: [Any] = [
+            "message", "meeting", "mention", "commitment",
+            "idea", "reminder", "goal_subtask",
+            "event_prep", "recurring", "deadline",
+            "error", "notification", "observation",
+            "project_tool", "alert", "documentation", "other"
+        ]
+
+        var tools: [ToolDefinition] = []
+
+        if hasScreenshotId {
+            tools.append(ToolDefinition(
+                name: "read_screenshot_ocr",
+                description: "Read OCR text from the screenshot under analysis. Returns up to ~4KB of extracted text plus window title. Call once before deciding whether to extract a task.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [:],
+                    "required": []
+                ]
+            ))
+        }
+
+        tools.append(contentsOf: [
+            ToolDefinition(
+                name: "search_similar",
+                description: "Search for semantically similar existing tasks via vector similarity. Use after you've spotted a potential request to check for duplicates.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "query": [
+                            "type": "string",
+                            "description": "Concise description of the potential task to search for"
+                        ]
+                    ],
+                    "required": ["query"]
+                ]
+            ),
+            ToolDefinition(
+                name: "search_keywords",
+                description: "FTS5 keyword search across existing tasks. Complements search_similar with precise keyword matching.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "query": [
+                            "type": "string",
+                            "description": "Keywords to match in existing tasks"
+                        ]
+                    ],
+                    "required": ["query"]
+                ]
+            ),
+            ToolDefinition(
+                name: "no_task_found",
+                description: "Call when there is no actionable request on screen (~90% of screenshots).",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "context_summary": [
+                            "type": "string",
+                            "description": "Brief summary of what the user is looking at"
+                        ],
+                        "current_activity": [
+                            "type": "string",
+                            "description": "What the user is actively doing"
+                        ]
+                    ],
+                    "required": ["context_summary", "current_activity"]
+                ]
+            ),
+            ToolDefinition(
+                name: "extract_task",
+                description: "Extract a new task that is not already tracked. Call ONLY after searching for duplicates. Title must be 6–15 words and include a concrete action plus a specific person/project/artifact.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "title": [
+                            "type": "string",
+                            "description": "Verb-first task title, 6–15 words. Must name a specific person/project/artifact."
+                        ],
+                        "description": [
+                            "type": "string",
+                            "description": "Additional context. Empty string if none."
+                        ],
+                        "priority": [
+                            "type": "string",
+                            "enum": priorityEnum
+                        ],
+                        "tags": [
+                            "type": "array",
+                            "items": ["type": "string"],
+                            "description": "1–3 relevant tags"
+                        ],
+                        "source_app": [
+                            "type": "string",
+                            "description": "App where the task was found"
+                        ],
+                        "inferred_deadline": [
+                            "type": "string",
+                            "description": "Deadline in yyyy-MM-dd format (resolve relative refs to a real date). Empty string if no deadline."
+                        ],
+                        "confidence": [
+                            "type": "number",
+                            "description": "0.0–1.0"
+                        ],
+                        "context_summary": [
+                            "type": "string",
+                            "description": "Brief summary of what user is looking at"
+                        ],
+                        "current_activity": [
+                            "type": "string",
+                            "description": "What the user is actively doing"
+                        ],
+                        "source_category": [
+                            "type": "string",
+                            "enum": sourceCategoryEnum
+                        ],
+                        "source_subcategory": [
+                            "type": "string",
+                            "enum": sourceSubcategoryEnum
+                        ],
+                        "relevance_score": [
+                            "type": "integer",
+                            "description": "Where this task ranks vs existing tasks (1 = most important; positive integer)."
+                        ]
+                    ],
+                    "required": [
+                        "title", "description", "priority", "tags",
+                        "source_app", "inferred_deadline", "confidence",
+                        "context_summary", "current_activity",
+                        "source_category", "source_subcategory", "relevance_score"
+                    ]
+                ]
+            ),
+            ToolDefinition(
+                name: "reject_task",
+                description: "Reject task extraction — duplicate / completed / previously rejected.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "reason": [
+                            "type": "string",
+                            "description": "Why this task was rejected"
+                        ],
+                        "context_summary": [
+                            "type": "string"
+                        ],
+                        "current_activity": [
+                            "type": "string"
+                        ]
+                    ],
+                    "required": ["reason", "context_summary", "current_activity"]
+                ]
+            ),
+        ])
+
+        return tools
+    }
+
+    /// Parse the extract_task tool arguments into a TaskExtractionResult.
+    /// Returns nil on validation failure so the caller can feed the rejection
+    /// back to the model and let it retry.
+    private func parseExtractTaskArgs(_ args: [String: Any], fallbackApp: String) -> TaskExtractionResult? {
+        let title = args["title"] as? String ?? ""
+        let words = title.split(separator: " ").count
+        if Self.validateTaskTitle(title, wordCount: words) != nil {
+            return nil
+        }
+
+        let description = args["description"] as? String
+        let priorityStr = args["priority"] as? String ?? "medium"
+        let priority = TaskPriority(rawValue: priorityStr) ?? .medium
+
+        let tags: [String]
+        if let arr = args["tags"] as? [Any] {
+            tags = arr.compactMap { $0 as? String }
+        } else if let s = args["tags"] as? String {
+            tags = [s]
+        } else {
+            tags = []
+        }
+
+        let sourceApp = args["source_app"] as? String ?? fallbackApp
+        let inferredDeadline = args["inferred_deadline"] as? String
+        let confidence: Double
+        if let v = args["confidence"] as? Double {
+            confidence = v
+        } else if let v = args["confidence"] as? Int {
+            confidence = Double(v)
+        } else if let s = args["confidence"] as? String, let v = Double(s) {
+            confidence = v
+        } else {
+            confidence = 0.5
+        }
+        let sourceCategory = args["source_category"] as? String ?? "other"
+        let sourceSubcategory = args["source_subcategory"] as? String ?? "other"
+        let relevanceScore: Int?
+        if let v = args["relevance_score"] as? Int {
+            relevanceScore = v
+        } else if let v = args["relevance_score"] as? Double {
+            relevanceScore = Int(v)
+        } else if let s = args["relevance_score"] as? String, let v = Int(s) {
+            relevanceScore = v
+        } else {
+            relevanceScore = nil
+        }
+        let contextSummary = args["context_summary"] as? String ?? ""
+        let currentActivity = args["current_activity"] as? String ?? ""
+
+        let task = ExtractedTask(
+            title: title,
+            description: description?.isEmpty == true ? nil : description,
+            priority: priority,
+            sourceApp: sourceApp,
+            inferredDeadline: inferredDeadline?.isEmpty == true ? nil : inferredDeadline,
+            confidence: confidence,
+            tags: tags,
+            sourceCategory: sourceCategory,
+            sourceSubcategory: sourceSubcategory,
+            relevanceScore: relevanceScore
+        )
+
+        log("Task: extract_task — \"\(title)\" (conf=\(confidence), pri=\(priorityStr), score=\(relevanceScore.map { String($0) } ?? "nil"))")
+
+        return TaskExtractionResult(
+            hasNewTask: true,
+            task: task,
+            contextSummary: contextSummary,
+            currentActivity: currentActivity
+        )
+    }
+
+    /// Encode a list of TaskSearchResult to a compact JSON string for tool
+    /// result feedback. Falls back to `[]` on encode failure.
+    private static func encodeSearchResults(_ results: [TaskSearchResult]) -> String {
+        if let data = try? JSONEncoder().encode(results),
+           let s = String(data: data, encoding: .utf8) {
+            return s
+        }
+        return "[]"
+    }
+
+    /// Read OCR + window title for a given screenshot id. Truncates to 3000
+    /// chars to keep tool feedback turns bounded.
+    private static func readScreenshotOcr(id: Int64) async -> String {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            return "Error: database unavailable"
+        }
+        do {
+            return try await dbQueue.read { db in
+                if let row = try GRDB.Row.fetchOne(
+                    db,
+                    sql: "SELECT appName, windowTitle, ocrText FROM screenshots WHERE id = ?",
+                    arguments: [id]
+                ) {
+                    let app = row["appName"] as? String ?? "?"
+                    let win = row["windowTitle"] as? String ?? ""
+                    let ocr = row["ocrText"] as? String ?? ""
+                    let truncated = ocr.count > 3000 ? String(ocr.prefix(3000)) + "... (truncated)" : ocr
+                    return """
+                        app: \(app)
+                        windowTitle: \(win)
+                        ocrText:
+                        \(truncated)
+                        """
+                }
+                return "No screenshot row for id=\(id)"
+            }
+        } catch {
+            return "Error reading screenshot: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Title Validation

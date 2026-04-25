@@ -63,12 +63,11 @@ actor InsightAssistant: ProactiveAssistant {
 
     init(apiKey: String? = nil) throws {
         // Infinite Recall fork: LLM client is resolved lazily per-call via
-        // AIProviderRegistry; constructor never fails on missing provider.
-        // NOTE: this assistant relies on multi-turn tool calling + vision, which
-        // the v1 local provider doesn't yet support. The processing loop will
-        // currently skip extraction with a clear log line until a tool-calling
-        // local model lands. TODO(local-tools): wire the SQL/screenshot tool
-        // loop through a local function-calling model.
+        // AIProviderRegistry. The legacy Gemini two-phase tool flow (vision +
+        // function calling) has been replaced with a single-phase JSON-mode
+        // tool loop driven by `LLMBridge.runToolLoop`. The local model can't
+        // see images, so investigation queries the screenshots table's
+        // ocrText column instead.
 
         let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         self.frameSignal = stream
@@ -498,12 +497,17 @@ actor InsightAssistant: ProactiveAssistant {
 
     // MARK: - Core Extraction (shared by production + test)
 
-    /// Two-phase insight extraction:
-    /// Phase 1 (text-only): Activity summary + SQL investigation loop. Model investigates via
-    ///   execute_sql, then calls `request_screenshot` with an ID and its findings so far.
-    /// Phase 2 (single vision call): Load the chosen screenshot + Phase 1 findings → single
-    ///   Gemini call with image → provide_advice or no_advice.
-    /// Returns (result, sqlQueryCount).
+    /// JSON-mode tool-calling insight extraction.
+    ///
+    /// Local LLM (Qwen 2.5-32B Instruct) can't take images, so the legacy
+    /// two-phase flow (text investigation → vision call) is collapsed into a
+    /// single tool loop. The model investigates by calling `execute_sql`
+    /// against the screenshots table (which carries `ocrText`), then calls
+    /// either `provide_advice` (final answer) or `no_advice` (final answer).
+    ///
+    /// Returns (result, sqlQueryCount). Returns (nil, n) if the loop runs
+    /// out of iterations or the model emits malformed JSON — callers stay
+    /// graceful in either case.
     private func runAdviceExtraction(
         jpegData: Data?,
         appName: String,
@@ -512,54 +516,245 @@ actor InsightAssistant: ProactiveAssistant {
         lookbackStart: Date,
         trackSqlCount: Bool
     ) async throws -> (InsightExtractionResult?, Int) {
-        // Infinite Recall fork: this flow requires multi-turn tool calling
-        // (execute_sql + request_screenshot) which the v1 local LLM provider
-        // doesn't expose. Bail out cleanly until tool-calling support lands.
-        // TODO(local-tools): replace with a local function-calling integration.
         guard await LLMBridge.currentClient() != nil else {
             log("[InsightAssistant] no LLM client available — skipping advice extraction")
             return (nil, 0)
         }
-        log("[InsightAssistant] tool-calling not supported by current LLM provider — skipping advice extraction (TODO: local tool calls)")
-        return await _legacyRunAdviceExtractionStub(
-            jpegData: jpegData,
-            appName: appName,
-            windowTitle: windowTitle,
-            referenceTime: referenceTime,
-            lookbackStart: lookbackStart,
-            trackSqlCount: trackSqlCount
+
+        // Build user prompt mirroring the legacy Phase 1 layout (current app +
+        // activity summary + previous insights).
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "h:mm a, EEEE"
+        var prompt = "CURRENT APP: \(appName)."
+        if let windowTitle = windowTitle, !windowTitle.isEmpty {
+            prompt += " Window: \"\(windowTitle)\"."
+        }
+        prompt += " Time: \(timeFormatter.string(from: referenceTime))."
+
+        let elapsed = referenceTime.timeIntervalSince(lookbackStart)
+        log("Insight: Activity lookback: \(String(format: "%.0f", elapsed))s (\(lookbackStart) to \(referenceTime))")
+        let activitySummary = await buildActivitySummary(from: lookbackStart, to: referenceTime)
+        if !activitySummary.isEmpty {
+            prompt += "\n\n" + activitySummary
+        }
+
+        if !previousInsights.isEmpty {
+            prompt += "\n\nPREVIOUSLY PROVIDED INSIGHTS (do not repeat or rephrase):\n"
+            for (index, prev) in previousInsights.prefix(maxInsightsInPrompt).enumerated() {
+                prompt += "\(index + 1). \(prev.insight)\n"
+            }
+        }
+
+        prompt += """
+
+
+            Investigate the activity summary above by calling execute_sql to read OCR text \
+            from screenshots that look interesting (browsers, comms, notes — not just the most-screenshotted app). \
+            When you find something specific and non-obvious worth advising about, call provide_advice. \
+            Otherwise call no_advice. Most screenshots have nothing actionable; default to no_advice.
+            """
+
+        // System prompt + DB schema hint for SQL.
+        var sysPrompt = await systemPrompt
+        if let language = await getUserLanguage(), language != "en" {
+            sysPrompt += "\n\nIMPORTANT: Respond (in the final_answer text or any user-visible advice) in the user's preferred language: \(language)"
+        }
+        sysPrompt += "\n\nDATABASE SCHEMA for execute_sql:\nscreenshots(id INTEGER, timestamp TEXT, appName TEXT, windowTitle TEXT, ocrText TEXT, focusStatus TEXT)"
+
+        let tools = buildLocalInsightTools()
+
+        // Tool loop — execute_sql collects evidence, provide_advice / no_advice
+        // are terminal "tools" whose JSON args carry the final result. We
+        // return early from `executeTool` for terminal tools by stashing the
+        // payload into a captured holder and signalling the loop to wind down
+        // via a sentinel string the model can ignore.
+        var sqlCount = 0
+        var terminalResult: InsightExtractionResult?
+        let trackSql = trackSqlCount
+
+        let answer: String?
+        do {
+            answer = try await LLMBridge.runToolLoop(
+                systemPrompt: sysPrompt,
+                userPrompt: prompt,
+                tools: tools,
+                maxIterations: 7,
+                executeTool: { [weak self] name, args in
+                    guard let self else { return "" }
+                    switch name {
+                    case "execute_sql":
+                        if trackSql { sqlCount += 1 }
+                        let query = args["query"] as? String ?? ""
+                        log("Insight: execute_sql — \(query.prefix(200))")
+                        let result = await ChatToolExecutor.execute(
+                            ToolCall(name: "execute_sql", arguments: ["query": query], thoughtSignature: nil)
+                        )
+                        return result
+
+                    case "provide_advice":
+                        let parsed = await self.parseProvideAdviceArgs(args)
+                        terminalResult = parsed
+                        return "ACK: advice recorded. Now respond with {\"action\":\"final_answer\",\"text\":\"done\"}."
+
+                    case "no_advice":
+                        let contextSummary = args["context_summary"] as? String ?? "No context"
+                        let currentActivity = args["current_activity"] as? String ?? "Unknown"
+                        terminalResult = InsightExtractionResult(
+                            hasInsight: false,
+                            insight: nil,
+                            contextSummary: contextSummary,
+                            currentActivity: currentActivity
+                        )
+                        return "ACK: no advice. Now respond with {\"action\":\"final_answer\",\"text\":\"done\"}."
+
+                    default:
+                        return "Error: unknown tool '\(name)'"
+                    }
+                }
+            )
+        } catch {
+            log("[InsightAssistant] tool loop threw: \(error.localizedDescription)")
+            return (nil, sqlCount)
+        }
+
+        if answer == nil && terminalResult == nil {
+            log("[InsightAssistant] tool loop produced no terminal result (malformed JSON or maxIterations)")
+            return (nil, sqlCount)
+        }
+
+        return (terminalResult, sqlCount)
+    }
+
+    // MARK: - Local tool catalog (JSON-mode)
+
+    /// Tool catalog for the local Qwen-driven insight loop. Mirrors the
+    /// legacy Gemini phase-1+phase-2 catalogs collapsed into one set —
+    /// `execute_sql` for investigation, `provide_advice` / `no_advice` as
+    /// terminal answers. (No `request_screenshot` because we have no vision.)
+    private func buildLocalInsightTools() -> [ToolDefinition] {
+        return [
+            ToolDefinition(
+                name: "execute_sql",
+                description: "Execute a SELECT query on the local screenshots table to investigate what the user has been doing. Read ocrText from interesting windows, check timing, etc. SELECT only. Auto-limited to 200 rows.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "query": [
+                            "type": "string",
+                            "description": "SQL SELECT query against the screenshots table"
+                        ]
+                    ],
+                    "required": ["query"]
+                ]
+            ),
+            ToolDefinition(
+                name: "provide_advice",
+                description: "Call this when you have a specific, non-obvious insight for the user based on your investigation. The advice should be concrete and actionable.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "advice": [
+                            "type": "string",
+                            "description": "The advice text (1-2 sentences, max 100 chars). Start with what you noticed, then why it matters."
+                        ],
+                        "headline": [
+                            "type": "string",
+                            "description": "Ultra-short observation (max 5 words) for notification preview."
+                        ],
+                        "reasoning": [
+                            "type": "string",
+                            "description": "Brief explanation of why this advice is relevant."
+                        ],
+                        "category": [
+                            "type": "string",
+                            "enum": ["productivity", "communication", "learning", "other"]
+                        ],
+                        "source_app": [
+                            "type": "string",
+                            "description": "App where context was observed."
+                        ],
+                        "confidence": [
+                            "type": "number",
+                            "description": "0.0–1.0. 0.90+: preventing clear mistake. 0.75–0.89: highly relevant non-obvious tip. 0.60–0.74: useful but user might know."
+                        ],
+                        "context_summary": [
+                            "type": "string",
+                            "description": "Brief summary of what user is looking at."
+                        ],
+                        "current_activity": [
+                            "type": "string",
+                            "description": "High-level description of user's activity."
+                        ]
+                    ],
+                    "required": [
+                        "advice", "headline", "category", "source_app",
+                        "confidence", "context_summary", "current_activity"
+                    ]
+                ]
+            ),
+            ToolDefinition(
+                name: "no_advice",
+                description: "Call this when there is nothing specific and non-obvious worth advising about. This is the most common outcome.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "context_summary": [
+                            "type": "string",
+                            "description": "Brief summary of what user is looking at"
+                        ],
+                        "current_activity": [
+                            "type": "string",
+                            "description": "High-level description of user's activity"
+                        ]
+                    ],
+                    "required": ["context_summary", "current_activity"]
+                ]
+            ),
+        ]
+    }
+
+    /// Parse a JSON-mode `provide_advice` arguments dict into an
+    /// `InsightExtractionResult`. Mirrors the legacy `parseProvideAdvice`
+    /// (which took a `ToolCall` from GeminiClient) but works against the
+    /// raw `[String: Any]` the local tool loop hands us.
+    private func parseProvideAdviceArgs(_ args: [String: Any]) -> InsightExtractionResult {
+        let adviceText = args["advice"] as? String ?? ""
+        let headline = args["headline"] as? String
+        let reasoning = args["reasoning"] as? String
+        let categoryStr = args["category"] as? String ?? "other"
+        let category = InsightCategory(rawValue: categoryStr) ?? .other
+        let sourceApp = args["source_app"] as? String ?? ""
+        let contextSummary = args["context_summary"] as? String ?? ""
+        let currentActivity = args["current_activity"] as? String ?? ""
+
+        let confidence: Double
+        if let v = args["confidence"] as? Double {
+            confidence = v
+        } else if let v = args["confidence"] as? Int {
+            confidence = Double(v)
+        } else if let s = args["confidence"] as? String, let v = Double(s) {
+            confidence = v
+        } else {
+            confidence = 0.5
+        }
+
+        let insight = ExtractedInsight(
+            insight: adviceText,
+            headline: headline,
+            reasoning: reasoning,
+            category: category,
+            sourceApp: sourceApp,
+            confidence: confidence
         )
-    }
 
-    /// Placeholder for the legacy Gemini tool-calling extraction. Always
-    /// returns no-op until a local function-calling provider lands.
-    /// The full Gemini implementation lived in this file pre-fork; see git
-    /// history for the original two-phase logic.
-    private func _legacyRunAdviceExtractionStub(
-        jpegData: Data?,
-        appName: String,
-        windowTitle: String?,
-        referenceTime: Date,
-        lookbackStart: Date,
-        trackSqlCount: Bool
-    ) async -> (InsightExtractionResult?, Int) {
-        return (nil, 0)
-    }
+        log("Insight: provide_advice — \"\(adviceText)\" [\(categoryStr), conf=\(confidence)]")
 
-    /// Original Gemini implementation, kept for reference. NOT INVOKED.
-    /// TODO(local-tools): port this once a tool-calling local model is wired in.
-    private func _legacyRunAdviceExtractionGemini(
-        jpegData: Data?,
-        appName: String,
-        windowTitle: String?,
-        referenceTime: Date,
-        lookbackStart: Date,
-        trackSqlCount: Bool
-    ) async throws -> (InsightExtractionResult?, Int) {
-        // Stripped in Infinite Recall fork — see git history for the original
-        // two-phase Gemini tool-calling implementation. Will be re-ported once
-        // a local function-calling provider is wired into AIProviderRegistry.
-        return (nil, 0)
+        return InsightExtractionResult(
+            hasInsight: true,
+            insight: insight,
+            contextSummary: contextSummary,
+            currentActivity: currentActivity
+        )
     }
 
     // MARK: - Activity Summary
@@ -624,145 +819,9 @@ actor InsightAssistant: ProactiveAssistant {
         }
     }
 
-    // MARK: - Tool Definitions
-
-    /// Phase 1 tools: text-only investigation (execute_sql, request_screenshot, no_advice)
-    private func buildPhase1Tools() -> GeminiTool {
-        GeminiTool(functionDeclarations: [
-            GeminiTool.FunctionDeclaration(
-                name: "execute_sql",
-                description: "Execute a SQL query on the local database to investigate screen activity. The screenshots table has: id INTEGER, timestamp TEXT, appName TEXT, windowTitle TEXT, ocrText TEXT, focusStatus TEXT. Use this to read OCR text from interesting windows, check what the user was doing, etc. SELECT queries only. Auto-limited to 200 rows.",
-                parameters: GeminiTool.FunctionDeclaration.Parameters(
-                    type: "object",
-                    properties: [
-                        "query": .init(type: "string", description: "SQL SELECT query to execute on the screenshots table")
-                    ],
-                    required: ["query"]
-                )
-            ),
-            GeminiTool.FunctionDeclaration(
-                name: "request_screenshot",
-                description: "Request to view a specific screenshot. Call this when you've found something interesting via SQL and want to see the actual screen. Provide the screenshot ID and a summary of your findings so far. The screenshot will be shown to you for final analysis.",
-                parameters: GeminiTool.FunctionDeclaration.Parameters(
-                    type: "object",
-                    properties: [
-                        "screenshot_id": .init(type: "integer", description: "The screenshot ID from the screenshots table"),
-                        "findings": .init(type: "string", description: "Summary of what you found during investigation — what app, what OCR text caught your attention, and what you suspect might be worth advising about")
-                    ],
-                    required: ["screenshot_id", "findings"]
-                )
-            ),
-            GeminiTool.FunctionDeclaration(
-                name: "no_advice",
-                description: "Call this when there is nothing worth advising about. Nothing qualifies as a specific, non-obvious insight. This ends the analysis.",
-                parameters: GeminiTool.FunctionDeclaration.Parameters(
-                    type: "object",
-                    properties: [
-                        "context_summary": .init(type: "string", description: "Brief summary of what user is looking at"),
-                        "current_activity": .init(type: "string", description: "High-level description of user's activity")
-                    ],
-                    required: ["context_summary", "current_activity"]
-                )
-            ),
-        ])
-    }
-
-    /// Phase 2 tools: vision call with screenshot + SQL cross-referencing (execute_sql, provide_advice, no_advice)
-    private func buildPhase2Tools() -> GeminiTool {
-        GeminiTool(functionDeclarations: [
-            GeminiTool.FunctionDeclaration(
-                name: "execute_sql",
-                description: "Cross-reference your findings by querying the database. Use this to check if an issue was resolved in later screenshots, verify context across time, or look up related activity. The screenshots table has: id INTEGER, timestamp TEXT, appName TEXT, windowTitle TEXT, ocrText TEXT, focusStatus TEXT. SELECT queries only.",
-                parameters: GeminiTool.FunctionDeclaration.Parameters(
-                    type: "object",
-                    properties: [
-                        "query": .init(type: "string", description: "SQL SELECT query to execute on the screenshots table")
-                    ],
-                    required: ["query"]
-                )
-            ),
-            GeminiTool.FunctionDeclaration(
-                name: "provide_advice",
-                description: "Call this when you have a specific, non-obvious insight for the user based on the screenshot and your investigation findings. You should cross-reference first using execute_sql to verify the issue is still relevant.",
-                parameters: GeminiTool.FunctionDeclaration.Parameters(
-                    type: "object",
-                    properties: [
-                        "advice": .init(type: "string", description: "The advice text (1-2 sentences, max 100 chars). Start with what you noticed, then why it matters."),
-                        "headline": .init(type: "string", description: "Ultra-short observation (max 5 words) for notification preview. E.g. 'Draft saved in /tmp', 'Credentials visible in terminal'"),
-                        "reasoning": .init(type: "string", description: "Brief explanation of why this advice is relevant"),
-                        "category": .init(type: "string", description: "Category of insight", enumValues: ["productivity", "communication", "learning", "other"]),
-                        "source_app": .init(type: "string", description: "App where context was observed"),
-                        "confidence": .init(type: "number", description: "Confidence score 0.0-1.0. 0.90+: preventing clear mistake. 0.75-0.89: highly relevant non-obvious tip. 0.60-0.74: useful but user might know."),
-                        "context_summary": .init(type: "string", description: "Brief summary of what user is looking at"),
-                        "current_activity": .init(type: "string", description: "High-level description of user's activity")
-                    ],
-                    required: ["advice", "headline", "category", "source_app", "confidence", "context_summary", "current_activity"]
-                )
-            ),
-            GeminiTool.FunctionDeclaration(
-                name: "no_advice",
-                description: "Call this when the screenshot doesn't reveal anything worth advising about, or when cross-referencing shows the issue was already resolved.",
-                parameters: GeminiTool.FunctionDeclaration.Parameters(
-                    type: "object",
-                    properties: [
-                        "context_summary": .init(type: "string", description: "Brief summary of what user is looking at"),
-                        "current_activity": .init(type: "string", description: "High-level description of user's activity")
-                    ],
-                    required: ["context_summary", "current_activity"]
-                )
-            ),
-        ])
-    }
-
-    // MARK: - Parse Tool Results
-
-    /// Parse the provide_advice tool call into an InsightExtractionResult
-    private func parseProvideAdvice(_ toolCall: ToolCall) -> InsightExtractionResult {
-        let adviceText = toolCall.arguments["advice"] as? String ?? ""
-        let headline = toolCall.arguments["headline"] as? String
-        let reasoning = toolCall.arguments["reasoning"] as? String
-        let categoryStr = toolCall.arguments["category"] as? String ?? "other"
-        let category = InsightCategory(rawValue: categoryStr) ?? .other
-        let sourceApp = toolCall.arguments["source_app"] as? String ?? ""
-        let contextSummary = toolCall.arguments["context_summary"] as? String ?? ""
-        let currentActivity = toolCall.arguments["current_activity"] as? String ?? ""
-
-        let confidence: Double
-        if let confValue = toolCall.arguments["confidence"] as? Double {
-            confidence = confValue
-        } else if let confInt = toolCall.arguments["confidence"] as? Int {
-            confidence = Double(confInt)
-        } else if let confStr = toolCall.arguments["confidence"] as? String, let parsed = Double(confStr) {
-            confidence = parsed
-        } else {
-            confidence = 0.5
-        }
-
-        let insight = ExtractedInsight(
-            insight: adviceText,
-            headline: headline,
-            reasoning: reasoning,
-            category: category,
-            sourceApp: sourceApp,
-            confidence: confidence
-        )
-
-        log("Insight: --- PROVIDE_ADVICE ---")
-        log("Insight:   insight: \(adviceText)")
-        log("Insight:   headline: \(headline ?? "(none)")")
-        log("Insight:   reasoning: \(reasoning ?? "(none)")")
-        log("Insight:   category: \(categoryStr)")
-        log("Insight:   source_app: \(sourceApp)")
-        log("Insight:   confidence: \(confidence)")
-        log("Insight:   context: \(contextSummary)")
-        log("Insight:   activity: \(currentActivity)")
-        return InsightExtractionResult(
-            hasInsight: true,
-            insight: insight,
-            contextSummary: contextSummary,
-            currentActivity: currentActivity
-        )
-    }
+    // (Legacy Gemini buildPhase1Tools / buildPhase2Tools / parseProvideAdvice
+    //  removed — replaced by buildLocalInsightTools + parseProvideAdviceArgs
+    //  above, which run on the local JSON-mode tool loop.)
 }
 
 // MARK: - Timeout Helper
