@@ -83,9 +83,6 @@ struct SidebarView: View {
   @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
   @ObservedObject private var crispManager = CrispManager.shared
 
-  // State for Get Omi Widget (shown when no device is paired, dismissible)
-  @AppStorage("showGetOmiWidget") private var showGetOmiWidget = true
-
   // Tier gating (0 = show all, 1-6 = sequential tiers)
   @AppStorage("currentTierLevel") private var currentTierLevel = 0
 
@@ -273,12 +270,6 @@ struct SidebarView: View {
           if deviceProvider.isConnected || deviceProvider.pairedDevice != nil {
             Spacer().frame(height: 12)
             deviceStatusWidget
-          }
-
-          // Get Omi promo widget (dismissible sales link)
-          if showGetOmiWidget {
-            Spacer().frame(height: 12)
-            getOmiWidget
           }
 
           // Update available widget
@@ -544,71 +535,6 @@ struct SidebarView: View {
   //        .buttonStyle(.plain)
   //        .help("Upgrade to Pro")
   //    }
-
-  // MARK: - Get Omi Widget (Sales link to omi.me)
-  private var getOmiWidget: some View {
-    Button(action: {
-      if let url = URL(string: "https://www.omi.me") {
-        NSWorkspace.shared.open(url)
-      }
-    }) {
-      HStack(spacing: 12) {
-        // Omi device image
-        if let deviceImage = OmiDeviceImage.shared {
-          Image(nsImage: deviceImage)
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .frame(width: 24, height: 24)
-        } else {
-          // Fallback SF Symbol
-          Image(systemName: "wave.3.right.circle.fill")
-            .scaledFont(size: 17)
-            .foregroundColor(OmiColors.purplePrimary)
-            .frame(width: iconWidth)
-        }
-
-        if !isCollapsed {
-          // Text content
-          VStack(alignment: .leading, spacing: 2) {
-            Text("Get Infinite Recall Device")
-              .scaledFont(size: 13, weight: .semibold)
-              .foregroundColor(OmiColors.textPrimary)
-
-            Text("Your wearable AI companion")
-              .scaledFont(size: 11)
-              .foregroundColor(OmiColors.textTertiary.opacity(0.8))
-          }
-
-          Spacer()
-
-          Button(action: {
-            withAnimation {
-              showGetOmiWidget = false
-            }
-          }) {
-            Image(systemName: "xmark")
-              .scaledFont(size: 10, weight: .medium)
-              .foregroundColor(OmiColors.textTertiary)
-              .padding(6)
-          }
-          .buttonStyle(.plain)
-          .help("Dismiss")
-        }
-      }
-      .padding(.horizontal, 12)
-      .padding(.vertical, 11)
-      .background(
-        RoundedRectangle(cornerRadius: 10)
-          .fill(OmiColors.backgroundTertiary.opacity(0.6))
-          .overlay(
-            RoundedRectangle(cornerRadius: 10)
-              .stroke(OmiColors.backgroundQuaternary.opacity(0.3), lineWidth: 1)
-          )
-      )
-    }
-    .buttonStyle(.plain)
-    .help(isCollapsed ? "Get Infinite Recall Device" : "")
-  }
 
   // MARK: - Update Available Widget
   @State private var updateGlowAnimating = false
