@@ -83,6 +83,74 @@ struct ConversationRowView: View {
     return folders.first(where: { $0.id == folderId })?.name
   }
 
+  /// Inline 1-2 line summary for the row.
+  /// Source priority:
+  ///   1. `structured.overview` (LLM-generated, available once mlx-lm is up)
+  ///   2. First ~120 chars of segment text (cached on AppState)
+  ///   3. `nil` — caller renders an italic placeholder
+  /// WhisperKit special tokens (e.g. `<|0.00|>`) are stripped defensively
+  /// in case any slipped through unCleaned.
+  private var previewText: String? {
+    let overview = conversation.structured.overview.trimmingCharacters(
+      in: .whitespacesAndNewlines)
+    if !overview.isEmpty {
+      return stripWhisperTokens(overview)
+    }
+    if let cached = appState.conversationPreviews[conversation.id],
+      !cached.isEmpty
+    {
+      return stripWhisperTokens(cached)
+    }
+    // Fallback: try concatenating in-memory segments if any are attached
+    // (rare for list view since getLocalConversations passes empty segments,
+    // but cheap to check).
+    let joined = conversation.transcriptSegments
+      .prefix(3)
+      .map { $0.text }
+      .joined(separator: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    if !joined.isEmpty {
+      return stripWhisperTokens(String(joined.prefix(120)))
+    }
+    return nil
+  }
+
+  private func stripWhisperTokens(_ s: String) -> String {
+    let stripped = s.replacingOccurrences(
+      of: #"<\|[^|>]+\|>"#,
+      with: "",
+      options: .regularExpression
+    )
+    return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  /// Italic placeholder when no preview content exists yet.
+  private var placeholderText: String {
+    // If the conversation is still in-progress the user is actively recording.
+    if conversation.status == .inProgress {
+      return "Recording…"
+    }
+    return "No transcript yet"
+  }
+
+  @ViewBuilder
+  private var previewLine: some View {
+    if let preview = previewText {
+      Text(preview)
+        .scaledFont(size: 12)
+        .foregroundColor(OmiColors.textSecondary)
+        .lineLimit(2)
+        .truncationMode(.tail)
+        .multilineTextAlignment(.leading)
+    } else {
+      Text(placeholderText)
+        .scaledFont(size: 12)
+        .italic()
+        .foregroundColor(OmiColors.textTertiary)
+        .lineLimit(1)
+    }
+  }
+
   /// Label for the conversation source
   private var sourceLabel: String {
     switch conversation.source {
@@ -332,6 +400,11 @@ struct ConversationRowView: View {
             .scaledFont(size: 12)
             .foregroundColor(OmiColors.textTertiary)
         }
+
+        // Inline 1-2 line preview underneath title/duration. See `previewText`
+        // for source priority (structured.overview → first ~120 chars of
+        // segments → italic 'Recording…' / 'No transcript yet' placeholder).
+        previewLine
       }
 
       Spacer()
@@ -419,6 +492,11 @@ struct ConversationRowView: View {
             .scaledFont(size: 12)
             .foregroundColor(OmiColors.textTertiary)
         }
+
+        // Inline 1-2 line preview underneath title/duration. See `previewText`
+        // for source priority (structured.overview → first ~120 chars of
+        // segments → italic 'Recording…' / 'No transcript yet' placeholder).
+        previewLine
       }
 
       Spacer()

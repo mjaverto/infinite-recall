@@ -360,6 +360,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     AnalyticsManager.shared.appLaunched()
     AnalyticsManager.shared.trackDisplayInfo()
 
+    // Infinite Recall fork: clean up worthless 0s artifacts left behind
+    // by sessions that started but where no audio actually flowed (brief
+    // launches, mid-launch failures, permission denials). These rows had
+    // been cluttering the Conversations list as titleless duration-0 cards.
+    // Skips active recordings (status='recording' newer than 30s) to avoid
+    // racing capture before the first segment lands.
+    Task {
+      do {
+        let purged = try await TranscriptionStorage.shared.purgeEmptySessions()
+        if purged > 0 {
+          log("Conversations: Purged \(purged) empty session(s) on launch")
+        }
+      } catch {
+        logError("Conversations: purgeEmptySessions failed", error: error)
+      }
+    }
+
     // Probe the local LLM (mlx-lm.server) and surface the result + active
     // provider in the log. Best-effort: a missing/offline server only means
     // assistants will gracefully no-op until the server is up.

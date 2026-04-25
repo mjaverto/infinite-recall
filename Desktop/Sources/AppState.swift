@@ -80,6 +80,14 @@ class AppState: ObservableObject {
   @Published var conversationsError: String? = nil
   @Published var totalConversationsCount: Int? = nil  // Total count (fetched separately)
 
+  /// Lightweight inline previews for the Conversations list, keyed by the
+  /// synthesized `local-N` conversation id. Populated alongside
+  /// `loadConversations` via a single batched SQL pass — see
+  /// `TranscriptionStorage.getFirstSegmentTexts`. The row view falls back
+  /// to `structured.overview` first; this map fills the gap until the
+  /// local LLM has summarized a conversation.
+  @Published var conversationPreviews: [String: String] = [:]
+
   // Conversation filters
   @Published var showStarredOnly: Bool = false
   @Published var selectedDateFilter: Date? = nil
@@ -1703,10 +1711,18 @@ class AppState: ObservableObject {
     // (backend will process it; memory_created event may arrive on the new session's WebSocket)
     if let sessionId = currentSessionId {
       do {
-        try await TranscriptionStorage.shared.finishSession(id: sessionId)
-        log("Transcription: Finished DB session \(sessionId) before reconnect")
+        let segmentCount = try await TranscriptionStorage.shared.getSegmentCount(sessionId: sessionId)
+        let chunkCount = try await TranscriptionStorage.shared.getAudioChunkCount(sessionId: sessionId)
+        let elapsed: Double = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        if segmentCount == 0 && chunkCount == 0 && elapsed < 5 {
+          try await TranscriptionStorage.shared.deleteSession(id: sessionId)
+          log("Transcription: Discarded empty session \(sessionId) before reconnect (elapsed=\(String(format: "%.1f", elapsed))s)")
+        } else {
+          try await TranscriptionStorage.shared.finishSession(id: sessionId)
+          log("Transcription: Finished DB session \(sessionId) before reconnect")
+        }
       } catch {
-        logError("Transcription: Failed to finish DB session \(sessionId)", error: error)
+        logError("Transcription: Failed to finalize DB session \(sessionId)", error: error)
       }
     }
 
@@ -1868,14 +1884,29 @@ class AppState: ObservableObject {
     // End live notes session
     LiveNotesMonitor.shared.endSession()
 
-    // Mark DB session as finished (pending upload / crash recovery)
+    // Mark DB session as finished (pending upload / crash recovery).
+    // BUT first: if the session has no segments and no audio_chunks AND
+    // ran for less than 5 seconds, drop it on the floor — these are
+    // worthless 0s artifacts (brief launches, permission denials, etc.)
+    // that just clutter the Conversations list.
     if let sessionId = currentSessionId {
+      let elapsedSeconds: Double = {
+        guard let started = recordingStartTime else { return 0 }
+        return Date().timeIntervalSince(started)
+      }()
       Task {
         do {
-          try await TranscriptionStorage.shared.finishSession(id: sessionId)
-          log("Transcription: Finished DB session \(sessionId)")
+          let segmentCount = try await TranscriptionStorage.shared.getSegmentCount(sessionId: sessionId)
+          let chunkCount = try await TranscriptionStorage.shared.getAudioChunkCount(sessionId: sessionId)
+          if segmentCount == 0 && chunkCount == 0 && elapsedSeconds < 5 {
+            try await TranscriptionStorage.shared.deleteSession(id: sessionId)
+            log("Transcription: Discarded empty session \(sessionId) (elapsed=\(String(format: "%.1f", elapsedSeconds))s, no segments, no audio)")
+          } else {
+            try await TranscriptionStorage.shared.finishSession(id: sessionId)
+            log("Transcription: Finished DB session \(sessionId)")
+          }
         } catch {
-          logError("Transcription: Failed to finish DB session \(sessionId)", error: error)
+          logError("Transcription: Failed to finalize DB session \(sessionId)", error: error)
         }
       }
     }
@@ -1944,6 +1975,31 @@ class AppState: ObservableObject {
       if !cachedConversations.isEmpty {
         conversations = cachedConversations
         log("Conversations: Loaded \(cachedConversations.count) from local cache (instant)")
+
+        // Batch-fetch first-segment text per session for inline preview.
+        // Only need this for `local-N` ids (no overview yet); rows backed by
+        // a real backendId still benefit if their structured.overview is
+        // empty. Either way this is one SQL pass for the visible page.
+        let sessionIds: [Int64] = cachedConversations.compactMap { conv in
+          guard conv.id.hasPrefix("local-"),
+            let n = Int64(conv.id.dropFirst("local-".count))
+          else { return nil }
+          return n
+        }
+        if !sessionIds.isEmpty {
+          do {
+            let textsBySessionId = try await TranscriptionStorage.shared.getFirstSegmentTexts(
+              sessionIds: sessionIds)
+            var previews: [String: String] = [:]
+            for (sid, text) in textsBySessionId {
+              let preview = String(text.prefix(120))
+              previews["local-\(sid)"] = preview
+            }
+            conversationPreviews = previews
+          } catch {
+            logError("Conversations: Failed to load previews", error: error)
+          }
+        }
 
         // Get local count
         let localCount = try await TranscriptionStorage.shared.getLocalConversationsCount(
