@@ -1,28 +1,28 @@
-// Health check routes
+use axum::{extract::State, Json};
+use serde_json::{json, Value};
 
-use axum::{routing::get, Json, Router};
-use serde::Serialize;
+use crate::db::with_conn;
+use crate::error::ApiResult;
+use crate::state::AppState;
 
-use crate::AppState;
-
-#[derive(Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub service: String,
-    pub version: String,
-}
-
-/// Health check endpoint for Kubernetes probes
-async fn health_check() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        service: "omi-desktop-backend".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    // Cheap readability check.
+    let ok = with_conn(&state.pool, |c| {
+        c.query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(true)
     })
+    .await
+    .unwrap_or(false);
+    Ok(Json(json!({
+        "status": if ok { "ok" } else { "degraded" },
+        "db_readable": ok,
+    })))
 }
 
-pub fn health_routes() -> Router<AppState> {
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/", get(health_check))
+pub async fn version() -> Json<Value> {
+    Json(json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "api_shape": "omi-local-v1",
+    }))
 }
