@@ -4,6 +4,29 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
+// MARK: - Timeout helper
+
+/// Races `work` against a deadline. Cancels `work` and throws `TimeoutError`
+/// if `seconds` elapse before the closure returns.
+struct TimeoutError: Error {}
+
+func withTimeout<T: Sendable>(
+    seconds: TimeInterval,
+    work: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await work() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw TimeoutError()
+        }
+        // Return the first result (work or timeout — whichever finishes first).
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
+    }
+}
+
 /// Consumes frames from `VisualActivitySampler`, calls the local VLM
 /// (`VisionLLMClient.shared`, owned by Sprint GG) for a 1-2 sentence
 /// description, and persists a `visual_activity` row.
@@ -152,46 +175,78 @@ actor VisualActivityIndexer {
 
     // MARK: - VLM availability + call
 
-    /// **Sprint GG dependency stub.**
+    /// Returns true when the local VLM sidecar is reachable on 127.0.0.1:8081.
     ///
-    /// Once Agent GG lands `VisionLLMClient.shared.isReachable()`, replace
-    /// the body with `await VisionLLMClient.shared.isReachable()`. Today we
-    /// hard-return `false` so we exercise the OCR-only fallback path
-    /// end-to-end without making real HTTP calls to a VLM that doesn't yet
-    /// exist on `127.0.0.1:8081`.
+    /// INVARIANT: `VisionLLMClient.isReachable()` must NOT call
+    /// `IdleAIController.shared.recordAICall()`. A polling probe that records
+    /// AI calls would pin the VLM alive, defeating idle-unload entirely.
+    /// Verified: `VisionLLMClient.isReachable()` is a bare URLSession GET to
+    /// `/v1/models` with a 2s timeout — no `recordAICall()` in its body.
     private func isVLMAvailable() async -> Bool {
-        // TODO(sprint-gg): wire to VisionLLMClient.shared.isReachable()
-        return false
+        return await VisionLLMClient.shared.isReachable()
     }
 
-    /// **Sprint GG dependency stub.**
-    ///
-    /// Calls `VisionLLMClient.shared.describe(image:prompt:)` (and
-    /// optionally `.extractStructured`) with a 5s timeout. Today this is
-    /// unreachable because `isVLMAvailable()` returns false; left as a
-    /// concrete shape so swapping in the real client is a one-line change.
+    /// Calls `VisionLLMClient.shared.describe(image:prompt:)` wrapped in a
+    /// `withTimeout` guard. On timeout or any error, returns `(nil, nil)` and
+    /// logs so the caller can insert an OCR-only row.
     private func describeWithTimeout(
         cgImage: CGImage,
         appName: String,
         windowTitle: String?
     ) async -> (summary: String?, uiState: String?) {
-        // TODO(sprint-gg): wire to VisionLLMClient. Sketch of intended impl:
-        //
-        //   let prompt = "Describe what's happening on this screen in 1-2 \
-        //                sentences. Note app, document, key UI elements visible."
-        //   return await withTimeout(seconds: vlmTimeout) {
-        //     let summary = try await VisionLLMClient.shared.describe(
-        //       image: cgImage, prompt: prompt
-        //     )
-        //     let uiState = try? await VisionLLMClient.shared.extractStructured(
-        //       image: cgImage, schemaJSON: VisualActivityIndexer.uiStateSchema
-        //     )
-        //     return (summary, uiState.flatMap(serializeJSON))
-        //   } ?? (nil, nil)
-        _ = appName
-        _ = windowTitle
-        return (nil, nil)
+        // Convert CGImage → NSImage. VisionLLMClient.describe takes NSImage.
+        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+
+        let contextHint: String
+        if let title = windowTitle, !title.isEmpty {
+            contextHint = "\(appName) — \(title)"
+        } else {
+            contextHint = appName
+        }
+        let prompt = "Describe what is happening on this screen in 1-2 sentences. "
+            + "Note the app, document, or content visible. Context: \(contextHint)"
+
+        let uiStateSchema = VisualActivityIndexer.uiStateSchema
+        let timeout = vlmTimeout
+
+        do {
+            let (summary, uiState) = try await withTimeout(seconds: timeout) { () async throws -> (String, String?) in
+                let text = try await VisionLLMClient.shared.describe(image: nsImage, prompt: prompt)
+                let structured = try? await VisionLLMClient.shared.extractStructured(
+                    image: nsImage,
+                    schemaJSON: uiStateSchema
+                )
+                let serialized = structured.flatMap { dict -> String? in
+                    guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]) else { return nil }
+                    return String(data: data, encoding: .utf8)
+                }
+                return (text, serialized)
+            }
+            return (summary.isEmpty ? nil : summary, uiState)
+        } catch is TimeoutError {
+            log("VisualActivityIndexer: VLM describe timed out after \(timeout)s — inserting OCR-only row")
+            return (nil, nil)
+        } catch {
+            log("VisualActivityIndexer: VLM describe failed: \(error) — inserting OCR-only row")
+            return (nil, nil)
+        }
     }
+
+    // MARK: - UI state schema
+
+    /// JSON schema string sent to `VisionLLMClient.extractStructured`.
+    private static let uiStateSchema = """
+        {
+          "type": "object",
+          "properties": {
+            "appName":     { "type": "string" },
+            "windowTitle": { "type": "string" },
+            "uiMode":      { "type": "string", "description": "e.g. editor, browser, terminal, video, document" },
+            "focusedElement": { "type": "string", "description": "The most prominent UI element or content area" }
+          },
+          "required": ["appName"]
+        }
+        """
 
     // MARK: - Image resizing
 

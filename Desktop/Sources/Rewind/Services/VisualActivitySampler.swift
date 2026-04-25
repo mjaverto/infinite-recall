@@ -65,6 +65,16 @@ final class VisualActivitySampler: ObservableObject {
     private var lastSampleApp: String?
     private var isStarted: Bool = false
 
+    /// Pending app-switch debounce state. An app switch is only committed
+    /// once the new app has been in the foreground for ≥ `appSwitchDebounce`
+    /// seconds AND the current frame's appName still matches `pendingAppName`.
+    private var pendingAppSwitchAt: Date?
+    private var pendingAppName: String?
+
+    /// Minimum dwell time before an app-switch trigger fires. Filters out
+    /// cmd-tab bounces and Command-key accidental activations.
+    var appSwitchDebounce: TimeInterval = 1.0
+
     private init() {}
 
     // MARK: - Lifecycle
@@ -89,6 +99,8 @@ final class VisualActivitySampler: ObservableObject {
         isStarted = false
         lastSampleHash = nil
         lastSampleApp = nil
+        pendingAppSwitchAt = nil
+        pendingAppName = nil
     }
 
     /// Called by `VisualActivityIndexer` whenever it completes processing a
@@ -112,6 +124,11 @@ final class VisualActivitySampler: ObservableObject {
     /// Cheap operations only on this path: a single CGImage decode + 8x8
     /// downsample for the perceptual hash. The expensive VLM call happens
     /// off-thread inside the indexer.
+    ///
+    /// Race fix: decision inputs are snapshotted at entry, before the
+    /// `await loadCGImage` suspension point. This prevents a concurrent call
+    /// from mutating `lastSampleApp` / `lastSampleHash` between the read and
+    /// the later commit, which would cause double-sampling or missed samples.
     func considerFrame(_ frame: Screenshot) async {
         guard isStarted else { return }
         guard frame.id != nil else { return }
@@ -119,6 +136,14 @@ final class VisualActivitySampler: ObservableObject {
         // Battery gate. We drop on battery rather than enqueueing so we don't
         // play catch-up on minutes-old screen contents on AC reconnect.
         guard BatteryAwareScheduler.shared.allowHeavyWork else { return }
+
+        // Snapshot decision inputs NOW, before any suspension point, so that
+        // a concurrent call cannot mutate them under us.
+        let snapshotLastApp = lastSampleApp
+        let snapshotLastHash = lastSampleHash
+        let snapshotLastTime = lastSampleTime
+        let snapshotPendingApp = pendingAppName
+        let snapshotPendingAt = pendingAppSwitchAt
 
         // Try to load the underlying CGImage so we can hash it. If the load
         // fails (video chunk still encoding, etc.) we silently drop — the
@@ -130,13 +155,29 @@ final class VisualActivitySampler: ObservableObject {
 
         // Decision logic — first matching reason wins, in priority order.
         let reason: SampleReason? = {
-            // 1. App switch beats everything; new context, want a fresh
-            //    summary even if the visual content overlaps.
-            if let last = lastSampleApp, last != frame.appName {
-                return .appSwitch
+            // 1. App switch — debounced: only fire once the new app has been
+            //    in the foreground for ≥ appSwitchDebounce seconds AND the
+            //    frame we're evaluating still belongs to that app. This
+            //    suppresses cmd-tab flicker and accidental activations.
+            if let last = snapshotLastApp, last != frame.appName {
+                if snapshotPendingApp == frame.appName,
+                   let pendingAt = snapshotPendingAt,
+                   now.timeIntervalSince(pendingAt) >= appSwitchDebounce
+                {
+                    // Debounce elapsed — commit the switch.
+                    return .appSwitch
+                }
+                // Not yet debounced (or new pending app). Record the pending
+                // switch and wait for a future frame to confirm it.
+                pendingAppName = frame.appName
+                pendingAppSwitchAt = (snapshotPendingApp == frame.appName) ? snapshotPendingAt : now
+                return nil
+            } else {
+                // App didn't switch — clear any stale pending state.
+                if pendingAppName != nil { pendingAppName = nil; pendingAppSwitchAt = nil }
             }
             // 2. Scene change.
-            if let prev = lastSampleHash {
+            if let prev = snapshotLastHash {
                 let distance = prev.hammingDistance(to: hash)
                 if distance >= sceneChangeThreshold {
                     return .sceneChange(distance: distance)
@@ -144,13 +185,13 @@ final class VisualActivitySampler: ObservableObject {
                 // Idle suppression: identical hash within the suppression
                 // window means nothing changed and time-floor shouldn't fire.
                 if distance == 0,
-                   now.timeIntervalSince(lastSampleTime) < idleSuppressionInterval
+                   now.timeIntervalSince(snapshotLastTime) < idleSuppressionInterval
                 {
                     return nil
                 }
             }
             // 3. Time floor.
-            if now.timeIntervalSince(lastSampleTime) >= forceSampleInterval {
+            if now.timeIntervalSince(snapshotLastTime) >= forceSampleInterval {
                 return .timeFloor
             }
             return nil
@@ -163,6 +204,8 @@ final class VisualActivitySampler: ObservableObject {
         lastSampleHash = hash
         lastSampleTime = now
         lastSampleApp = frame.appName
+        pendingAppName = nil
+        pendingAppSwitchAt = nil
         samplesQueued += 1
 
         await VisualActivityIndexer.shared.enqueue(
