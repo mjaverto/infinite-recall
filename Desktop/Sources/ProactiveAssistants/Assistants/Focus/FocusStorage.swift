@@ -318,8 +318,12 @@ class FocusStorage: ObservableObject {
 
             // Update on main thread — skip if data hasn't changed to avoid unnecessary re-renders
             await MainActor.run {
-                let newStatus = converted.first?.status
-                let newApp = converted.first?.appOrSite
+                // Staleness guard: do not restore current status from a row that is more than
+                // 10 minutes old — it reflects a prior session and would freeze the banner.
+                let stalenessCutoff = Date().addingTimeInterval(-600)
+                let mostRecentIsRecent = converted.first.map { $0.createdAt > stalenessCutoff } ?? false
+                let newStatus: FocusStatus? = mostRecentIsRecent ? converted.first?.status : nil
+                let newApp: String? = mostRecentIsRecent ? converted.first?.appOrSite : nil
 
                 // Only update if data actually changed
                 let sessionsChanged = self.sessions.map(\.id) != converted.map(\.id)

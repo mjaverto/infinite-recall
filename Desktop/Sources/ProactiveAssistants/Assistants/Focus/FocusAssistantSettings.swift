@@ -32,8 +32,8 @@ class FocusAssistantSettings {
         - HISTORY: Use recent analysis history to notice patterns, acknowledge transitions, and vary your responses.
 
         Set status to "distracted" if the PRIMARY window is:
-        - YouTube, Twitch, Netflix, TikTok (actual video site visible, not just text mentioning it)
         - Social media feeds: Twitter/X, Instagram, Facebook, Reddit (casual browsing, not researching a specific work topic)
+        - Video streaming: Twitch, Netflix, TikTok, YouTube (actual video site visible, not just text mentioning it)
         - News sites, entertainment sites, games
         - Any content consumption with no clear work purpose
 
@@ -43,7 +43,7 @@ class FocusAssistantSettings {
         - Email, work chat (Slack, Teams), research
         - Browsing that is clearly work-related (Stack Overflow, docs, PRs, Jira, etc.)
 
-        When in doubt, lean toward "distracted" — it's better to nudge the user once too often than to silently let them drift.
+        When in doubt, return "focused" — only flag distraction when there is clear evidence.
 
         Always provide a short coaching message (100 characters max for notification banner):
         - If distracted: Create a unique nudge to refocus. Vary your approach — be playful, direct, or motivational.
@@ -51,7 +51,7 @@ class FocusAssistantSettings {
         """
 
     private let promptVersionKey = "focusPromptVersion"
-    private let currentPromptVersion = 2  // Bump when changing defaultAnalysisPrompt
+    private let currentPromptVersion = 3  // Bump when changing defaultAnalysisPrompt
 
     private init() {
         // Register defaults

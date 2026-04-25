@@ -449,7 +449,7 @@ actor FocusAssistant: ProactiveAssistant {
     private func processFrame(_ frame: CapturedFrame) async {
         guard await isEnabled else { return }
         do {
-            guard let analysis = try await analyzeScreenshot(jpegData: frame.jpegData) else {
+            guard let analysis = try await analyzeScreenshot(jpegData: frame.jpegData, appName: frame.appName, windowTitle: frame.windowTitle) else {
                 return
             }
 
@@ -685,7 +685,15 @@ actor FocusAssistant: ProactiveAssistant {
         return contextString
     }
 
-    private func analyzeScreenshot(jpegData: Data) async throws -> ScreenAnalysis? {
+    private func analyzeScreenshot(jpegData: Data, appName: String = "", windowTitle: String? = nil) async throws -> ScreenAnalysis? {
+        // Guard: skip the LLM call entirely if there is no meaningful metadata to classify.
+        let effectiveApp = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveWindow = (windowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !effectiveApp.isEmpty else {
+            log("Focus: skipping LLM call — no app metadata available")
+            return nil
+        }
+
         // Refresh context from local DB
         let context = await refreshContext()
 
@@ -698,6 +706,9 @@ actor FocusAssistant: ProactiveAssistant {
         if !historyText.isEmpty {
             promptParts.append(historyText)
         }
+        // Inject the real window metadata so the model has concrete grounding.
+        let windowLabel = effectiveWindow.isEmpty ? "unknown" : effectiveWindow
+        promptParts.append("CURRENT STATE: app=\"\(effectiveApp)\", window_title=\"\(windowLabel)\"")
         // Local LLM is text-only — see analyzeScreenshotWithHistory for context.
         promptParts.append("Now classify the user's current focus state based on the active app, window title, and recent activity above.")
         promptParts.append(Self.focusJSONSchemaInstruction)
