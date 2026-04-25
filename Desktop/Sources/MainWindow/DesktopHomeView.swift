@@ -109,7 +109,7 @@ struct DesktopHomeView: View {
                   reason: appState.usageLimitReason,
                   onUpgrade: {
                     appState.showUsageLimitPopup = false
-                    selectedSettingsSection = .planUsage
+                    selectedSettingsSection = .account
                     withAnimation(.easeInOut(duration: 0.2)) {
                       selectedIndex = SidebarNavItem.settings.rawValue
                     }

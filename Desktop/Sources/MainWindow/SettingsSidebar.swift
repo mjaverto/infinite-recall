@@ -154,20 +154,6 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["sign out", "log out", "logout", "signout"], section: .account,
       icon: "person.circle", settingId: "account.signout"),
 
-    // Plan and Usage
-    SettingsSearchItem(
-      name: "Plan and Usage", subtitle: "Subscription status and usage limits",
-      keywords: ["subscription", "billing", "plan", "usage", "stripe", "architect", "unlimited"],
-      section: .planUsage, icon: "creditcard", settingId: "planusage.overview"),
-    SettingsSearchItem(
-      name: "Current Plan", subtitle: "See your current subscription and renewal status",
-      keywords: ["current plan", "renewal", "billing"], section: .planUsage, icon: "creditcard",
-      settingId: "planusage.current"),
-    SettingsSearchItem(
-      name: "Upgrade Plan", subtitle: "Buy Operator or Architect",
-      keywords: ["upgrade", "buy", "pricing", "checkout", "architect", "operator", "unlimited"], section: .planUsage,
-      icon: "creditcard", settingId: "planusage.purchase"),
-
     // About
     SettingsSearchItem(
       name: "Software Updates", subtitle: "Check for and manage app updates",
@@ -323,7 +309,6 @@ struct SettingsSidebar: View {
     .notifications,
     .privacy,
     .account,
-    .planUsage,
     .floatingBar,
     .shortcuts,
     .advanced,
@@ -507,7 +492,6 @@ struct SettingsSidebarItem: View {
     case .notifications: return "bell"
     case .privacy: return "lock.shield"
     case .account: return "person.circle"
-    case .planUsage: return "creditcard"
     case .aiChat: return "cpu"
     case .floatingBar: return "sparkles"
     case .shortcuts: return "keyboard"
