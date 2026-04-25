@@ -1338,6 +1338,17 @@ class AppState: ObservableObject {
       AudioLevelMonitor.shared.reset()
       RecordingTimer.shared.start()
 
+      // Infinite Recall fork: start on-device speaker diarization. sessionId
+      // gets attached later via setSessionId once TranscriptionStorage allocates one.
+      SpeakerDiarizationService.shared.start(
+        sessionId: nil,
+        startedAt: recordingStartTime
+      ) { [weak self] turn in
+        Task { @MainActor in
+          self?.handleDiarizationTurn(turn)
+        }
+      }
+
       log(
         "Transcription: Using source: \(effectiveSource.rawValue), device: \(recordingInputDeviceName ?? "Unknown")"
       )
@@ -1355,6 +1366,12 @@ class AppState: ObservableObject {
             self.currentSessionId = sessionId
             // Start live notes session
             LiveNotesMonitor.shared.startSession(sessionId: sessionId)
+            // Infinite Recall fork: attach the diarization session id now so
+            // emitted turns persist embeddings linked to this transcription session.
+            SpeakerDiarizationService.shared.setSessionId(
+              sessionId,
+              startedAt: self.recordingStartTime
+            )
           }
           log("Transcription: Created DB session \(sessionId)")
         } catch {
@@ -1418,8 +1435,12 @@ class AppState: ObservableObject {
 
     // Start the mixer — it sums mic + system into a mono stream and forwards it to
     // the transcription WebSocket.
+    // Infinite Recall fork: also tee the mono stream into the on-device speaker
+    // diarization pipeline. Failures there are swallowed so capture / WhisperKit
+    // continue regardless.
     audioMixer?.start { [weak self] monoMixed in
       self?.transcriptionService?.sendAudio(monoMixed)
+      SpeakerDiarizationService.shared.appendAudio(monoMixed)
     }
 
     do {
@@ -1770,6 +1791,15 @@ class AppState: ObservableObject {
         await MainActor.run {
           self.currentSessionId = sessionId
           LiveNotesMonitor.shared.startSession(sessionId: sessionId)
+          // Infinite Recall fork: re-arm diarization for the next conversation.
+          SpeakerDiarizationService.shared.start(
+            sessionId: sessionId,
+            startedAt: self.recordingStartTime
+          ) { [weak self] turn in
+            Task { @MainActor in
+              self?.handleDiarizationTurn(turn)
+            }
+          }
         }
         log("Transcription: Created new DB session \(sessionId) for next conversation")
       } catch {
@@ -1815,6 +1845,9 @@ class AppState: ObservableObject {
     // Stop audio mixer
     audioMixer?.stop()
     audioMixer = nil
+
+    // Infinite Recall fork: stop on-device diarization (flushes any in-flight turn).
+    SpeakerDiarizationService.shared.stop()
 
     // Clear VAD gate
     vadGateService = nil
@@ -2243,76 +2276,93 @@ class AppState: ObservableObject {
   }
 
   // MARK: - People (Speaker Profiles)
+  //
+  // Infinite Recall fork: local-only people store backed by GRDB. The original
+  // implementation hit `/v1/users/people` on Omi's backend; we keep the same
+  // shape so the existing NameSpeakerSheet and PersonaPage UIs work unchanged.
 
-  /// Fetches all people from the OMI API
+  /// Fetches all people from the local store
   func fetchPeople() async {
-    do {
-      let fetchedPeople = try await APIClient.shared.getPeople()
-      people = fetchedPeople
-      log("People: Loaded \(fetchedPeople.count) people")
-    } catch {
-      logError("People: Failed to load", error: error)
-    }
+    let fetched = await PeopleStore.shared.fetchAll()
+    people = fetched
+    log("People: Loaded \(fetched.count) people from local store")
   }
 
   /// Creates a new person and adds to local cache
   func createPerson(name: String) async -> Person? {
-    do {
-      let person = try await APIClient.shared.createPerson(name: name)
-      people.append(person)
-      log("People: Created person '\(name)' with id \(person.id)")
-      return person
-    } catch {
-      logError("People: Failed to create person", error: error)
+    guard let person = await PeopleStore.shared.create(name: name) else {
+      logError("People: Failed to create '\(name)' in local store",
+               error: NSError(domain: "PeopleStore", code: -1))
       return nil
     }
+    people.append(person)
+    return person
   }
 
-  /// Assigns segments to a person or user via bulk API
+  /// Assigns segments to a person or user. The local-first fork resolves
+  /// `conversationId` (a backend UUID, even for local-only conversations — the
+  /// Conversations UI still uses that as the stable id) to a transcription
+  /// session id and updates the per-segment fields in local storage.
   func assignSpeakerToSegments(
     conversationId: String,
     segmentIds: [String],
     personId: String?,
     isUser: Bool
   ) async -> Bool {
-    do {
-      try await APIClient.shared.assignSegmentsBulk(
-        conversationId: conversationId,
-        segmentIds: segmentIds,
-        isUser: isUser,
-        personId: personId
-      )
-      log("People: Assigned \(segmentIds.count) segments in conversation \(conversationId)")
-      // Update in-memory conversations list so the prop is fresh on next open
-      let idSet = Set(segmentIds)
-      if let idx = conversations.firstIndex(where: { $0.id == conversationId }) {
-        for segIdx in conversations[idx].transcriptSegments.indices
-          where idSet.contains(conversations[idx].transcriptSegments[segIdx].id) {
-          let old = conversations[idx].transcriptSegments[segIdx]
-          conversations[idx].transcriptSegments[segIdx] = TranscriptSegment(
-            id: old.id,
-            backendId: old.backendId,
-            text: old.text,
-            speaker: old.speaker,
-            isUser: isUser,
-            personId: isUser ? nil : personId,
-            start: old.start,
-            end: old.end,
-            translations: old.translations
-          )
-        }
+    // Update in-memory conversations list so the prop is fresh on next open.
+    let idSet = Set(segmentIds)
+    if let idx = conversations.firstIndex(where: { $0.id == conversationId }) {
+      for segIdx in conversations[idx].transcriptSegments.indices
+        where idSet.contains(conversations[idx].transcriptSegments[segIdx].id) {
+        let old = conversations[idx].transcriptSegments[segIdx]
+        conversations[idx].transcriptSegments[segIdx] = TranscriptSegment(
+          id: old.id,
+          backendId: old.backendId,
+          text: old.text,
+          speaker: old.speaker,
+          isUser: isUser,
+          personId: isUser ? nil : personId,
+          start: old.start,
+          end: old.end,
+          translations: old.translations
+        )
       }
-      // Also update local SQLite cache so changes persist across app restarts
-      try? await TranscriptionStorage.shared.updateSegmentSpeakerAssignment(
+    }
+    // Persist to local SQLite (transcription_segments + speaker_embeddings).
+    do {
+      try await TranscriptionStorage.shared.updateSegmentSpeakerAssignment(
         backendConversationId: conversationId,
         segmentIds: segmentIds,
         personId: personId,
         isUser: isUser
       )
-      return true
     } catch {
-      logError("People: Failed to assign segments", error: error)
-      return false
+      logError("People: Failed to update local segment cache", error: error)
+    }
+    if let sessionId = await TranscriptionStorage.shared.sessionIdForBackendId(conversationId) {
+      _ = await PeopleStore.shared.assignSegments(
+        sessionId: sessionId,
+        segmentIds: segmentIds,
+        personId: personId,
+        isUser: isUser
+      )
+    }
+    log("People: Assigned \(segmentIds.count) segments in conversation \(conversationId)")
+    return true
+  }
+
+  /// Infinite Recall fork: handle one diarization turn emitted by the on-device
+  /// pipeline. If the matched person is known, surface their name in the live
+  /// transcript via `liveSpeakerPersonMap` (the same channel cloud-mode used
+  /// for backend-identified speakers).
+  func handleDiarizationTurn(_ turn: DiarizationTurn) {
+    guard let personId = turn.personId else { return }
+    if liveSpeakerPersonMap[turn.speakerId] != personId {
+      liveSpeakerPersonMap[turn.speakerId] = personId
+      log(
+        "Diarization: Speaker \(turn.speakerId) auto-matched to person \(personId) "
+          + "(similarity=\(String(format: "%.2f", turn.similarity ?? 0)))"
+      )
     }
   }
 

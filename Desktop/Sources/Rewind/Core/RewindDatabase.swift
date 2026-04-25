@@ -2181,6 +2181,43 @@ actor RewindDatabase {
             }
         }
 
+        // Infinite Recall fork: on-device speaker diarization. No cloud calls.
+        // Local-only people store — replaces backend Person API for the local-first fork.
+        // The existing NameSpeakerSheet UI is wired to a Person struct (see APIClient.swift);
+        // this table mirrors that shape so PeopleStore can satisfy the same interface.
+        migrator.registerMigration("createPeopleLocal") { db in
+            try db.create(table: "people", ifNotExists: true) { t in
+                t.column("id", .text).primaryKey()
+                t.column("displayName", .text).notNull()
+                t.column("defaultEmoji", .text)
+                t.column("createdAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+                t.column("updatedAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+            }
+            try db.create(index: "idx_people_displayName", on: "people", columns: ["displayName"])
+        }
+
+        // Infinite Recall fork: on-device speaker diarization. No cloud calls.
+        // Per-segment speaker embeddings — one row per detected speech turn.
+        // person_id is nullable so unmatched turns can be backfilled later from the UI.
+        migrator.registerMigration("createSpeakerEmbeddings") { db in
+            try db.create(table: "speaker_embeddings", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("sessionId", .integer).notNull().indexed()
+                t.column("chunkId", .integer).indexed()
+                // Float32 vector serialized little-endian
+                t.column("embedding", .blob).notNull()
+                t.column("embeddingDim", .integer).notNull()
+                // Seconds within the session
+                t.column("startTime", .double).notNull()
+                t.column("endTime", .double).notNull()
+                // Local cluster id assigned by diarizer (nullable until clustered)
+                t.column("speakerId", .integer).indexed()
+                // FK to people.id (nullable until user names this voice)
+                t.column("personId", .text).indexed()
+                t.column("createdAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+            }
+        }
+
         try migrator.migrate(queue)
     }
 

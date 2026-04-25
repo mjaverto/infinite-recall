@@ -327,14 +327,24 @@ class TranscriptionService: @unchecked Sendable {
                 let trimmed = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
 
+                // Infinite Recall fork: consult the on-device diarization
+                // timeline to attach a real speakerId. If diarization isn't
+                // running (or hasn't seen this region yet), fall back to
+                // SPEAKER_00 / is_user=true so behavior is unchanged from the
+                // pre-diarization baseline.
+                let midpoint = (absStart + absEnd) * 0.5
+                let lookup = SpeakerDiarizationService.shared.lookupSpeaker(at: midpoint)
+                let speakerId = lookup?.speakerId ?? 0
+                let personId = lookup?.personId
+                let speakerLabel = String(format: "SPEAKER_%02d", speakerId)
                 emitted.append(
                     BackendSegment(
                         id: UUID().uuidString,
                         text: trimmed,
-                        speaker: "SPEAKER_00",
-                        speaker_id: 0,
-                        is_user: true,
-                        person_id: nil,
+                        speaker: speakerLabel,
+                        speaker_id: speakerId,
+                        is_user: speakerId == 0 && personId == nil,
+                        person_id: personId,
                         start: absStart,
                         end: absEnd,
                         translations: nil
