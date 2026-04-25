@@ -1,318 +1,117 @@
-// Memories routes - Port from Python backend
-// Endpoints: GET, POST, DELETE, PATCH /v3/memories
+//! /v3/memories — backed by `memories` table.
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    routing::{delete, get, patch, post},
-    Json, Router,
+    Json,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-use crate::auth::AuthUser;
-use crate::models::{
-    CreateMemoryRequest, CreateMemoryResponse, EditMemoryRequest, GetMemoriesQuery, MemoryDB,
-    MemoryStatusResponse, ReviewMemoryRequest, UpdateMemoryReadRequest, UpdateVisibilityRequest,
-};
-use crate::AppState;
+use crate::db::with_conn;
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
 
-/// GET /v3/memories - Fetch user memories with optional filtering
-/// Copied from Python get_memories endpoint
-async fn get_memories(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Query(query): Query<GetMemoriesQuery>,
-) -> Result<Json<Vec<MemoryDB>>, (StatusCode, String)> {
-    // Parse tags from comma-separated string
-    let tags: Option<Vec<String>> = query.tags.as_ref().map(|t| {
-        t.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
-
-    tracing::info!(
-        "Getting memories for user {} with limit={}, offset={}, category={:?}, tags={:?}, include_dismissed={}",
-        user.uid,
-        query.limit,
-        query.offset,
-        query.category,
-        tags,
-        query.include_dismissed
-    );
-
-    match state
-        .firestore
-        .get_memories_filtered(
-            &user.uid,
-            query.limit,
-            query.offset,
-            query.category.as_deref(),
-            tags.as_deref(),
-            query.include_dismissed,
-        )
-        .await
-    {
-        Ok(memories) => Ok(Json(memories)),
-        Err(e) => {
-            tracing::error!("Failed to get memories: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get memories: {}", e)))
-        }
-    }
+#[derive(Debug, Deserialize, Default)]
+pub struct ListQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub category: Option<String>,
 }
 
-/// POST /v3/memories - Create a new memory (manual or extracted)
-async fn create_memory(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Json(request): Json<CreateMemoryRequest>,
-) -> Result<Json<CreateMemoryResponse>, StatusCode> {
-    tracing::info!(
-        "Creating memory for user {} with category={:?}, tags={:?}, source_app={:?}",
-        user.uid,
-        request.category,
-        request.tags,
-        request.source_app
-    );
-
-    match state
-        .firestore
-        .create_memory(
-            &user.uid,
-            &request.content,
-            &request.visibility,
-            request.category,
-            request.confidence,
-            request.source_app.as_deref(),
-            request.context_summary.as_deref(),
-            &request.tags,
-            request.reasoning.as_deref(),
-            request.current_activity.as_deref(),
-            request.source.as_deref(),
-            request.window_title.as_deref(),
-        )
-        .await
-    {
-        Ok(id) => Ok(Json(CreateMemoryResponse {
-            id,
-            message: "Memory created successfully".to_string(),
-        })),
-        Err(e) => {
-            tracing::error!("Failed to create memory: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+#[derive(Debug, Serialize)]
+pub struct Memory {
+    pub id: i64,
+    pub backend_id: Option<String>,
+    pub content: String,
+    pub category: String,
+    pub tags: Option<String>,
+    pub visibility: String,
+    pub source: Option<String>,
+    pub source_app: Option<String>,
+    pub conversation_id: Option<String>,
+    pub confidence: Option<f64>,
+    pub reviewed: bool,
+    pub manually_added: bool,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
-/// DELETE /v3/memories/:id - Delete a memory
-async fn delete_memory(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(memory_id): Path<String>,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!("Deleting memory {} for user {}", memory_id, user.uid);
+const SELECT: &str = "SELECT id, backendId, content, category, tagsJson, visibility,
+        source, sourceApp, conversationId, confidence, reviewed, manuallyAdded,
+        createdAt, updatedAt
+     FROM memories WHERE deleted = 0";
 
-    match state.firestore.delete_memory(&user.uid, &memory_id).await {
-        Ok(()) => Ok(Json(MemoryStatusResponse {
-            status: "ok".to_string(),
-        })),
-        Err(e) => {
-            tracing::error!("Failed to delete memory: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: r.get(0)?,
+        backend_id: r.get(1)?,
+        content: r.get(2)?,
+        category: r.get(3)?,
+        tags: r.get(4)?,
+        visibility: r.get(5)?,
+        source: r.get(6)?,
+        source_app: r.get(7)?,
+        conversation_id: r.get(8)?,
+        confidence: r.get(9)?,
+        reviewed: r.get::<_, i64>(10)? != 0,
+        manually_added: r.get::<_, i64>(11)? != 0,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
+    })
 }
 
-/// PATCH /v3/memories/:id - Edit memory content
-async fn edit_memory(
+pub async fn list(
     State(state): State<AppState>,
-    user: AuthUser,
-    Path(memory_id): Path<String>,
-    Json(request): Json<EditMemoryRequest>,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!("Editing memory {} for user {}", memory_id, user.uid);
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Value>> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
 
-    match state
-        .firestore
-        .update_memory_content(&user.uid, &memory_id, &request.value)
-        .await
-    {
-        Ok(()) => Ok(Json(MemoryStatusResponse {
-            status: "ok".to_string(),
-        })),
-        Err(e) => {
-            tracing::error!("Failed to edit memory: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+    let rows = with_conn(&state.pool, move |c| {
+        let mut sql = SELECT.to_string();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(cat) = q.category.clone() {
+            sql.push_str(" AND category = ?");
+            params.push(Box::new(cat));
         }
-    }
+        sql.push_str(" ORDER BY createdAt DESC LIMIT ? OFFSET ?");
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = c.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|p| p.as_ref() as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt.query(rusqlite::params_from_iter(param_refs))?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(map_row(r)?);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(ApiError::Internal)?;
+
+    Ok(Json(json!({
+        "memories": rows,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
-/// PATCH /v3/memories/:id/visibility - Update memory visibility
-async fn update_visibility(
+pub async fn get_one(
     State(state): State<AppState>,
-    user: AuthUser,
-    Path(memory_id): Path<String>,
-    Json(request): Json<UpdateVisibilityRequest>,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!(
-        "Updating visibility for memory {} for user {}",
-        memory_id,
-        user.uid
-    );
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Memory>> {
+    let mem = with_conn(&state.pool, move |c| {
+        let sql = format!("{SELECT} AND id = ?");
+        let mem = c.query_row(&sql, [id], map_row)?;
+        Ok(mem)
+    })
+    .await;
 
-    match state
-        .firestore
-        .update_memory_visibility(&user.uid, &memory_id, &request.value)
-        .await
-    {
-        Ok(()) => Ok(Json(MemoryStatusResponse {
-            status: "ok".to_string(),
-        })),
-        Err(e) => {
-            tracing::error!("Failed to update memory visibility: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    match mem {
+        Ok(m) => Ok(Json(m)),
+        Err(e) if format!("{e:#}").contains("Query returned no rows") => Err(ApiError::NotFound),
+        Err(e) => Err(ApiError::Internal(e)),
     }
-}
-
-/// POST /v3/memories/:id/review - Review/approve a memory
-async fn review_memory(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(memory_id): Path<String>,
-    Json(request): Json<ReviewMemoryRequest>,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!(
-        "Reviewing memory {} for user {} with value {}",
-        memory_id,
-        user.uid,
-        request.value
-    );
-
-    match state
-        .firestore
-        .review_memory(&user.uid, &memory_id, request.value)
-        .await
-    {
-        Ok(()) => Ok(Json(MemoryStatusResponse {
-            status: "ok".to_string(),
-        })),
-        Err(e) => {
-            tracing::error!("Failed to review memory: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-/// PATCH /v3/memories/:id/read - Update memory read/dismissed status
-async fn update_memory_read(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(memory_id): Path<String>,
-    Json(request): Json<UpdateMemoryReadRequest>,
-) -> Result<Json<MemoryDB>, StatusCode> {
-    tracing::info!("Updating read status for memory {} for user {}", memory_id, user.uid);
-
-    match state
-        .firestore
-        .update_memory_read_status(&user.uid, &memory_id, request.is_read, request.is_dismissed)
-        .await
-    {
-        Ok(memory) => Ok(Json(memory)),
-        Err(e) => {
-            tracing::error!("Failed to update memory read status: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-/// POST /v3/memories/mark-all-read - Mark all memories as read
-async fn mark_all_read(
-    State(state): State<AppState>,
-    user: AuthUser,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!("Marking all memories as read for user {}", user.uid);
-
-    match state.firestore.mark_all_memories_read(&user.uid).await {
-        Ok(count) => {
-            tracing::info!("Marked {} memories as read for user {}", count, user.uid);
-            Ok(Json(MemoryStatusResponse {
-                status: format!("marked {} as read", count),
-            }))
-        }
-        Err(e) => {
-            tracing::error!("Failed to mark all memories as read: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-/// PATCH /v3/memories/visibility - Update visibility of all memories
-async fn update_all_visibility(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Json(request): Json<UpdateVisibilityRequest>,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!(
-        "Updating all memories visibility to '{}' for user {}",
-        request.value,
-        user.uid
-    );
-
-    match state
-        .firestore
-        .update_all_memories_visibility(&user.uid, &request.value)
-        .await
-    {
-        Ok(count) => {
-            tracing::info!(
-                "Updated visibility for {} memories for user {}",
-                count,
-                user.uid
-            );
-            Ok(Json(MemoryStatusResponse {
-                status: format!("updated {} memories", count),
-            }))
-        }
-        Err(e) => {
-            tracing::error!("Failed to update all memories visibility: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-/// DELETE /v3/memories - Delete all memories
-async fn delete_all_memories(
-    State(state): State<AppState>,
-    user: AuthUser,
-) -> Result<Json<MemoryStatusResponse>, StatusCode> {
-    tracing::info!("Deleting all memories for user {}", user.uid);
-
-    match state.firestore.delete_all_memories(&user.uid).await {
-        Ok(count) => {
-            tracing::info!("Deleted {} memories for user {}", count, user.uid);
-            Ok(Json(MemoryStatusResponse {
-                status: format!("deleted {} memories", count),
-            }))
-        }
-        Err(e) => {
-            tracing::error!("Failed to delete all memories: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-pub fn memories_routes() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/v3/memories",
-            get(get_memories)
-                .post(create_memory)
-                .delete(delete_all_memories),
-        )
-        .route("/v3/memories/mark-all-read", post(mark_all_read))
-        .route("/v3/memories/visibility", patch(update_all_visibility))
-        .route("/v3/memories/:id", delete(delete_memory).patch(edit_memory))
-        .route("/v3/memories/:id/visibility", patch(update_visibility))
-        .route("/v3/memories/:id/review", post(review_memory))
-        .route("/v3/memories/:id/read", patch(update_memory_read))
 }
