@@ -53,7 +53,7 @@ are pending merge.
 ### Build and launch
 
 ```bash
-OMI_APP_NAME="omi-irecall" \
+OMI_APP_NAME="infinite-recall" \
 OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
 ./run.sh --yolo
 ```

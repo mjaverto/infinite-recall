@@ -22,12 +22,12 @@ xcrun swift build -c debug --package-path Desktop
 For full app build + install + launch:
 
 ```bash
-OMI_APP_NAME="omi-irecall" \
+OMI_APP_NAME="infinite-recall" \
 OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
 ./run.sh --yolo
 ```
 
-The `OMI_APP_NAME` puts the build in `/Applications/omi-irecall.app` so it
+The `OMI_APP_NAME` puts the build in `/Applications/infinite-recall.app` so it
 won't collide with any "Omi Dev" install on the same machine. Skip-flags
 disable everything cloud — we don't need any of it.
 
@@ -47,7 +47,7 @@ disable everything cloud — we don't need any of it.
 ## Testing
 
 - Logs: `/private/tmp/omi-dev.log` (legacy path, will rename)
-- UI verification: `agent-swift connect --bundle-id com.omi.omi-irecall`
+- UI verification: `agent-swift connect --bundle-id com.omi.infinite-recall`
 - `xcrun swift build` is **compile-check only** — does not start the app.
   Always `./run.sh` to actually test.
 
