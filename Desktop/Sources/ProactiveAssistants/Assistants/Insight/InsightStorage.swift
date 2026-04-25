@@ -1,5 +1,4 @@
 import Foundation
-import FirebaseCore
 
 /// Stored insight item with additional metadata
 struct StoredInsight: Codable, Identifiable {
@@ -186,12 +185,6 @@ class InsightStorage: ObservableObject {
 
     private func syncFromBackend() async {
         guard !isSyncing else { return }
-
-        // Don't sync if Firebase isn't configured yet (app still initializing)
-        guard FirebaseApp.app() != nil else {
-            log("Insight: Skipping sync - Firebase not configured yet")
-            return
-        }
 
         isSyncing = true
         isLoading = true

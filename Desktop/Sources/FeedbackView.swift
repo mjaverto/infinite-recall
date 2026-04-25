@@ -1,4 +1,3 @@
-import Sentry
 import SwiftUI
 
 /// Window controller for the feedback dialog
@@ -135,33 +134,9 @@ struct FeedbackView: View {
     // Track feedback submitted
     AnalyticsManager.shared.feedbackSubmitted(feedbackLength: message.count)
 
-    // Submit to Sentry with log file attachment (dev + prod — user explicitly chose to report)
-    let sentryMessage = message.isEmpty ? "User Report (logs only)" : "User Report: \(message)"
-
-    // Capture event with log file attached via scope
-    let eventId = SentrySDK.capture(message: sentryMessage) { scope in
-      let isDev = AppBuild.isNonProduction
-      let logPath = isDev ? "/tmp/omi-dev.log" : "/tmp/omi.log"
-      let logFilename = isDev ? "omi-dev.log" : "omi.log"
-      if FileManager.default.fileExists(atPath: logPath) {
-        let attachment = Attachment(path: logPath, filename: logFilename, contentType: "text/plain")
-        scope.addAttachment(attachment)
-      }
-    }
-
-    // Also send as Sentry feedback if there's a message
-    if !message.isEmpty {
-      let feedback = SentryFeedback(
-        message: message,
-        name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-        email: email.trimmingCharacters(in: .whitespacesAndNewlines),
-        associatedEventId: eventId
-      )
-      SentrySDK.capture(feedback: feedback)
-    }
-
+    // Sentry removed (local-first fork). Log the report locally only.
     log(
-      "User report submitted to Sentry (logs attached, message: \(message.isEmpty ? "none" : "yes"))"
+      "User report recorded locally (Sentry removed; message: \(message.isEmpty ? "none" : "yes"))"
     )
 
     // Show success

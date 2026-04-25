@@ -1,8 +1,4 @@
-import FirebaseAuth
-import FirebaseCore
-// Infinite Recall fork: Mixpanel/PostHog/Heap SPM deps removed (telemetry no-op'd).
-import Sentry
-import Sparkle
+// Infinite Recall fork: Firebase/Sentry/Sparkle/Heap removed (local-first).
 import SwiftUI
 
 // MARK: - Launch Mode
@@ -291,61 +287,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     _ = UpdaterViewModel.shared
     UpdaterViewModel.shared.checkForUpdatesImmediatelyAfterLaunchIfNeeded()
 
-    // Infinite Recall fork: Sentry crash reporting / error tracking is telemetry — disabled.
-    // The SentrySDK.start(...) call below is commented out so the SDK never initializes.
-    // Other SentrySDK.* calls scattered across the codebase (addBreadcrumb, capture, setUser)
-    // become safe no-ops automatically because the SDK is never started. We keep the
-    // `import Sentry` statements and the SPM dependency in place so the rest of the code
-    // continues to compile.
-    let isDev = AnalyticsManager.isDevBuild
-    // Disabled for local-first fork: SentrySDK.start { options in
-    //   options.dsn =
-    //     "https://bbffa02d948c81ea4dccd36246c7bd20@o4511085999816704.ingest.us.sentry.io/4511086024851456"
-    //   options.debug = false
-    //   options.enableAutoSessionTracking = true
-    //   options.environment = isDev ? "development" : "production"
-    //   options.enableCaptureFailedRequests = false
-    //   options.maxBreadcrumbs = 100
-    //   options.beforeSend = { event in
-    //     if event.message?.formatted.hasPrefix("User Report") == true { return event }
-    //     if isDev { return nil }
-    //     if let urlTag = event.tags?["url"],
-    //       urlTag.contains("localhost") || urlTag.contains("127.0.0.1")
-    //         || urlTag.contains("trycloudflare.com")
-    //     { return nil }
-    //     if let exceptions = event.exceptions,
-    //       exceptions.contains(where: { exc in
-    //         let value = exc.value ?? ""
-    //         return exc.type == "NSURLErrorDomain" && (
-    //           value.contains("Code=-999") || value.contains("Code: -999")
-    //         )
-    //       })
-    //     { return nil }
-    //     if let exceptions = event.exceptions,
-    //       exceptions.contains(where: { exc in
-    //         exc.type == "Omi_Computer.AuthError" && (exc.value ?? "").contains("notSignedIn")
-    //       })
-    //     { return nil }
-    //     return event
-    //   }
-    // }
-    log("[telemetry-stripped] Sentry init skipped (Infinite Recall is local-first; isDev=\(isDev))")
-
-    // Infinite Recall fork: never initialize Firebase. The local-only build
-    // doesn't need it. If a future cloud-sync feature ships, gate it behind
-    // an explicit user opt-in here.
-    if false /* localOnlyMode */ {
-      // Initialize Firebase
-      let plistPath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist")
-
-      if let path = plistPath,
-        let options = FirebaseOptions(contentsOfFile: path)
-      {
-        FirebaseApp.configure(options: options)
-        AuthService.shared.configure()
-      }
-    }
-
     // Infinite Recall fork: force anonymous local-only mode on every launch.
     // This unconditionally bypasses the Apple/Google/Firebase sign-in gate so
     // the app boots straight into the main UI. Auto-completes onboarding too,
@@ -438,13 +379,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     if AuthState.shared.isSignedIn {
       AnalyticsManager.shared.identify()
       // Set Sentry user context (now enabled for dev builds too)
-      if let email = AuthState.shared.userEmail {
-        let sentryUser = Sentry.User()
-        sentryUser.email = email
-        sentryUser.username =
-          AuthService.shared.displayName.isEmpty ? nil : AuthService.shared.displayName
-        SentrySDK.setUser(sentryUser)
-      }
       // Fetch conversations on startup
       AuthService.shared.fetchConversations()
 
@@ -560,18 +494,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     log("AppDelegate: applicationDidFinishLaunching completed")
   }
 
-  /// Start a timer that sends Sentry session snapshots every 5 minutes
-  /// This ensures we have breadcrumbs captured even without errors
   private func startSentryHeartbeat() {
-    // Now runs in dev builds too since Sentry is always initialized
-    sentryHeartbeatTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
-      // Capture a session heartbeat event with current breadcrumbs
-      SentrySDK.capture(message: "Session Heartbeat") { scope in
-        scope.setLevel(.info)
-        scope.setTag(value: "heartbeat", key: "event_type")
-      }
-      log("Sentry: Session heartbeat captured")
-    }
+    // Sentry removed; heartbeat is a no-op.
   }
 
   /// Strip com.apple.provenance extended attributes from our own bundle.
@@ -798,10 +722,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     guard let statusBarItem = statusBarItem else {
       log("AppDelegate: [MENUBAR] ERROR - Failed to create status bar item")
-      SentrySDK.capture(message: "Failed to create NSStatusItem") { scope in
-        scope.setLevel(.error)
-        scope.setTag(value: "menu_bar", key: "component")
-      }
       return
     }
 
@@ -890,55 +810,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     safeModeItem.submenu = buildSafeModeSubmenu()
     menu.addItem(safeModeItem)
 
-    menu.addItem(NSMenuItem.separator())
-
     // Open app item
     let openItem = NSMenuItem(
       title: "Open \(displayName)", action: #selector(openOmiFromMenu), keyEquivalent: "o")
     openItem.target = self
     menu.addItem(openItem)
 
-    menu.addItem(NSMenuItem.separator())
-
     // Check for Updates
     let updatesItem = NSMenuItem(
       title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
     updatesItem.target = self
     menu.addItem(updatesItem)
-
-    menu.addItem(NSMenuItem.separator())
-
-    // Sign out / User info
-    if AuthState.shared.isSignedIn {
-      if let email = AuthState.shared.userEmail {
-        let emailItem = NSMenuItem(title: "Signed in as \(email)", action: nil, keyEquivalent: "")
-        emailItem.isEnabled = false
-        menu.addItem(emailItem)
-        menu.addItem(NSMenuItem.separator())
-      }
-
-      let resetItem = NSMenuItem(
-        title: "Reset Onboarding...", action: #selector(resetOnboarding), keyEquivalent: "")
-      resetItem.target = self
-      menu.addItem(resetItem)
-
-      menu.addItem(NSMenuItem.separator())
-
-      let reportItem = NSMenuItem(
-        title: "Report Issue...", action: #selector(reportIssue), keyEquivalent: "")
-      reportItem.target = self
-      menu.addItem(reportItem)
-
-      menu.addItem(NSMenuItem.separator())
-
-      let signOutItem = NSMenuItem(title: "Sign Out", action: #selector(signOut), keyEquivalent: "")
-      signOutItem.target = self
-      menu.addItem(signOutItem)
-    } else {
-      let notSignedInItem = NSMenuItem(title: "Not signed in", action: nil, keyEquivalent: "")
-      notSignedInItem.isEnabled = false
-      menu.addItem(notSignedInItem)
-    }
 
     menu.addItem(NSMenuItem.separator())
 
@@ -1435,11 +1317,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ResourceMonitor.shared.reportResourcesNow(context: "app_terminating")
     ResourceMonitor.shared.stop()
 
-    // Capture final session snapshot before termination (now enabled for dev builds too)
-    SentrySDK.capture(message: "App Terminating") { scope in
-      scope.setLevel(.info)
-      scope.setTag(value: "lifecycle", key: "event_type")
-    }
   }
 
   @objc func handleGetURLEvent(

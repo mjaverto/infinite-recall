@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import Foundation
-import Sentry
 
 /// File storage manager for Rewind screenshots
 actor RewindStorage {
@@ -260,18 +259,6 @@ actor RewindStorage {
             let detail = "fileExists=\(fileExists), fileSize=\(fileSize), dataLoaded=\(imageData != nil), imageDecoded=\(image != nil), systemMemoryMB=\(memoryMB), videoPath=\(videoPath), frameOffset=\(frameOffset), timeOffset=\(timeOffset)"
             throw RewindError.storageError("Failed to load extracted frame, \(detail)")
         }
-
-        // Log extracted frame dimensions to Sentry for debugging quality issues
-        let breadcrumb = Breadcrumb(level: .info, category: "frame_extraction")
-        breadcrumb.message = "Extracted frame from video"
-        breadcrumb.data = [
-            "video_path": videoPath,
-            "frame_offset": frameOffset,
-            "image_width": Int(image.size.width),
-            "image_height": Int(image.size.height),
-            "data_size_bytes": imageData.count
-        ]
-        SentrySDK.addBreadcrumb(breadcrumb)
 
         // Clean up temp file
         try? FileManager.default.removeItem(at: outputPath)

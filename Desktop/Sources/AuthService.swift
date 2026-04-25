@@ -1,9 +1,7 @@
 import Foundation
-@preconcurrency import FirebaseAuth
 import CryptoKit
 import AppKit
 import AuthenticationServices
-import Sentry
 
 // Infinite Recall fork: Firebase auth state listener disabled.
 // The signInAnonymously() method below is the load-bearing piece that forces
@@ -36,7 +34,6 @@ class AuthService {
         set { authState.error = newValue }
     }
 
-    private var authStateHandle: AuthStateDidChangeListenerHandle?
     private var isConfigured: Bool = false
 
     // OAuth state for CSRF protection
@@ -280,36 +277,16 @@ class AuthService {
             AuthState.shared.userEmail = email
         }
 
-        // Step 4: Sign in with Firebase using Apple credential
-        // Use Firebase SDK first (handles native bundle ID audience correctly),
-        // fall back to REST API (for web OAuth audience 'me.omi.web')
-        NSLog("OMI AUTH: Signing in with Firebase using Apple identity token...")
-
-        let credential = OAuthProvider.credential(providerID: .apple, idToken: identityToken, rawNonce: nonce)
+        // Disabled for local-first fork: Firebase SDK Apple sign-in never runs.
+        // signInWithAppleNative() is itself unreachable (signInWithApple() is a no-op).
+        // Kept as dead code so the call site compiles without FirebaseAuth.
         var userId = ""
-
         do {
-            // Firebase SDK sign-in (works with native bundle ID as token audience)
-            let authResult = try await Auth.auth().signIn(with: credential)
-            NSLog("OMI AUTH: Firebase SDK sign-in SUCCESS - uid: %@", authResult.user.uid)
-            userId = authResult.user.uid
-
-            // Get ID token from Firebase SDK for API calls
-            let tokenResult = try await authResult.user.getIDTokenResult()
-            let idToken = tokenResult.token
-            let refreshToken = authResult.user.refreshToken ?? ""
-            let expiresIn = Int(tokenResult.expirationDate.timeIntervalSinceNow)
-
-            saveTokens(idToken: idToken, refreshToken: refreshToken, expiresIn: expiresIn, userId: userId)
-        } catch {
-            // Fall back to REST API (works when Firebase SDK has keychain issues)
-            let nsError = error as NSError
-            NSLog("OMI AUTH: Firebase SDK Apple sign-in failed (domain=%@ code=%d): %@", nsError.domain, nsError.code, error.localizedDescription)
-            logError("AUTH: Firebase SDK Apple sign-in failed (domain=\(nsError.domain) code=\(nsError.code))", error: error)
-            NSLog("OMI AUTH: Falling back to REST API for Apple sign-in...")
             let firebaseTokens = try await signInWithAppleIdentityToken(identityToken: identityToken, nonce: nonce)
             userId = firebaseTokens.localId
             saveTokens(idToken: firebaseTokens.idToken, refreshToken: firebaseTokens.refreshToken, expiresIn: firebaseTokens.expiresIn, userId: userId)
+        } catch {
+            throw error
         }
 
         isSignedIn = true
@@ -332,13 +309,6 @@ class AuthService {
         AnalyticsManager.shared.identify()
         AnalyticsManager.shared.signInCompleted(provider: "apple")
         APIKeyService.shared.startFetchingKeys()
-
-        if !AnalyticsManager.isDevBuild {
-            let sentryUser = User(userId: userId)
-            sentryUser.email = AuthState.shared.userEmail
-            sentryUser.username = displayName.isEmpty ? nil : displayName
-            SentrySDK.setUser(sentryUser)
-        }
 
         NSLog("OMI AUTH: Apple Sign in complete!")
         fetchConversations()
@@ -432,14 +402,7 @@ class AuthService {
             // Store tokens for API calls (include userId to validate token ownership on retrieval)
             saveTokens(idToken: firebaseTokens.idToken, refreshToken: firebaseTokens.refreshToken, expiresIn: firebaseTokens.expiresIn, userId: firebaseTokens.localId)
 
-            // Also try Firebase SDK sign-in (best effort for other Firebase features)
-            do {
-                let authResult = try await Auth.auth().signIn(withCustomToken: tokenResult.customToken)
-                NSLog("OMI AUTH: Firebase SDK sign-in SUCCESS - uid: %@", authResult.user.uid)
-            } catch let firebaseError as NSError {
-                // Keychain errors are expected on dev builds - we have REST API tokens as fallback
-                NSLog("OMI AUTH: Firebase SDK sign-in failed (using REST API tokens): %@", firebaseError.localizedDescription)
-            }
+            // Disabled for local-first fork: Firebase SDK sign-in removed.
 
             isSignedIn = true
 
@@ -458,14 +421,6 @@ class AuthService {
             AnalyticsManager.shared.identify()
             AnalyticsManager.shared.signInCompleted(provider: provider)
             APIKeyService.shared.startFetchingKeys()
-
-            // Set Sentry user context for error tracking (skip in dev builds)
-            if !AnalyticsManager.isDevBuild {
-                let sentryUser = User(userId: userId)
-                sentryUser.email = tokenResult.email
-                sentryUser.username = displayName.isEmpty ? nil : displayName
-                SentrySDK.setUser(sentryUser)
-            }
 
             NSLog("OMI AUTH: Sign in complete!")
 
@@ -710,23 +665,9 @@ class AuthService {
         familyName = newFamilyName
         NSLog("OMI AUTH: Updated name locally - given: %@, family: %@", newGivenName, newFamilyName)
 
-        // Try to update Firebase profile (best effort)
-        // Skip during impersonation to avoid overwriting the target user's display name
+        // Disabled for local-first fork: Firebase profile update removed.
         let isImpersonating = UserDefaults.standard.bool(forKey: "auth_isImpersonating")
-        if isImpersonating {
-            NSLog("OMI AUTH: Skipping Firebase displayName update (impersonation mode)")
-        } else if let user = Auth.auth().currentUser {
-            do {
-                let changeRequest = user.createProfileChangeRequest()
-                changeRequest.displayName = trimmedName
-                try await changeRequest.commitChanges()
-                NSLog("OMI AUTH: Updated Firebase displayName to: %@", trimmedName)
-            } catch {
-                NSLog("OMI AUTH: Failed to update Firebase displayName (non-fatal): %@", error.localizedDescription)
-            }
-        }
 
-        // Also save to backend profile (Firestore) so it persists across sign-in methods
         if !isImpersonating {
             do {
                 try await APIClient.shared.updateUserProfile(name: trimmedName)
@@ -737,23 +678,11 @@ class AuthService {
         }
     }
 
-    /// Try to get name from Firebase user (after OAuth sign-in)
-    func getNameFromFirebase() -> String? {
-        if let displayName = Auth.auth().currentUser?.displayName, !displayName.isEmpty {
-            return displayName
-        }
-        return nil
-    }
+    /// Disabled for local-first fork: Firebase removed.
+    func getNameFromFirebase() -> String? { return nil }
 
-    /// Load name from Firebase if local name is empty
-    func loadNameFromFirebaseIfNeeded() {
-        if givenName.isEmpty, let firebaseName = getNameFromFirebase() {
-            let nameParts = firebaseName.split(separator: " ", maxSplits: 1)
-            givenName = nameParts.first.map(String.init) ?? firebaseName
-            familyName = nameParts.count > 1 ? String(nameParts[1]) : ""
-            NSLog("OMI AUTH: Loaded name from Firebase - given: %@, family: %@", givenName, familyName)
-        }
-    }
+    /// No-op: Firebase removed. loadNameFromBackendIfNeeded() handles the backend path.
+    func loadNameFromFirebaseIfNeeded() {}
 
     /// Load name from backend profile (Firestore) first, then fall back to Firebase Auth.
     /// This handles cases like Apple Sign-In where Firebase Auth displayName may be empty
@@ -1005,23 +934,7 @@ class AuthService {
             }
         }
 
-        // Third try: Use Firebase SDK (only if user matches expected user)
-        // This prevents returning a stale user's token during sign-out race conditions
-        if let user = Auth.auth().currentUser {
-            if expectedUserId == nil || user.uid == expectedUserId {
-                if expectedUserId == nil {
-                    // Backfill the missing userId
-                    NSLog("OMI AUTH: expectedUserId is nil, backfilling from Firebase SDK user %@", user.uid)
-                    UserDefaults.standard.set(user.uid, forKey: kAuthUserId)
-                }
-                let tokenResult = try await user.getIDTokenResult(forcingRefresh: forceRefresh)
-                return tokenResult.token
-            } else {
-                NSLog("OMI AUTH: Firebase SDK user mismatch (firebase: %@, expected: %@) - not using",
-                      user.uid, expectedUserId ?? "nil")
-            }
-        }
-
+        // Disabled for local-first fork: Firebase SDK removed; no third-try path.
         throw AuthError.notSignedIn
     }
 
@@ -1064,12 +977,6 @@ class AuthService {
         AnalyticsManager.shared.signedOut()
         AnalyticsManager.shared.reset()
 
-        // Clear Sentry user context (skip in dev builds)
-        if !AnalyticsManager.isDevBuild {
-            SentrySDK.setUser(nil)
-        }
-
-        try Auth.auth().signOut()
         isSignedIn = false
         APIKeyService.shared.clear()
         // Clear saved auth state and tokens

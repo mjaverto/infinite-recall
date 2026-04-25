@@ -435,27 +435,7 @@ cp -f "Desktop/.build/debug/$BINARY_NAME" "$APP_BUNDLE/Contents/MacOS/$BINARY_NA
 substep "Adding rpath for Frameworks"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$BINARY_NAME" 2>/dev/null || true
 
-# Copy Sparkle framework
-SPARKLE_FRAMEWORK="Desktop/.build/arm64-apple-macosx/debug/Sparkle.framework"
-if [ -d "$SPARKLE_FRAMEWORK" ]; then
-    substep "Copying Sparkle framework ($(du -sh "$SPARKLE_FRAMEWORK" 2>/dev/null | cut -f1))"
-    rm -rf "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
-    cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
-fi
-
-# Copy HeapSwiftCore framework and its dependency CSSwiftProtobuf
-HEAP_FRAMEWORK="Desktop/.build/artifacts/heap-swift-core-sdk/HeapSwiftCore/HeapSwiftCore.xcframework/macos-arm64_x86_64/HeapSwiftCore.framework"
-if [ -d "$HEAP_FRAMEWORK" ]; then
-    substep "Copying HeapSwiftCore framework"
-    rm -rf "$APP_BUNDLE/Contents/Frameworks/HeapSwiftCore.framework"
-    cp -R "$HEAP_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
-fi
-CSPROTOBUF_FRAMEWORK="Desktop/.build/artifacts/csswiftprotobuf/CSSwiftProtobuf/CSSwiftProtobuf.xcframework/macos-arm64_x86_64/CSSwiftProtobuf.framework"
-if [ -d "$CSPROTOBUF_FRAMEWORK" ]; then
-    substep "Copying CSSwiftProtobuf framework"
-    rm -rf "$APP_BUNDLE/Contents/Frameworks/CSSwiftProtobuf.framework"
-    cp -R "$CSPROTOBUF_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
-fi
+# Sparkle/HeapSwiftCore/CSSwiftProtobuf removed from Package.swift — no framework copy needed.
 
 # Copy libwebp dylibs and rewrite load paths
 WEBP_LIB="$(pkg-config --variable=libdir libwebp 2>/dev/null)/libwebp.7.dylib"
@@ -482,13 +462,7 @@ cp -f Desktop/Info.plist "$APP_BUNDLE/Contents/Info.plist"
 
 auth_debug "AFTER plist edits: auth_isSignedIn=$(defaults read "$BUNDLE_ID" auth_isSignedIn 2>&1 || true)"
 
-substep "Copying GoogleService-Info.plist"
-if [ -f "Desktop/Sources/GoogleService-Info-Dev.plist" ]; then
-    cp -f Desktop/Sources/GoogleService-Info-Dev.plist "$APP_BUNDLE/Contents/Resources/GoogleService-Info.plist"
-else
-    cp -f Desktop/Sources/GoogleService-Info.plist "$APP_BUNDLE/Contents/Resources/"
-fi
-/usr/libexec/PlistBuddy -c "Set :BUNDLE_ID $BUNDLE_ID" "$APP_BUNDLE/Contents/Resources/GoogleService-Info.plist" 2>/dev/null || true
+# GoogleService-Info.plist removed — Firebase is not used.
 
 # Copy resource bundle (contains app assets like permissions.gif, herologo.png, etc.)
 RESOURCE_BUNDLE="Desktop/.build/arm64-apple-macosx/debug/Omi Computer_Omi Computer.bundle"
@@ -620,14 +594,7 @@ fi
 
 if [ -n "$SIGN_IDENTITY" ]; then
     substep "Using identity: $SIGN_IDENTITY"
-    if [ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]; then
-        substep "Signing Sparkle framework"
-        codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
-    fi
-    if [ -d "$APP_BUNDLE/Contents/Frameworks/CSSwiftProtobuf.framework" ]; then
-        substep "Signing CSSwiftProtobuf framework"
-        codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Frameworks/CSSwiftProtobuf.framework"
-    fi
+    # Sparkle/CSSwiftProtobuf removed from Package.swift — no sign blocks needed.
     if [ -f "$APP_BUNDLE/Contents/Frameworks/libsharpyuv.0.dylib" ]; then
         substep "Signing libsharpyuv"
         codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Frameworks/libsharpyuv.0.dylib"
@@ -636,10 +603,7 @@ if [ -n "$SIGN_IDENTITY" ]; then
         substep "Signing libwebp"
         codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Frameworks/libwebp.7.dylib"
     fi
-    if [ -d "$APP_BUNDLE/Contents/Frameworks/HeapSwiftCore.framework" ]; then
-        substep "Signing HeapSwiftCore framework"
-        codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Frameworks/HeapSwiftCore.framework"
-    fi
+    # HeapSwiftCore removed from Package.swift — no sign block needed.
     # Sign the bundled node binary with developer identity + Node.entitlements
     # (macOS requires executables inside app bundles to be properly signed)
     NODE_BIN="$APP_BUNDLE/Contents/Resources/Omi Computer_Omi Computer.bundle/node"

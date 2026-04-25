@@ -1,7 +1,6 @@
 import Foundation
 import Vision
 import AppKit
-import Sentry
 
 /// Represents a text block with its bounding box (in normalized coordinates 0-1)
 struct OCRTextBlock: Codable, Equatable {
@@ -153,12 +152,8 @@ actor RewindOCRService {
         let modeName = useFastOCR ? "fast" : "accurate"
         let recognitionLevel: VNRequestTextRecognitionLevel = useFastOCR ? .fast : .accurate
 
-        // Log OCR mode once, then only on change; set Sentry tag for queryability
         if modeName != lastLoggedOCRMode {
             log("RewindOCRService: OCR mode set to \(modeName)")
-            SentrySDK.configureScope { scope in
-                scope.setTag(value: modeName, key: "ocr_mode")
-            }
             lastLoggedOCRMode = modeName
         }
 

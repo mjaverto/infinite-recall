@@ -2,7 +2,6 @@ import AppKit
 import CoreGraphics
 import Darwin
 import Foundation
-import Sentry
 
 /// Encodes screenshot frames into H.265 video chunks using ffmpeg for efficient storage.
 /// Uses fragmented MP4 format so frames can be read while the file is still being written.
@@ -284,21 +283,6 @@ actor VideoChunkEncoder {
         ffmpegStdin = stdinPipe.fileHandleForWriting
 
         log("VideoChunkEncoder: Started ffmpeg for chunk at \(relativePath)")
-
-        // Log frame dimensions to Sentry for debugging user quality issues
-        let breadcrumb = Breadcrumb(level: .info, category: "video_encoder")
-        breadcrumb.message = "Started video chunk encoding"
-        breadcrumb.data = [
-            "chunk_path": relativePath,
-            "input_width": Int(imageSize.width),
-            "input_height": Int(imageSize.height),
-            "output_width": Int(outputSize.width),
-            "output_height": Int(outputSize.height),
-            "quality": 65,
-            "encoder": "hevc_videotoolbox",
-            "max_resolution": Int(maxResolution)
-        ]
-        SentrySDK.addBreadcrumb(breadcrumb)
     }
 
     private func writeFrame(image: CGImage) async throws {
@@ -401,16 +385,6 @@ actor VideoChunkEncoder {
         guard age >= chunkDuration else { return }
 
         log("VideoChunkEncoder: Stale chunk detected (age: \(String(format: "%.0f", age))s, no new frames) — finalizing to release encoder resources")
-
-        let breadcrumb = Breadcrumb(level: .warning, category: "video_encoder")
-        breadcrumb.message = "Stale chunk finalized"
-        breadcrumb.data = [
-            "age_seconds": Int(age),
-            "frame_count": frameTimestamps.count,
-            "chunk_path": currentChunkPath ?? "none"
-        ]
-        SentrySDK.addBreadcrumb(breadcrumb)
-
         try? await finalizeCurrentChunk()
     }
 
@@ -568,16 +542,6 @@ actor VideoChunkEncoder {
         stalenessCheckTask = nil
 
         let droppedFrames = frameTimestamps.count
-
-        // Report to Sentry for monitoring
-        let breadcrumb = Breadcrumb(level: .error, category: "video_encoder")
-        breadcrumb.message = "Emergency reset triggered"
-        breadcrumb.data = [
-            "dropped_frames": droppedFrames,
-            "consecutive_failures": consecutiveWriteFailures,
-            "chunk_path": currentChunkPath ?? "none"
-        ]
-        SentrySDK.addBreadcrumb(breadcrumb)
 
         logError("VideoChunkEncoder: Emergency reset - dropping \(droppedFrames) frames to prevent memory leak")
 

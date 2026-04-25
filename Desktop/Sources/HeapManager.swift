@@ -1,5 +1,4 @@
 import Foundation
-import FirebaseAuth
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
 // Heap SPM dep removed; `import HeapSwiftCore` dropped along with it.

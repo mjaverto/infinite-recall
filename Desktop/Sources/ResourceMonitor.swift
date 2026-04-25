@@ -1,13 +1,11 @@
 import AppKit
 import Foundation
-import Sentry
 
-/// Monitors system resources (memory, CPU, disk) and reports to Sentry
+/// Monitors system resources (memory, CPU, disk) and logs warnings
 @MainActor
 class ResourceMonitor {
   static let shared = ResourceMonitor()
 
-  /// Check if this is a non-production build (avoids Sentry calls in test apps)
   private let isDevBuild: Bool = AppBuild.isNonProduction
 
   // MARK: - Configuration
@@ -96,19 +94,9 @@ class ResourceMonitor {
     )
   }
 
-  /// Manually report current resources to Sentry (call before known heavy operations)
+  /// Report current resources to the log (call before known heavy operations)
   func reportResourcesNow(context: String) {
     let snapshot = getCurrentResources()
-
-    // Add as breadcrumb (skip in dev builds)
-    if !isDevBuild {
-      let breadcrumb = Breadcrumb(level: .info, category: "resources")
-      breadcrumb.message =
-        "[\(context)] Memory: \(snapshot.memoryUsageMB)MB, Footprint: \(snapshot.memoryFootprintMB)MB, CPU: \(String(format: "%.1f", snapshot.cpuUsage))%"
-      breadcrumb.data = snapshot.asDictionary()
-      SentrySDK.addBreadcrumb(breadcrumb)
-    }
-
     log("ResourceMonitor: [\(context)] \(snapshot.summary)")
   }
 
@@ -122,9 +110,6 @@ class ResourceMonitor {
     if memorySamples.count > maxSamples {
       memorySamples.removeFirst()
     }
-
-    // Update Sentry context with current resources
-    updateSentryContext(snapshot)
 
     // Check for issues
     checkMemoryThresholds(snapshot)
@@ -175,29 +160,6 @@ class ResourceMonitor {
     let componentSummary = components.map { "\($0.key)=\($0.value)" }.sorted().joined(
       separator: ", ")
     log("ResourceMonitor: COMPONENTS: \(componentSummary)")
-
-    // Add to Sentry context for crash diagnostics
-    if !isDevBuild {
-      SentrySDK.configureScope { scope in
-        scope.setContext(value: components, key: "memory_components")
-      }
-
-      // Add breadcrumb when memory is elevated
-      if snapshot.memoryFootprintMB >= memoryWarningThreshold {
-        let breadcrumb = Breadcrumb(level: .warning, category: "memory_diagnostics")
-        breadcrumb.message = "Component diagnostics at \(snapshot.memoryFootprintMB)MB"
-        breadcrumb.data = components
-        SentrySDK.addBreadcrumb(breadcrumb)
-      }
-    }
-  }
-
-  private func updateSentryContext(_ snapshot: ResourceSnapshot) {
-    // Set resource context that will be attached to all future events (skip in dev builds)
-    guard !isDevBuild else { return }
-    SentrySDK.configureScope { scope in
-      scope.setContext(value: snapshot.asDictionary(), key: "resources")
-    }
   }
 
   private func checkMemoryThresholds(_ snapshot: ResourceSnapshot) {
@@ -214,16 +176,9 @@ class ResourceMonitor {
         "ResourceMonitor: EXTREME memory \(snapshot.memoryFootprintMB)MB — auto-restarting to prevent system degradation"
       )
 
-      SentrySDK.capture(message: "App Auto-Restarting Due to Extreme Memory") { scope in
-        scope.setLevel(.fatal)
-        scope.setTag(value: "auto_restart", key: "resource_alert")
-        scope.setContext(value: snapshot.asDictionary(), key: "resources")
-      }
-
-      // Give Sentry 3 seconds to flush, then relaunch and terminate.
-      // Only terminate if the relaunch succeeds — otherwise the user would be
-      // left with no running app and would need a full computer restart.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+      // Relaunch and terminate. Only terminate if the relaunch succeeds — otherwise
+      // the user would be left with no running app and would need a full computer restart.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
         let task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = ["-n", Bundle.main.bundleURL.path]
@@ -257,39 +212,15 @@ class ResourceMonitor {
         // Attempt to free memory by flushing heavy components
         triggerMemoryRemediation()
 
-        // Send Sentry event (skip in dev builds)
-        if !isDevBuild {
-          let threshold = self.memoryCriticalThreshold
-          SentrySDK.capture(message: "Critical Memory Usage") { scope in
-            scope.setLevel(.error)
-            scope.setTag(value: "memory_critical", key: "resource_alert")
-            scope.setContext(value: snapshot.asDictionary(), key: "resources")
-            scope.setContext(
-              value: [
-                "threshold_mb": threshold,
-                "current_mb": snapshot.memoryFootprintMB,
-                "peak_mb": snapshot.peakMemoryMB,
-              ], key: "memory_details")
-          }
-        }
       }
     }
     // Warning threshold
     else if snapshot.memoryFootprintMB >= memoryWarningThreshold {
       if lastWarningTime == nil || now.timeIntervalSince(lastWarningTime!) > warningCooldown {
         lastWarningTime = now
-
         log(
           "ResourceMonitor: WARNING - Memory usage \(snapshot.memoryFootprintMB)MB exceeds \(memoryWarningThreshold)MB threshold"
         )
-
-        // Add warning breadcrumb (skip in dev builds)
-        if !isDevBuild {
-          let breadcrumb = Breadcrumb(level: .warning, category: "resources")
-          breadcrumb.message = "High memory usage: \(snapshot.memoryFootprintMB)MB"
-          breadcrumb.data = snapshot.asDictionary()
-          SentrySDK.addBreadcrumb(breadcrumb)
-        }
       }
     }
   }
@@ -312,21 +243,6 @@ class ResourceMonitor {
       log(
         "ResourceMonitor: WARNING - Memory growing at \(String(format: "%.1f", growthRateMBPerMin))MB/min (potential leak)"
       )
-
-      // Add breadcrumb (skip in dev builds)
-      if !isDevBuild {
-        let breadcrumb = Breadcrumb(level: .warning, category: "resources")
-        breadcrumb.message =
-          "Potential memory leak detected: \(String(format: "%.1f", growthRateMBPerMin))MB/min growth rate"
-        breadcrumb.data = [
-          "growth_rate_mb_per_min": growthRateMBPerMin,
-          "samples_analyzed": recentSamples.count,
-          "time_span_minutes": timeDiffMinutes,
-          "start_memory_mb": first.memoryMB,
-          "end_memory_mb": last.memoryMB,
-        ]
-        SentrySDK.addBreadcrumb(breadcrumb)
-      }
     }
   }
 
@@ -372,15 +288,6 @@ class ResourceMonitor {
       log("ResourceMonitor: Memory remediation completed — \(memoryBefore)MB -> \(memoryAfter)MB")
     }
 
-    if !isDevBuild {
-      let breadcrumb = Breadcrumb(level: .warning, category: "memory_remediation")
-      breadcrumb.message = "Memory remediation triggered at critical threshold"
-      breadcrumb.data = [
-        "memory_footprint_mb": memoryBefore,
-        "threshold_mb": memoryCriticalThreshold,
-      ]
-      SentrySDK.addBreadcrumb(breadcrumb)
-    }
   }
 
   // MARK: - Resource Getters (macOS specific)

@@ -1,4 +1,3 @@
-import Sparkle
 import SwiftUI
 import UniformTypeIdentifiers
 import WebKit

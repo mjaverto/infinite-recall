@@ -1,5 +1,4 @@
 import Foundation
-import FirebaseAuth
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
 // PostHog SPM dep removed; `import PostHog` dropped along with it.

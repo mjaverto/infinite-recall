@@ -1,5 +1,4 @@
 import Foundation
-import FirebaseAuth
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
 // Mixpanel SPM dep removed; `import Mixpanel` dropped along with it.

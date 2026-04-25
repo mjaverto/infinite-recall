@@ -1,5 +1,4 @@
 import Foundation
-import Sentry
 
 private let logFile: String = {
   let isDev = AppBuild.isNonProduction
@@ -121,10 +120,6 @@ func logSync(_ message: String) {
   print(line)
   fflush(stdout)
 
-  let breadcrumb = Breadcrumb(level: .info, category: "app")
-  breadcrumb.message = message
-  SentrySDK.addBreadcrumb(breadcrumb)
-
   appendToLogFileSync(line)
 }
 
@@ -135,15 +130,10 @@ func log(_ message: String) {
   print(line)
   fflush(stdout)
 
-  // Add breadcrumb to Sentry for context in crash reports (now enabled for dev builds too)
-  let breadcrumb = Breadcrumb(level: .info, category: "app")
-  breadcrumb.message = message
-  SentrySDK.addBreadcrumb(breadcrumb)
-
   appendToLogFile(line)
 }
 
-/// Log an error and capture it in Sentry
+/// Log an error to the log file and stdout
 func logError(_ message: String, error: Error? = nil) {
   let timestamp = dateFormatter.string(from: Date())
   let errorDesc = error?.localizedDescription ?? ""
@@ -151,37 +141,5 @@ func logError(_ message: String, error: Error? = nil) {
   let line = "[\(timestamp)] [error] \(fullMessage)"
   print(line)
   fflush(stdout)
-
-  // Add error breadcrumb and capture in Sentry (now enabled for dev builds too)
-  let breadcrumb = Breadcrumb(level: .error, category: "error")
-  breadcrumb.message = fullMessage
-  SentrySDK.addBreadcrumb(breadcrumb)
-
-  // Capture error context in Sentry without passing the raw Swift Error object.
-  // Some Swift-native error payloads can crash inside Sentry's reflection path.
-  let isCancelledRequest =
-    (error as? URLError)?.code == .cancelled
-    || (error as NSError?)?.domain == NSURLErrorDomain
-      && (error as NSError?)?.code == NSURLErrorCancelled
-  if let error = error, !isCancelledRequest {
-    let nsError = error as NSError
-    let errorType = String(reflecting: type(of: error))
-    SentrySDK.capture(message: fullMessage) { scope in
-      scope.setLevel(.error)
-      scope.setContext(
-        value: [
-          "message": message,
-          "error_type": errorType,
-          "error_domain": nsError.domain,
-          "error_code": nsError.code,
-          "localized_description": errorDesc,
-        ], key: "app_context")
-    }
-  } else if error == nil {
-    SentrySDK.capture(message: fullMessage) { scope in
-      scope.setLevel(.error)
-    }
-  }
-
   appendToLogFile(line)
 }
