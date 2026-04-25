@@ -2,6 +2,10 @@ import Foundation
 import Sparkle
 import SwiftUI
 
+// Infinite Recall fork: this service no longer talks to a remote backend.
+// Public API kept for compile compat; bodies are no-ops.
+// Infinite Recall fork: auto-updates disabled. Re-run ./run.sh to update manually.
+
 /// Update channel for staged releases
 enum UpdateChannel: String, CaseIterable {
   case stable = "stable"
@@ -333,9 +337,13 @@ final class UpdaterViewModel: ObservableObject {
       AppBuild.syncUpdateChannelOnFirstLaunch()
     }
 
-    // Initialize the updater controller with our delegate
+    // Infinite Recall fork: auto-updates disabled.
+    // Disabled for local-first fork: updaterController = SPUStandardUpdaterController(startingUpdater: true, ...)
+    // We still construct the controller because `updaterController` is a `let` property
+    // referenced elsewhere in the class (publishers, lastUpdateCheckDate, etc.), but we
+    // pass `startingUpdater: false` so Sparkle does NOT contact the appcast feed.
     updaterController = SPUStandardUpdaterController(
-      startingUpdater: true,
+      startingUpdater: false,
       updaterDelegate: updaterDelegate,
       userDriverDelegate: nil
     )
@@ -376,35 +384,37 @@ final class UpdaterViewModel: ObservableObject {
 
   /// Manually check for updates
   func checkForUpdates() {
-    updaterController.checkForUpdates(nil)
+    // Infinite Recall fork: auto-updates disabled.
+    log("[backend-stripped] UpdaterViewModel.checkForUpdates: no-op (local-first)")
+    // Disabled for local-first fork: updaterController.checkForUpdates(nil)
+    return
   }
 
   /// Background update check (no UI). Used after channel changes.
   func checkForUpdatesInBackground() {
-    updaterController.updater.checkForUpdatesInBackground()
+    // Infinite Recall fork: auto-updates disabled.
+    // Disabled for local-first fork: updaterController.updater.checkForUpdatesInBackground()
+    return
   }
 
   /// Force the runtime update policy:
   /// - release builds: always auto-check + auto-install
   /// - dev builds: keep both disabled to avoid replacing the local app
   func applyManagedUpdatePolicy() {
-    let shouldAutoUpdate = !AnalyticsManager.isDevBuild
-    automaticallyChecksForUpdates = shouldAutoUpdate
-    automaticallyDownloadsUpdates = shouldAutoUpdate
-    updaterController.updater.automaticallyChecksForUpdates = shouldAutoUpdate
-    updaterController.updater.automaticallyDownloadsUpdates = shouldAutoUpdate
-    logSync(
-      "Sparkle: Managed policy applied - isDevBuild=\(AnalyticsManager.isDevBuild) autoChecks=\(updaterController.updater.automaticallyChecksForUpdates) autoDownloads=\(updaterController.updater.automaticallyDownloadsUpdates)"
-    )
+    // Infinite Recall fork: auto-updates disabled. Force everything off so Sparkle
+    // never contacts the appcast feed regardless of build flavor.
+    automaticallyChecksForUpdates = false
+    automaticallyDownloadsUpdates = false
+    updaterController.updater.automaticallyChecksForUpdates = false
+    updaterController.updater.automaticallyDownloadsUpdates = false
+    logSync("Sparkle: Disabled in Infinite Recall fork (local-first)")
   }
 
   /// Trigger one immediate silent update check right after launch.
   /// Sparkle recommends calling this only immediately after starting the updater.
   func checkForUpdatesImmediatelyAfterLaunchIfNeeded() {
-    guard usesManagedUpdatePolicy else { return }
-    guard automaticallyChecksForUpdates else { return }
-    guard canCheckForUpdates else { return }
-    checkForUpdatesInBackground()
+    // Infinite Recall fork: auto-updates disabled.
+    return
   }
 
   /// Get the current app version string

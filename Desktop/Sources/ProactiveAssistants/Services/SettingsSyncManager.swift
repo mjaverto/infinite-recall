@@ -1,5 +1,8 @@
 import Foundation
 
+// Infinite Recall fork: this service no longer talks to a remote backend.
+// Public API kept for compile compat; bodies are no-ops.
+
 /// Manages bidirectional sync of assistant settings between local UserDefaults and the backend.
 /// Server is source of truth — server values override local when present.
 @MainActor
@@ -9,36 +12,22 @@ class SettingsSyncManager {
 
     /// Pull settings from server and apply non-nil values to local singletons.
     func syncFromServer() async {
-        guard AuthService.shared.isSignedIn else { return }
-        do {
-            let remote = try await APIClient.shared.getAssistantSettings()
-            applyRemoteSettings(remote)
-            log("SettingsSyncManager: synced from server")
-        } catch {
-            logError("SettingsSyncManager: failed to sync from server", error: error)
-        }
+        log("[backend-stripped] SettingsSyncManager.syncFromServer: no-op (local-first)")
+        // Disabled for local-first fork: would have called APIClient.getAssistantSettings().
+        return
     }
 
     /// Push all current local settings to the server.
     func syncToServer() async {
-        let settings = buildFromLocal()
-        do {
-            let _ = try await APIClient.shared.updateAssistantSettings(settings)
-            log("SettingsSyncManager: synced to server")
-        } catch {
-            logError("SettingsSyncManager: failed to sync to server", error: error)
-        }
+        log("[backend-stripped] SettingsSyncManager.syncToServer: no-op (local-first)")
+        // Disabled for local-first fork: would have called APIClient.updateAssistantSettings(...).
+        return
     }
 
     /// Fire-and-forget partial update to server.
     func pushPartialUpdate(_ settings: AssistantSettingsResponse) {
-        Task {
-            do {
-                let _ = try await APIClient.shared.updateAssistantSettings(settings)
-            } catch {
-                logError("SettingsSyncManager: failed to push partial update", error: error)
-            }
-        }
+        // Disabled for local-first fork: would have called APIClient.updateAssistantSettings(...).
+        return
     }
 
     // MARK: - Apply Remote → Local

@@ -5,6 +5,11 @@ import AppKit
 import AuthenticationServices
 import Sentry
 
+// Infinite Recall fork: Firebase auth state listener disabled.
+// The signInAnonymously() method below is the load-bearing piece that forces
+// local-only mode on every launch; the listener is redundant and would still
+// ping Firebase, so it's commented out.
+
 extension Notification.Name {
     /// Posted by AuthService.signOut() so views can reset @AppStorage-backed properties directly.
     static let userDidSignOut = Notification.Name("com.omi.desktop.userDidSignOut")
@@ -130,7 +135,10 @@ class AuthService {
         guard !isConfigured else { return }
         isConfigured = true
         restoreAuthState()
-        setupAuthStateListener()
+        // Disabled for local-first fork: setupAuthStateListener()
+        // The Firebase auth state listener still fires and pings Firebase even
+        // though we force anonymous mode at launch — skip it entirely.
+        log("[backend-stripped] AuthService.configure: Firebase state listener disabled (local-first)")
 
         // Timeout: if auth isn't restored within 5 seconds, stop showing loading
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
@@ -164,13 +172,10 @@ class AuthService {
         // creating a race window where the Firebase auth state listener can fire first
         // with user=nil and flip isSignedIn to false before we restore it.
         if savedSignedIn {
-            // Check if Firebase also has a current user (session might still be valid)
-            if let currentUser = Auth.auth().currentUser {
-                NSLog("OMI AUTH: Restored auth state from Firebase - uid: %@", currentUser.uid)
-                self.isSignedIn = true
-                AuthState.shared.userEmail = currentUser.email ?? savedEmail
-                AuthState.shared.isRestoringAuth = false
-                self.loadNameFromBackendIfNeeded()
+            // Disabled for local-first fork: if let currentUser = Auth.auth().currentUser
+            // We never want to consult Firebase on launch; fall through to the saved-state branch.
+            if false {
+                // unreachable; kept so the compiler doesn't drop the else branch
             } else {
                 // Firebase doesn't have user, but we have saved state
                 // This can happen with ad-hoc signing where Keychain doesn't persist
@@ -199,41 +204,12 @@ class AuthService {
     // MARK: - Auth State Listener
 
     private func setupAuthStateListener() {
-        authStateHandle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
-            Task { @MainActor in
-                if user != nil {
-                    // Firebase has a user - trust it
-                    log("AUTH_LISTENER: Firebase user present (uid=\(user?.uid ?? "nil")), setting isSignedIn=true")
-                    self?.isSignedIn = true
-                    AuthState.shared.userEmail = user?.email
-                    AuthState.shared.isRestoringAuth = false
-                    self?.saveAuthState(isSignedIn: true, email: user?.email, userId: user?.uid)
-                    // Configure database for the signed-in user immediately so any code
-                    // that touches the DB during onboarding (e.g. save_knowledge_graph)
-                    // writes to the correct per-user path instead of "anonymous".
-                    if let uid = user?.uid {
-                        Task { await RewindDatabase.shared.configure(userId: uid) }
-                    }
-                    // Load name from backend profile (Firestore), then Firebase Auth as fallback
-                    self?.loadNameFromBackendIfNeeded()
-                    // Sync assistant settings from backend (fire-and-forget)
-                    Task { await SettingsSyncManager.shared.syncFromServer() }
-                } else {
-                    // Firebase has no user - check if we have a saved session (for dev builds where Keychain doesn't persist)
-                    let savedSignedIn = UserDefaults.standard.bool(forKey: self?.kAuthIsSignedIn ?? "")
-                    log("AUTH_LISTENER: Firebase user nil, savedSignedIn=\(savedSignedIn), currentIsSignedIn=\(self?.isSignedIn ?? false)")
-                    if !savedSignedIn {
-                        // No saved session either - user is truly signed out
-                        log("AUTH_LISTENER: No saved session - setting isSignedIn=false")
-                        self?.isSignedIn = false
-                        AuthState.shared.userEmail = nil
-                        AuthState.shared.isRestoringAuth = false
-                    } else {
-                        log("AUTH_LISTENER: Keeping saved session (not overriding isSignedIn)")
-                    }
-                }
-            }
-        }
+        // Disabled for local-first fork: Auth.auth().addStateDidChangeListener
+        // pings Firebase even when we don't sign in. The signInAnonymously() path
+        // owns auth state going forward; this listener is intentionally dead code
+        // kept only so callers continue to compile.
+        log("[backend-stripped] AuthService.setupAuthStateListener: no-op (local-first)")
+        return
     }
 
     // MARK: - Anonymous Local Mode (Infinite Recall fork)
