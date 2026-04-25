@@ -232,6 +232,19 @@ class TranscriptionService: @unchecked Sendable {
         pcmBufferLock.unlock()
     }
 
+    /// Returns true when the window's RMS is below a silence threshold.
+    /// Threshold tuned empirically on M-series Macs: -45 dBFS catches room
+    /// silence + keyboard clicks but lets normal speech through. Float32
+    /// samples in [-1, 1].
+    private static func isWindowSilent(_ samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return true }
+        var sumSq: Float = 0
+        for s in samples { sumSq += s * s }
+        let rms = (sumSq / Float(samples.count)).squareRoot()
+        // -45 dBFS = 10^(-45/20) ≈ 0.00562
+        return rms < 0.00562
+    }
+
     /// Flush remaining audio. Cloud path used to send a "finalize" message; in
     /// WhisperKit mode this just triggers one last transcribe pass.
     func finishStream() {
@@ -301,6 +314,18 @@ class TranscriptionService: @unchecked Sendable {
 
             let durationSec = Double(samples.count) / Double(sampleRate)
             guard durationSec >= minWindowSeconds else { continue }
+
+            // Silence gate (fork-local): skip the Whisper pass when the window's
+            // RMS is below a small threshold. Whisper hallucinates noise (e.g.
+            // "Thank you." / ".") on near-silence and burns ~600ms of inference
+            // each pass. This is a cheap inline replacement for the original
+            // VADGateService (stereo, cloud-streaming-shaped) that's intentionally
+            // disabled in this fork — we still slide the window so we don't
+            // re-evaluate the same silence next pass.
+            if Self.isWindowSilent(samples) {
+                await slideWindowForward()
+                continue
+            }
 
             // Battery gate: if heavy work is not allowed, skip the live Whisper
             // pass and enqueue a marker referencing the current window's
