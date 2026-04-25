@@ -16,9 +16,19 @@ enum BYOKValidator {
   }
 
   /// Hit the provider and return whether the key authenticates.
+  ///
+  /// Infinite Recall fork: this validator may only fire on an explicit
+  /// user-pasted key. We intentionally do NOT remove the network calls here —
+  /// future BYOK still needs them — but we hard-gate: any empty / placeholder /
+  /// suspicious-looking key short-circuits before any URLRequest is built.
   static func validate(_ provider: BYOKProvider, key: String) async -> Status {
     let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return .failed("Empty") }
+    // Defensive: refuse to ping unless the key looks like a real user paste.
+    // A real key is at least 16 chars and contains no whitespace.
+    guard trimmed.count >= 16, !trimmed.contains(where: { $0.isWhitespace }) else {
+      return .failed("Key too short or malformed — refusing to ping provider")
+    }
 
     switch provider {
     case .openai:

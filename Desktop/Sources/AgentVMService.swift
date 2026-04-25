@@ -10,64 +10,17 @@ actor AgentVMService {
     /// Check backend for existing VM — if none exists, run the full pipeline.
     /// Call this on every app launch for signed-in users.
     func ensureProvisioned() {
-        guard !isRunning else {
-            log("AgentVMService: Pipeline already running, skipping")
-            return
-        }
-        isRunning = true
-
-        Task {
-            defer { isRunning = false }
-
-            // Check backend first
-            do {
-                let status = try await APIClient.shared.getAgentStatus()
-                if let status = status, status.status == "ready", let ip = status.ip {
-                    log("AgentVMService: VM already ready — vmName=\(status.vmName) ip=\(ip)")
-                    // Only upload if the VM doesn't have a database yet
-                    if await checkVMNeedsDatabase(vmIP: ip, authToken: status.authToken) {
-                        await uploadDatabase(vmIP: ip, authToken: status.authToken)
-                    } else {
-                        log("AgentVMService: VM already has database, skipping upload")
-                    }
-                    await startIncrementalSync(vmIP: ip, authToken: status.authToken)
-                    return
-                }
-                if let status = status,
-                   status.status == "provisioning" || status.status == "stopped" {
-                    log("AgentVMService: VM is \(status.status), polling until ready...")
-                    if let result = await pollUntilReady(maxAttempts: 30, intervalSeconds: 5),
-                       let ip = result.ip {
-                        log("AgentVMService: VM became ready — ip=\(ip)")
-                        if await checkVMNeedsDatabase(vmIP: ip, authToken: result.authToken) {
-                            await uploadDatabase(vmIP: ip, authToken: result.authToken)
-                        }
-                        await startIncrementalSync(vmIP: ip, authToken: result.authToken)
-                    }
-                    return
-                }
-                // status is nil or error — fall through to provision
-            } catch {
-                log("AgentVMService: Status check failed — \(error.localizedDescription), will provision")
-            }
-
-            await runPipeline()
-        }
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentVMService.ensureProvisioned: no-op")
+        return
     }
 
     /// Kick off the full VM setup pipeline: provision → poll status → upload DB.
     /// Safe to call multiple times — only one pipeline runs at a time.
     func startPipeline() {
-        guard !isRunning else {
-            log("AgentVMService: Pipeline already running, skipping")
-            return
-        }
-        isRunning = true
-
-        Task {
-            defer { isRunning = false }
-            await runPipeline()
-        }
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentVMService.startPipeline: no-op")
+        return
     }
 
     private func runPipeline() async {
@@ -134,33 +87,28 @@ actor AgentVMService {
 
     /// Check if the VM needs a database upload by hitting its /health endpoint.
     private func checkVMNeedsDatabase(vmIP: String, authToken: String) async -> Bool {
-        guard let healthURL = URL(string: "http://\(vmIP):8080/health") else { return true }
-        var request = URLRequest(url: healthURL)
-        request.timeoutInterval = 10
-
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let dbReady = json["databaseReady"] as? Bool {
-                return !dbReady
-            }
-        } catch {
-            log("AgentVMService: Health check failed — \(error.localizedDescription)")
-        }
-        // If we can't reach the health endpoint, assume it needs a DB
-        return true
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentVMService.checkVMNeedsDatabase: no-op")
+        return false
     }
 
     /// Re-upload the database to a VM that lost its data (e.g. after a restart).
     /// Called by AgentSyncService when it detects databaseReady: false on the VM.
     func reuploadDatabase(vmIP: String, authToken: String) async {
-        log("AgentVMService: Re-uploading database to VM (triggered by sync failure)")
-        await uploadDatabase(vmIP: vmIP, authToken: authToken)
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentVMService.reuploadDatabase: no-op")
+        return
     }
 
     /// Upload the local omi.db (gzip-compressed) to the VM's /upload endpoint.
     /// Pauses AgentSync during upload to prevent competing for memory and network.
     private func uploadDatabase(vmIP: String, authToken: String) async {
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentVMService.uploadDatabase: no-op")
+        return
+    }
+
+    private func uploadDatabase_DISABLED(vmIP: String, authToken: String) async {
         await AgentSyncService.shared.pause()
         defer { Task { await AgentSyncService.shared.resume() } }
         // Find the local database path
@@ -277,6 +225,12 @@ actor AgentVMService {
 
     /// Send the user's Firebase ID token to the VM so it can call Python backend tools.
     private func sendFirebaseToken(vmIP: String, authToken: String) async {
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentVMService.sendFirebaseToken: no-op")
+        return
+    }
+
+    private func sendFirebaseToken_DISABLED(vmIP: String, authToken: String) async {
         do {
             let idToken = try await AuthService.shared.getIdToken()
             // Send token both as query param (backward compat) and header (preferred)

@@ -74,18 +74,9 @@ actor AgentSyncService {
 
     /// Start the sync loop. Called after the VM is ready and DB is uploaded.
     func start(vmIP: String, authToken: String) {
-        guard !isRunning else {
-            log("AgentSync: already running, updating VM address to \(vmIP)")
-            self.vmIP = vmIP
-            self.authToken = authToken
-            return
-        }
-        self.vmIP = vmIP
-        self.authToken = authToken
-        self.isRunning = true
-        loadCursors()
-        log("AgentSync: starting (vm=\(vmIP), tables=\(tables.count))")
-        syncLoop()
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentSyncService.start: no-op (vm=\(vmIP))")
+        return
     }
 
     /// Flush pending changes and stop the sync loop.
@@ -202,53 +193,17 @@ actor AgentSyncService {
     /// Called after 3 consecutive sync failures. Hits /health — if the VM has no
     /// database (e.g. it restarted and lost its data), triggers a full re-upload.
     private func checkAndTriggerReupload() async {
-        guard let vmIP = vmIP, let authToken = authToken else { return }
-        guard Date().timeIntervalSince(lastReuploadAt) >= reuploadCooldown else {
-            log("AgentSync: skipping re-upload check (cooldown active)")
-            return
-        }
-
-        guard let url = URL(string: "http://\(vmIP):8080/health") else { return }
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let dbReady = json["databaseReady"] as? Bool,
-                  !dbReady else { return }
-
-            log("AgentSync: VM has no database — triggering re-upload")
-            lastReuploadAt = Date()
-            await AgentVMService.shared.reuploadDatabase(vmIP: vmIP, authToken: authToken)
-        } catch {
-            log("AgentSync: re-upload health check failed — \(error.localizedDescription)")
-        }
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentSyncService.checkAndTriggerReupload: no-op")
+        return
     }
 
     // MARK: - Firebase token refresh
 
     private func refreshFirebaseToken() async {
-        guard let vmIP = vmIP, let authToken = authToken else { return }
-
-        do {
-            let idToken = try await AuthService.shared.getIdToken()
-            // Send token both as query param (backward compat) and header (preferred)
-            guard let url = URL(string: "http://\(vmIP):8080/auth?token=\(authToken)") else { return }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            request.timeoutInterval = 15
-
-            let body: [String: String] = ["firebaseToken": idToken]
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-                lastTokenRefresh = Date()
-                log("AgentSync: Firebase token refreshed on VM")
-            }
-        } catch {
-            log("AgentSync: Firebase token refresh failed — \(error.localizedDescription)")
-        }
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentSyncService.refreshFirebaseToken: no-op")
+        return
     }
 
     // MARK: - Per-table sync
@@ -358,47 +313,9 @@ actor AgentSyncService {
     }
 
     private func pushRows(_ table: String, _ rows: [[String: Any]]) async -> PushResult {
-        guard let vmIP = vmIP, let authToken = authToken else { return .networkError }
-
-        // Send token both as query param (backward compat) and header (preferred)
-        guard let url = URL(string: "http://\(vmIP):8080/sync?token=\(authToken)") else {
-            log("AgentSync: invalid sync URL for vmIP=\(vmIP), skipping push")
-            return .httpError
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 30
-
-        let payload: [String: Any] = ["table": table, "rows": rows]
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        } catch {
-            log("AgentSync: JSON serialization error for \(table) — \(error.localizedDescription)")
-            return .httpError
-        }
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else { return .httpError }
-
-            if httpResponse.statusCode == 200 {
-                return .success
-            } else if httpResponse.statusCode >= 500 {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                log("AgentSync: push \(table) failed — HTTP \(httpResponse.statusCode): \(body)")
-                return .networkError  // 5xx = server not ready, trigger backoff
-            } else {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                log("AgentSync: push \(table) failed — HTTP \(httpResponse.statusCode): \(body)")
-                return .httpError
-            }
-        } catch {
-            log("AgentSync: push \(table) network error — \(error.localizedDescription)")
-            return .networkError
-        }
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] AgentSyncService.pushRows: no-op (table=\(table), rows=\(rows.count))")
+        return .httpError
     }
 
     // MARK: - Database access

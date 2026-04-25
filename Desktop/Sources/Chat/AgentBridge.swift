@@ -107,6 +107,12 @@ actor AgentBridge {
 
   /// Start the Node.js agent bridge process
   func start() async throws {
+    // Infinite Recall fork: local-only mode — pi-mono bridge would call api.omi.me. Refuse to start.
+    log("[backend-stripped] AgentBridge.start: no-op (refusing to spawn Node bridge)")
+    throw BridgeError.bridgeScriptNotFound
+  }
+
+  private func start_DISABLED() async throws {
     guard !isRunning else { return }
 
     // Clean up any leftover state from a previous crashed process

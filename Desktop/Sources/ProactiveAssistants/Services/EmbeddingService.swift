@@ -39,49 +39,9 @@ actor EmbeddingService {
   ///   - text: Text to embed
   ///   - taskType: Optional Gemini task type (e.g. "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY")
   func embed(text: String, taskType: String? = nil) async throws -> [Float] {
-    guard !Self.proxyBaseURL.isEmpty else {
-      throw EmbeddingError.missingAPIKey
-    }
-
-    let modelName = Self.modelName
-    var requestBody: [String: Any] = [
-      "model": "models/\(modelName)",
-      "content": [
-        "parts": [["text": text]]
-      ],
-    ]
-    if let taskType = taskType {
-      requestBody["taskType"] = taskType
-    }
-
-    let url = URL(
-      string: "\(Self.proxyBaseURL)v1/proxy/gemini/models/\(modelName):embedContent"
-    )!
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(try await authHeader(), forHTTPHeaderField: "Authorization")
-    request.timeoutInterval = 30
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-
-    let (data, response) = try await URLSession.shared.data(for: request)
-
-    // Check HTTP status before parsing — non-JSON error bodies (HTML 401/500)
-    // cause "data couldn't be read" errors that mask the real problem.
-    if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
-      let body = String(data: data.prefix(200), encoding: .utf8) ?? "<non-utf8>"
-      throw EmbeddingError.serverError(statusCode: httpResponse.statusCode, body: body)
-    }
-
-    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let embedding = json["embedding"] as? [String: Any],
-      let values = embedding["values"] as? [Double]
-    else {
-      throw EmbeddingError.invalidResponse
-    }
-
-    let floats = values.map { Float($0) }
-    return normalize(floats)
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] EmbeddingService.embed: no-op")
+    throw EmbeddingError.missingAPIKey
   }
 
   /// Batch embed multiple texts using Gemini (3072-dim, up to 100 per call)
@@ -89,48 +49,9 @@ actor EmbeddingService {
   ///   - texts: Texts to embed
   ///   - taskType: Optional Gemini task type (e.g. "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY")
   func embedBatch(texts: [String], taskType: String? = nil) async throws -> [[Float]] {
-    guard !Self.proxyBaseURL.isEmpty else {
-      throw EmbeddingError.missingAPIKey
-    }
-
-    let modelName = Self.modelName
-    let requests = texts.map { text in
-      var req: [String: Any] = [
-        "model": "models/\(modelName)",
-        "content": [
-          "parts": [["text": text]]
-        ],
-      ]
-      if let taskType = taskType {
-        req["taskType"] = taskType
-      }
-      return req
-    }
-
-    let requestBody: [String: Any] = ["requests": requests]
-
-    let url = URL(
-      string: "\(Self.proxyBaseURL)v1/proxy/gemini/models/\(modelName):batchEmbedContents"
-    )!
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(try await authHeader(), forHTTPHeaderField: "Authorization")
-    request.timeoutInterval = 60
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-
-    let (data, _) = try await URLSession.shared.data(for: request)
-
-    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let embeddings = json["embeddings"] as? [[String: Any]]
-    else {
-      throw EmbeddingError.invalidResponse
-    }
-
-    return embeddings.compactMap { embedding in
-      guard let values = embedding["values"] as? [Double] else { return nil }
-      return normalize(values.map { Float($0) })
-    }
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] EmbeddingService.embedBatch: no-op (texts=\(texts.count))")
+    throw EmbeddingError.missingAPIKey
   }
 
   // MARK: - In-Memory Index
