@@ -43,5 +43,22 @@ Infinite Recall is a **local-first** rework. Major changes from Omi:
 - Telemetry (Sentry, PostHog, Mixpanel, Heap) removed
 - Subscription / payment / OAuth flows removed
 - Brand reset to "Infinite Recall"
+- On-device speaker diarization added (no cloud)
+
+## On-device speaker diarization
+
+The `Desktop/Sources/Diarization/` module ships a lightweight, fully on-device
+speaker diarization pipeline. v1 uses a deterministic MFCC-based embedding
+(no model files, no downloads) computed via Apple's Accelerate framework.
+
+- **Approach**: 26-dim L2-normalized MFCC mean+std embedding per speech turn,
+  cosine-matched to per-person centroids (threshold 0.65) stored in GRDB.
+- **VAD**: simple energy-based with hangover; intentionally kept minimal so
+  failures here can't block the always-on capture pipeline.
+- **No external model is downloaded**. A neural embedding (pyannote-audio
+  segmentation + WeSpeaker, ported to Core ML or ONNX) can drop into the same
+  `MFCCExtractor.embed(samples:)` interface later — see TODOs in
+  `SpeakerDiarizationService.swift`.
+- **License**: Original code, MIT-licensed under this project.
 
 The architectural blueprint is in `~/.claude/plans/stop-all-versions-of-humble-hennessy.md`.

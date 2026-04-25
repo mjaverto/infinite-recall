@@ -385,6 +385,24 @@ actor TranscriptionStorage {
         log("TranscriptionStorage: Deleted \(segmentIds.count) segments by backend IDs from session \(sessionId)")
     }
 
+    /// Infinite Recall fork: resolve a backend conversation id to its local
+    /// transcription_sessions.id. Used by the local-first People assignment
+    /// path to backfill speaker_embeddings.
+    func sessionIdForBackendId(_ backendId: String) async -> Int64? {
+        do {
+            let db = try await ensureInitialized()
+            return try await db.read { database in
+                try Int64.fetchOne(
+                    database,
+                    sql: "SELECT id FROM transcription_sessions WHERE backendId = ?",
+                    arguments: [backendId]
+                )
+            }
+        } catch {
+            return nil
+        }
+    }
+
     /// Update speaker assignment metadata for existing segments in a synced conversation.
     /// Matches by backend segment IDs when available, then falls back to local segment order.
     func updateSpeakerAssignmentByBackendId(
