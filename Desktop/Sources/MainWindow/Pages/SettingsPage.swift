@@ -363,6 +363,31 @@ struct SettingsContentView: View {
   // approximation by a few hundred MB).
   @State private var localModelDiskSizes: [String: Int64] = [:]
 
+  // Vision Model picker — mirrors the text-tier state block above but
+  // pointed at `VLMLifecycleManager` / `VisionModelCatalog`.
+  @AppStorage("activeVisionModelID") private var activeVisionModelID: String =
+    VLMLifecycleManager.defaultModelID
+  @State private var visionModelPickerExpanded: Bool = false
+  @State private var visionModelPickerSelection: String? = nil
+  @State private var visionModelSwitchInFlight: Bool = false
+
+  // Post-switch prompt for the vision tier.
+  @State private var visionModelPostSwitchPrompt: PostSwitchPrompt? = nil
+  @State private var visionModelPostSwitchDialogVisible: Bool = false
+
+  // Per-row delete confirmation for the vision tier.
+  @State private var visionModelDeletePrompt: DeletePrompt? = nil
+  @State private var visionModelDeleteDialogVisible: Bool = false
+
+  // True while a vision model delete is in flight.
+  @State private var visionModelDeleteInFlightId: String? = nil
+
+  // Transient "Freed X GB" toast for the vision tier.
+  @State private var visionModelDeleteToast: String? = nil
+
+  // Cached on-disk sizes for vision models.
+  @State private var visionModelDiskSizes: [String: Int64] = [:]
+
   // MCP API card — expandable response viewer + transient "copied" feedback.
   @State private var mcpAPIShowResponse: Bool = false
   @State private var mcpAPICopyFeedback: String? = nil
@@ -2014,6 +2039,9 @@ struct SettingsContentView: View {
   /// mlx-vlm tier (image-text-to-text) on 127.0.0.1:8081. Same install /
   /// start / stop / status / test surface as the text tier, but pointed at
   /// `VLMLifecycleManager` and `VisionLLMClient`.
+  ///
+  /// Sprint FF: added per-row Delete button on non-active rows + post-switch
+  /// "Delete previous model?" prompt, mirroring the text-tier pattern exactly.
   private var aiVisionModelCard: some View {
     settingsCard(settingId: "ai.visionmodel") {
       VStack(alignment: .leading, spacing: 14) {
@@ -2035,31 +2063,8 @@ struct SettingsContentView: View {
           .foregroundColor(OmiColors.textSecondary)
           .fixedSize(horizontal: false, vertical: true)
 
-        // Default-model summary line.
-        HStack(spacing: 8) {
-          Text("Active:")
-            .scaledFont(size: 12)
-            .foregroundColor(OmiColors.textTertiary)
-          Text("Qwen3-VL-8B-Instruct (4-bit)")
-            .scaledFont(size: 12, weight: .semibold)
-            .foregroundColor(OmiColors.textPrimary)
-          if vlmLifecycle.modelPresent {
-            Image(systemName: "checkmark.circle.fill")
-              .scaledFont(size: 11)
-              .foregroundColor(OmiColors.success)
-            Text("Installed")
-              .scaledFont(size: 12)
-              .foregroundColor(OmiColors.textSecondary)
-          } else {
-            Image(systemName: "exclamationmark.circle")
-              .scaledFont(size: 11)
-              .foregroundColor(OmiColors.warning)
-            Text("Not installed")
-              .scaledFont(size: 12)
-              .foregroundColor(OmiColors.textSecondary)
-          }
-          Spacer()
-        }
+        // Active-model summary line — mirrors activeModelSummary on the text card.
+        activeVisionModelSummary
 
         if let err = vlmLifecycle.lastError, !err.isEmpty {
           Text(err)
@@ -2081,6 +2086,9 @@ struct SettingsContentView: View {
             Spacer()
           }
         }
+
+        // Model picker — disclosure group with per-row radio + Delete buttons.
+        visionModelPicker
 
         Divider().overlay(OmiColors.backgroundQuaternary)
 
@@ -2136,6 +2144,402 @@ struct SettingsContentView: View {
       }
       .sheet(isPresented: $presentingVLMInstallSheet) {
         LocalAIInstallSheet(kind: .vlm)
+      }
+    }
+  }
+
+  // MARK: Vision Model — active summary
+
+  private var activeVisionModelSummary: some View {
+    let active = VisionModelCatalog.option(forId: activeVisionModelID)
+      ?? VisionModelCatalog.recommended
+    let installed = vlmLifecycle.isModelInstalled(modelId: active.id)
+    return HStack(spacing: 8) {
+      Text("Active:")
+        .scaledFont(size: 12)
+        .foregroundColor(OmiColors.textTertiary)
+      Text(active.displayName)
+        .scaledFont(size: 12, weight: .semibold)
+        .foregroundColor(OmiColors.textPrimary)
+      if installed {
+        Image(systemName: "checkmark.circle.fill")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.success)
+        if let bytes = visionModelDiskSizes[active.id], bytes > 0 {
+          Text("Installed (\(formatBytes(bytes)) on disk)")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+        } else {
+          Text("Installed (~\(formatGB(active.approxDiskGB)))")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+        }
+      } else {
+        Image(systemName: "exclamationmark.circle")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.warning)
+        Text("Not installed")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+      }
+      Spacer()
+    }
+  }
+
+  // MARK: Vision Model picker (radio-row list)
+
+  @ViewBuilder
+  private var visionModelPicker: some View {
+    DisclosureGroup(
+      isExpanded: $visionModelPickerExpanded,
+      content: {
+        VStack(alignment: .leading, spacing: 10) {
+          ForEach(VisionModelCatalog.all) { option in
+            visionModelRow(option)
+          }
+
+          if let pendingId = visionModelPickerSelection,
+             pendingId != activeVisionModelID,
+             vlmLifecycle.isModelInstalled(modelId: pendingId)
+          {
+            HStack {
+              Spacer()
+              Button(action: { setActiveVisionModel(pendingId) }) {
+                if visionModelSwitchInFlight {
+                  ProgressView()
+                    .controlSize(.small)
+                    .padding(.horizontal, 6)
+                } else {
+                  Text("Set as Active")
+                    .scaledFont(size: 12, weight: .semibold)
+                }
+              }
+              .buttonStyle(.borderedProminent)
+              .tint(OmiColors.purplePrimary)
+              .controlSize(.small)
+              .disabled(visionModelSwitchInFlight)
+            }
+            .padding(.top, 4)
+          }
+        }
+        .padding(.top, 8)
+      },
+      label: {
+        Text(visionModelPickerExpanded ? "Hide models" : "Show all models")
+          .scaledFont(size: 12, weight: .medium)
+          .foregroundColor(OmiColors.purplePrimary)
+      }
+    )
+    .onAppear {
+      if visionModelPickerSelection == nil {
+        visionModelPickerSelection = activeVisionModelID
+      }
+      refreshAllVisionModelDiskSizes()
+    }
+    .onChange(of: visionModelPickerExpanded) { _, expanded in
+      if expanded { refreshAllVisionModelDiskSizes() }
+    }
+    // Post-switch: "Switched to X. Delete previous model Y to free Z?"
+    .confirmationDialog(
+      visionPostSwitchDialogTitle,
+      isPresented: $visionModelPostSwitchDialogVisible,
+      titleVisibility: .visible,
+      presenting: visionModelPostSwitchPrompt
+    ) { _ in
+      Button("Keep", role: .cancel) {
+        visionModelPostSwitchPrompt = nil
+      }
+      Button("Delete", role: .destructive) {
+        confirmVisionPostSwitchDelete()
+      }
+    } message: { prompt in
+      Text(
+        "Free \(formatBytes(prompt.freedBytes)) by deleting "
+          + "\(prompt.previousDisplayName). You can re-download from "
+          + "this panel anytime.")
+    }
+    // Per-row delete confirmation.
+    .confirmationDialog(
+      visionRowDeleteDialogTitle,
+      isPresented: $visionModelDeleteDialogVisible,
+      titleVisibility: .visible,
+      presenting: visionModelDeletePrompt
+    ) { _ in
+      Button("Cancel", role: .cancel) {
+        visionModelDeletePrompt = nil
+      }
+      Button("Delete", role: .destructive) {
+        confirmVisionRowDelete()
+      }
+    } message: { prompt in
+      Text(
+        "This frees \(formatBytes(prompt.bytes)). You can re-download "
+          + "from this panel anytime.")
+    }
+    .overlay(alignment: .bottom) {
+      if let toast = visionModelDeleteToast {
+        Text(toast)
+          .scaledFont(size: 12, weight: .medium)
+          .foregroundColor(OmiColors.textPrimary)
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+          .background(
+            RoundedRectangle(cornerRadius: 6)
+              .fill(OmiColors.backgroundTertiary)
+          )
+          .padding(.bottom, 4)
+          .transition(.opacity)
+      }
+    }
+  }
+
+  private var visionPostSwitchDialogTitle: String {
+    guard let prompt = visionModelPostSwitchPrompt else {
+      return "Delete previous vision model?"
+    }
+    return "Switched to \(prompt.newDisplayName). "
+      + "Delete \(prompt.previousDisplayName)?"
+  }
+
+  private var visionRowDeleteDialogTitle: String {
+    guard let prompt = visionModelDeletePrompt else {
+      return "Delete vision model?"
+    }
+    return "Delete \(prompt.displayName)?"
+  }
+
+  /// One radio-style row for a `VisionModelOption`. Mirrors `localModelRow`
+  /// exactly but references vision-tier state and `VLMLifecycleManager`.
+  @ViewBuilder
+  private func visionModelRow(_ option: VisionModelOption) -> some View {
+    let isActive = option.id == activeVisionModelID
+    let isSelected = (visionModelPickerSelection ?? activeVisionModelID) == option.id
+    let installed = vlmLifecycle.isModelInstalled(modelId: option.id)
+
+    HStack(alignment: .top, spacing: 10) {
+      Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+        .scaledFont(size: 14)
+        .foregroundColor(
+          isSelected ? OmiColors.purplePrimary : OmiColors.textTertiary
+        )
+        .padding(.top, 1)
+
+      VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 8) {
+          Text(option.displayName)
+            .scaledFont(size: 13, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+          Text(option.badge)
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textSecondary)
+          if isActive {
+            Image(systemName: "checkmark")
+              .scaledFont(size: 11, weight: .semibold)
+              .foregroundColor(OmiColors.success)
+          }
+          Spacer()
+        }
+
+        Text(visionModelMetadataLine(option))
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.textTertiary)
+
+        HStack(spacing: 8) {
+          if installed {
+            HStack(spacing: 4) {
+              Image(systemName: "checkmark.circle.fill")
+                .scaledFont(size: 10)
+                .foregroundColor(OmiColors.success)
+              if let bytes = visionModelDiskSizes[option.id], bytes > 0 {
+                Text("Installed · \(formatBytes(bytes)) on disk")
+                  .scaledFont(size: 11)
+                  .foregroundColor(OmiColors.textSecondary)
+              } else {
+                Text("Installed")
+                  .scaledFont(size: 11)
+                  .foregroundColor(OmiColors.textSecondary)
+              }
+            }
+            if isActive {
+              Text("· Currently active")
+                .scaledFont(size: 11)
+                .foregroundColor(OmiColors.textTertiary)
+            }
+            Spacer()
+            // Per-row Delete button: only on non-active installed rows.
+            if !isActive {
+              if visionModelDeleteInFlightId == option.id {
+                HStack(spacing: 4) {
+                  ProgressView().controlSize(.small)
+                  Text("Deleting…")
+                    .scaledFont(size: 11)
+                    .foregroundColor(OmiColors.textTertiary)
+                }
+              } else {
+                Button("Delete") {
+                  askDeleteVisionModel(option)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(visionModelDeleteInFlightId != nil)
+              }
+            }
+          } else {
+            Text("Not installed")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.textTertiary)
+
+            Button("Install") {
+              installVisionModel(option.id)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            Spacer()
+          }
+        }
+      }
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      visionModelPickerSelection = option.id
+    }
+  }
+
+  // MARK: Vision Model picker — helpers
+
+  private func visionModelMetadataLine(_ option: VisionModelOption) -> String {
+    let ram = formatGB(option.approxRamGB) + " RAM"
+    let disk = formatGB(option.approxDiskGB) + " disk"
+    return "~\(ram) · \(disk) · \(option.license)"
+  }
+
+  private func installVisionModel(_ modelId: String) {
+    Task {
+      visionModelPickerSelection = modelId
+      presentingVLMInstallSheet = true
+      await LocalAIInstaller.shared.startVLMInstall(modelId: modelId)
+    }
+  }
+
+  /// Switch the active vision model. Mirrors `setActiveModel` on the text
+  /// tier but uses `VLMLifecycleManager` and `activeVisionModelID`.
+  private func setActiveVisionModel(_ modelId: String) {
+    guard !visionModelSwitchInFlight else { return }
+    visionModelSwitchInFlight = true
+
+    let previousId = activeVisionModelID
+
+    Task {
+      defer { visionModelSwitchInFlight = false }
+
+      let lifecycle = VLMLifecycleManager.shared
+
+      if lifecycle.serverRunning {
+        await lifecycle.stopServer()
+      }
+
+      // Persist new id BEFORE plist regeneration — regeneratePlist reads from
+      // UserDefaults via VLMLifecycleManager.activeModelID.
+      activeVisionModelID = modelId
+
+      // Rewrite the launchd plist with the new --model arg.
+      _ = lifecycle.regeneratePlistForActiveModel()
+
+      // unload + load to apply.
+      _ = await lifecycle.reloadAgent()
+
+      _ = await lifecycle.startServer()
+      await lifecycle.refresh()
+
+      refreshVisionModelDiskSize(for: modelId)
+
+      if previousId != modelId,
+         lifecycle.isModelInstalled(modelId: previousId)
+      {
+        let bytes = VLMLifecycleManager.modelCacheSizeBytes(for: previousId)
+        let prevName = VisionModelCatalog.option(forId: previousId)?.displayName
+          ?? previousId
+        let newName = VisionModelCatalog.option(forId: modelId)?.displayName
+          ?? modelId
+        visionModelPostSwitchPrompt = PostSwitchPrompt(
+          previousModelId: previousId,
+          previousDisplayName: prevName,
+          newDisplayName: newName,
+          freedBytes: bytes)
+        visionModelPostSwitchDialogVisible = true
+      }
+    }
+  }
+
+  // MARK: Vision Model — disk-size cache + delete plumbing
+
+  private func refreshVisionModelDiskSize(for modelId: String) {
+    let bytes = VLMLifecycleManager.modelCacheSizeBytes(for: modelId)
+    if bytes > 0 {
+      visionModelDiskSizes[modelId] = bytes
+    } else {
+      visionModelDiskSizes.removeValue(forKey: modelId)
+    }
+  }
+
+  private func refreshAllVisionModelDiskSizes() {
+    for option in VisionModelCatalog.all {
+      refreshVisionModelDiskSize(for: option.id)
+    }
+  }
+
+  private func confirmVisionPostSwitchDelete() {
+    guard let prompt = visionModelPostSwitchPrompt else { return }
+    visionModelPostSwitchPrompt = nil
+    performVisionModelDelete(
+      modelId: prompt.previousModelId,
+      displayName: prompt.previousDisplayName,
+      bytes: prompt.freedBytes)
+  }
+
+  private func askDeleteVisionModel(_ option: VisionModelOption) {
+    let bytes = VLMLifecycleManager.modelCacheSizeBytes(for: option.id)
+    visionModelDeletePrompt = DeletePrompt(
+      modelId: option.id,
+      displayName: option.displayName,
+      bytes: bytes)
+    visionModelDeleteDialogVisible = true
+  }
+
+  private func confirmVisionRowDelete() {
+    guard let prompt = visionModelDeletePrompt else { return }
+    visionModelDeletePrompt = nil
+    performVisionModelDelete(
+      modelId: prompt.modelId,
+      displayName: prompt.displayName,
+      bytes: prompt.bytes)
+  }
+
+  /// Shared delete path for the vision tier. Mirrors `performLocalModelDelete`
+  /// exactly but calls `VLMLifecycleManager.deleteModel(_:)`.
+  private func performVisionModelDelete(
+    modelId: String, displayName: String, bytes: Int64
+  ) {
+    guard visionModelDeleteInFlightId == nil else { return }
+    visionModelDeleteInFlightId = modelId
+    Task.detached(priority: .userInitiated) {
+      let ok = VLMLifecycleManager.deleteModel(modelId)
+      await MainActor.run {
+        self.visionModelDeleteInFlightId = nil
+        self.refreshVisionModelDiskSize(for: modelId)
+        self.vlmLifecycle.refreshSync()
+        if ok {
+          self.visionModelDeleteToast = "Freed \(self.formatBytes(bytes))"
+          Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if self.visionModelDeleteToast == "Freed \(self.formatBytes(bytes))" {
+              self.visionModelDeleteToast = nil
+            }
+          }
+        } else {
+          self.visionModelDeleteToast =
+            "Couldn't delete \(displayName). See logs."
+        }
       }
     }
   }
