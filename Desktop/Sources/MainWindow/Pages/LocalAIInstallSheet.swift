@@ -88,6 +88,36 @@ struct LocalAIInstallSheet: View {
     }
   }
 
+  // MARK: - Copy helpers
+
+  /// Human-readable tier label that matches the card title in Settings.
+  private var tierLabel: String {
+    let resolvedKind = installAPIInstead ? Kind.api : kind
+    switch resolvedKind {
+    case .vlm: return "Vision Model"
+    case .api: return "API Server"
+    case .mlx: return "Local Model"
+    }
+  }
+
+  /// Disk size string sourced from the catalog entry being installed, e.g.
+  /// "5.5 GB". Falls back gracefully when no catalog entry is available.
+  private var catalogDiskSizeLabel: String {
+    let resolvedKind = installAPIInstead ? Kind.api : kind
+    switch resolvedKind {
+    case .mlx:
+      let entry = modelId.flatMap { LocalModelCatalog.option(forId: $0) }
+        ?? LocalModelCatalog.recommended
+      return String(format: "%.4g GB", entry.approxDiskGB)
+    case .vlm:
+      let entry = modelId.flatMap { VisionModelCatalog.option(forId: $0) }
+        ?? VisionModelCatalog.recommended
+      return String(format: "%.4g GB", entry.approxDiskGB)
+    case .api:
+      return ""
+    }
+  }
+
   // MARK: - Header
 
   private var header: some View {
@@ -107,10 +137,10 @@ struct LocalAIInstallSheet: View {
 
       VStack(alignment: .leading, spacing: 4) {
         Text(installer.currentStep == .done
-             ? "Local AI is ready"
+             ? "\(tierLabel) is ready"
              : (installer.currentStep == .failed
                 ? "Install failed"
-                : "Setting up Local AI"))
+                : "Setting up \(tierLabel)"))
           .scaledFont(size: 17, weight: .semibold)
           .foregroundColor(OmiColors.textPrimary)
 
@@ -130,7 +160,8 @@ struct LocalAIInstallSheet: View {
     case .failed:
       return installer.error ?? "Something went wrong. See details below."
     default:
-      return "This installs everything needed to run AI on this Mac. About 18 GB of disk."
+      let sizeClause = catalogDiskSizeLabel.isEmpty ? "" : " About \(catalogDiskSizeLabel) of disk."
+      return "This installs everything needed to run AI on this Mac.\(sizeClause)"
     }
   }
 
@@ -157,7 +188,7 @@ struct LocalAIInstallSheet: View {
         .frame(width: 22, height: 22)
 
       VStack(alignment: .leading, spacing: 6) {
-        Text(step.rawValue)
+        Text(stepLabel(for: step))
           .scaledFont(size: 14, weight: isCurrent ? .medium : .regular)
           .foregroundColor(
             isCompleted || isCurrent
@@ -170,6 +201,15 @@ struct LocalAIInstallSheet: View {
       }
       Spacer(minLength: 0)
     }
+  }
+
+  /// Returns the display label for a step row. The download step includes the
+  /// catalog-sourced size so it always agrees with the header subtitle.
+  private func stepLabel(for step: LocalAIInstaller.Step) -> String {
+    if step == .downloadingModel, !catalogDiskSizeLabel.isEmpty {
+      return "Downloading model (~\(catalogDiskSizeLabel))"
+    }
+    return step.rawValue
   }
 
   @ViewBuilder

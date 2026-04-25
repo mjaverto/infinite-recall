@@ -37,7 +37,7 @@ final class LocalAIInstaller: ObservableObject {
     case checkingPrereqs = "Checking prerequisites"
     case installingUV = "Installing uv"
     case installingMLX = "Installing mlx-lm"
-    case downloadingModel = "Downloading model (~18 GB)"
+    case downloadingModel = "Downloading model"
     case installingLaunchAgent = "Registering background service"
     case startingService = "Starting AI server"
     case done = "Ready"
@@ -81,7 +81,9 @@ final class LocalAIInstaller: ObservableObject {
   @Published var logLines: [String] = []
   @Published var modelDownloadProgress: Double? = nil
   @Published var modelDownloadedBytes: Int64? = nil
-  @Published var modelTotalBytes: Int64 = 18_000_000_000
+  /// Estimated total download size in bytes, sourced from the catalog entry
+  /// being installed. Set at install start; defaults to 0 until then.
+  @Published var modelTotalBytes: Int64 = 0
   @Published var isRunning: Bool = false
   @Published var error: String? = nil
 
@@ -177,6 +179,21 @@ final class LocalAIInstaller: ObservableObject {
     pendingKind = kind
     pendingMLXModelId = (kind == .mlx) ? modelId : nil
     pendingVLMModelId = (kind == .vlm) ? modelId : nil
+
+    // Seed modelTotalBytes from the catalog so the progress label never shows
+    // a stale hardcoded number. Fall back to 0 if the id isn't in the catalog.
+    switch kind {
+    case .mlx:
+      let entry = modelId.flatMap { LocalModelCatalog.option(forId: $0) }
+        ?? LocalModelCatalog.recommended
+      modelTotalBytes = Int64(entry.approxDiskGB * 1_000_000_000)
+    case .vlm:
+      let entry = modelId.flatMap { VisionModelCatalog.option(forId: $0) }
+        ?? VisionModelCatalog.recommended
+      modelTotalBytes = Int64(entry.approxDiskGB * 1_000_000_000)
+    case .api:
+      modelTotalBytes = 0
+    }
 
     let scriptURL: URL
     do {
