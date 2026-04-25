@@ -188,8 +188,6 @@ class AppState: ObservableObject {
   private var transcriptionService: TranscriptionService?
   private var systemAudioCaptureService: Any?  // SystemAudioCaptureService (macOS 14.4+)
   private var audioMixer: AudioMixer?
-  private var vadGateService: VADGateService?
-
   // Speaker segments for diarized transcription (sliding window — older segments are in SQLite)
   private var speakerSegments: [SpeakerSegment] = []
   private let maxInMemorySegments = 200
@@ -1281,9 +1279,6 @@ class AppState: ObservableObject {
         // Initialize audio mixer for combining mic and system audio
         audioMixer = AudioMixer()
 
-        // VAD gate not used for Python backend streaming (backend handles its own VAD)
-        vadGateService = nil
-
         // Initialize system audio capture if supported (macOS 14.4+)
         // Can be disabled via: defaults write com.omi.desktop-dev disableSystemAudioCapture -bool true
         //                  or: defaults write com.omi.computer-macos disableSystemAudioCapture -bool true
@@ -1866,9 +1861,6 @@ class AppState: ObservableObject {
 
     // Infinite Recall fork: stop on-device diarization (flushes any in-flight turn).
     SpeakerDiarizationService.shared.stop()
-
-    // Clear VAD gate
-    vadGateService = nil
 
     // Stop transcription service
     transcriptionService?.stop()

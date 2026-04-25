@@ -228,16 +228,6 @@ final class UpdaterDelegate: NSObject, SPUUpdaterDelegate {
       return false
     }
 
-    if let lastSpeech = VADGateService.lastSpeechAt {
-      let secondsSinceSpeech = Date().timeIntervalSince(lastSpeech)
-      if secondsSinceSpeech < UpdaterDelegate.activeCallSilenceWindow {
-        logSync(
-          "Sparkle: Deferring update v\(version) — speech detected \(Int(secondsSinceSpeech))s ago (active recording)"
-        )
-        return false
-      }
-    }
-
     logSync("Sparkle: Triggering immediate installation for v\(version)")
     installationBlock()
     return true

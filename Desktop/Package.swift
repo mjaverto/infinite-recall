@@ -16,8 +16,6 @@ let package = Package(
     .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.24.0"),
     .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.0"),
     .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.0"),
-    .package(
-      url: "https://github.com/microsoft/onnxruntime-swift-package-manager.git", from: "1.20.0"),
     // On-device Whisper transcription (Apache 2.0). Repo redirects to argmax-oss-swift.
     .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.9.0"),
   ],
@@ -47,7 +45,6 @@ let package = Package(
         .product(name: "GRDB", package: "GRDB.swift"),
         .product(name: "Sparkle", package: "Sparkle"),
         .product(name: "MarkdownUI", package: "swift-markdown-ui"),
-        .product(name: "onnxruntime", package: "onnxruntime-swift-package-manager"),
         .product(name: "WhisperKit", package: "WhisperKit"),
         .product(name: "SpeakerKit", package: "WhisperKit"),
       ],
