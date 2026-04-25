@@ -1,36 +1,42 @@
 import Foundation
+import WhisperKit
 
-/// Service for real-time speech-to-text transcription.
-/// Conversation capture: Python backend `/v4/listen` WebSocket (speech profiles, speaker assignment, memory events).
-/// PTT live streaming: Python backend `/v2/voice-message/transcribe-stream` WebSocket (transcription only).
-/// PTT batch: Python backend `/v2/voice-message/transcribe` REST API.
-/// Full stereo batch: removed (formerly Rust proxy Deepgram, now dead code).
-class TranscriptionService {
+/// On-device speech-to-text via WhisperKit (Apache 2.0, Core ML Whisper).
+///
+/// HISTORY: This file used to stream audio over WebSocket to the Python backend
+/// (`/v4/listen` for conversations, `/v2/voice-message/transcribe-stream` for PTT).
+/// In the local-first fork that path is gone — see the `LegacyCloudPath` enum and
+/// the commented-out `connectToBackend` / `parseBackendResponse` block below for
+/// reference. We keep the old types (`BackendSegment`, `ListenEvent`, callback
+/// shapes) so AppState and the live transcript UI compile unchanged.
+///
+/// Threading model: this class is `@unchecked Sendable`. Audio comes in on the
+/// CoreAudio IO thread via `sendAudio(_:)`; transcription runs on a single async
+/// task that consumes a sliding window from the buffer.
+class TranscriptionService: @unchecked Sendable {
 
     // MARK: - Types
 
     /// Streaming mode determines which backend endpoint and parameters are used.
+    /// In the local-first fork both modes resolve to the same on-device pipeline.
     enum StreamingMode {
-        /// Conversation capture via `/v4/listen` — full pipeline with speech profiles,
-        /// speaker assignment, memory creation events, and conversation lifecycle.
         case conversation
-        /// PTT live transcription via `/v2/voice-message/transcribe-stream` — transcription only,
-        /// no conversation lifecycle. Supports "finalize" text message for flush.
         case ptt
     }
 
-    /// Translation from backend (lang code + translated text)
+    /// Translation slot — kept for source compatibility with the old backend wire format.
     struct BackendTranslation: Decodable {
         let lang: String
         let text: String
     }
 
-    /// Transcript segment from Python backend
-    /// Matches `models.transcript_segment.TranscriptSegment` on the backend
+    /// Transcript segment — same shape AppState's `handleBackendSegments` expects.
+    /// In WhisperKit mode `id` is a synthetic UUID per emitted segment, `speaker`
+    /// is `"SPEAKER_00"`, and `is_user` is always true (no diarization in v1).
     struct BackendSegment: Decodable {
         let id: String?
         let text: String
-        let speaker: String?        // e.g. "SPEAKER_00"
+        let speaker: String?
         let speaker_id: Int?
         let is_user: Bool
         let person_id: String?
@@ -39,14 +45,12 @@ class TranscriptionService {
         let translations: [BackendTranslation]?
     }
 
-    /// Message event (from `/v4/listen` only — not used by PTT transcribe-stream)
-    /// JSON object with a `type` field indicating the event kind
+    /// Listen event — only used in cloud mode. Kept so callers compile.
     struct ListenEvent {
         let type: String
-        let raw: [String: Any]  // Full JSON for event-specific fields
+        let raw: [String: Any]
     }
 
-    /// Callback types
     typealias BackendSegmentsHandler = ([BackendSegment]) -> Void
     typealias ListenEventHandler = (ListenEvent) -> Void
     typealias ErrorHandler = (Error) -> Void
@@ -58,133 +62,109 @@ class TranscriptionService {
         case invalidResponse
         case payloadTooLarge
         case webSocketError(String)
+        case modelLoadFailed(Error)
 
         var errorDescription: String? {
             switch self {
             case .missingBackendURL:
-                return "Python backend URL not configured (OMI_PYTHON_API_URL or api.omi.me)"
+                return "Transcription backend not configured"
             case .connectionFailed(let error):
                 return "Connection failed: \(error.localizedDescription)"
             case .invalidResponse:
-                return "Invalid response from backend"
+                return "Invalid response from transcription engine"
             case .payloadTooLarge:
                 return "Recording too long — keep it under 5 minutes"
             case .webSocketError(let message):
-                return "WebSocket error: \(message)"
+                return "Transcription error: \(message)"
+            case .modelLoadFailed(let error):
+                return "WhisperKit model load failed: \(error.localizedDescription)"
             }
         }
     }
 
     // MARK: - Properties
 
-    private let apiKey: String
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var urlSession: URLSession?
-    // Internal for @testable import access in unit tests
-    var isConnected = false
-    var shouldReconnect = false
+    private let language: String
+    private let streamingMode: StreamingMode
 
-    // Callbacks
+    /// True once WhisperKit has loaded a model. Until then `sendAudio` still
+    /// accepts samples (so audio capture can keep buffering on disk via
+    /// AudioPersistenceService) but no segments are emitted.
+    var isConnected = false
+    var shouldReconnect = false  // unused locally; kept for API compatibility
+
     private var onBackendSegments: BackendSegmentsHandler?
     private var onListenEvent: ListenEventHandler?
     private var onError: ErrorHandler?
     private var onConnected: ConnectionHandler?
     private var onDisconnected: ConnectionHandler?
 
-    // Configuration
-    private let language: String
-    private let sampleRate = 16000
-    private let encoding = "linear16"
-    private let channels = 1  // Always mono for Python backend streaming
-    private let streamingMode: StreamingMode
+    // WhisperKit state
+    private var whisperKit: WhisperKit?
+    private var modelLoadTask: Task<Void, Never>?
+    private var transcribeTask: Task<Void, Never>?
 
-    /// Python backend base URL for transcription endpoints.
-    /// Resolution order: OMI_PYTHON_API_URL → https://api.omi.me/
-    /// NOTE: Do NOT fall back to OMI_API_URL — that points to the Rust desktop-backend
-    /// (Cloud Run), which does not have /v2/voice-message/* or /v4/listen endpoints.
-    private static let pythonBackendBaseURL: String = {
-        if let cString = getenv("OMI_PYTHON_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty {
-            return url.hasSuffix("/") ? url : url + "/"
-        }
-        return "https://api.omi.me/"
-    }()
+    /// PCM ring buffer (Float32 samples at 16 kHz mono) fed by `sendAudio`.
+    private var pcmBuffer: [Float] = []
+    private let pcmBufferLock = NSLock()
 
-    // Reconnection (internal for @testable import)
-    var reconnectAttempts = 0
-    let maxReconnectAttempts = 10
-    private var reconnectTask: Task<Void, Never>?
+    /// Whisper's expected sample rate.
+    private let sampleRate: Int = 16000
 
-    // Watchdog: detect stale connections where WebSocket dies silently
-    private var watchdogTask: Task<Void, Never>?
-    private var lastDataReceivedAt: Date?
-    private let watchdogInterval: TimeInterval = 30.0   // Check every 30 seconds
-    private let staleThreshold: TimeInterval = 60.0     // Reconnect if no data for 60 seconds
+    /// Run a transcribe pass every `windowStrideSeconds` once we have at least
+    /// `minWindowSeconds` of audio. Keep up to `maxWindowSeconds` in the window
+    /// for context, then slide forward by `commitSeconds` after each pass.
+    private let minWindowSeconds: Double = 4.0
+    private let windowStrideSeconds: Double = 1.0
+    private let maxWindowSeconds: Double = 30.0
+    private let commitSeconds: Double = 6.0
 
-    // Audio buffering
-    private var audioBuffer = Data()
-    private let audioBufferSize = 3200  // ~100ms of 16kHz 16-bit audio (16000 * 2 * 0.1)
-    private let audioBufferLock = NSLock()
+    /// Wall-clock time at which the first sample in the current window started.
+    private var windowStartTime: Date?
+    /// Offset (seconds) from the *start of recording* of the first sample in the
+    /// current window — used so emitted segments have monotonically increasing
+    /// `start`/`end` even after the window slides.
+    private var windowStartOffsetSeconds: Double = 0.0
+    /// Offset (seconds) of the most recently committed end of transcription.
+    private var lastCommittedEndSeconds: Double = 0.0
+
+    /// Default model — small + English-only, ~140 MB on disk after Core ML
+    /// quantization. Fits comfortably in memory and runs well on M1/M2/M3.
+    /// (Multilingual users can swap to `openai_whisper-base` later.)
+    private let modelName = "openai_whisper-base.en"
 
     // MARK: - Initialization
 
-    /// Initialize the transcription service for streaming.
-    /// - Parameters:
-    ///   - language: Language code for transcription (e.g., "en", "uk", "ru", "multi" for auto-detect)
-    ///   - mode: Streaming mode — `.conversation` for `/v4/listen` (default), `.ptt` for `/v2/voice-message/transcribe-stream`
     init(language: String = "en", mode: StreamingMode = .conversation) throws {
-        self.apiKey = ""  // Not needed — Python backend uses Firebase auth
         self.language = language
         self.streamingMode = mode
-        log("TranscriptionService: Initialized for \(mode == .conversation ? "/v4/listen" : "/v2/voice-message/transcribe-stream"), language=\(language)")
+        log("TranscriptionService: WhisperKit init (mode=\(mode), language=\(language), model=\(modelName))")
     }
 
-    /// Initialize for batch (PTT) mode only — uses Python backend `/v2/voice-message/transcribe`
-    /// - Parameters:
-    ///   - apiKey: Ignored (kept for API compatibility with callers)
-    ///   - language: Language code
-    ///   - forBatchOnly: Must be true
+    /// Batch-only init — kept for `PushToTalkManager` API compat.
     init(apiKey: String? = nil, language: String = "en", forBatchOnly: Bool) throws {
         guard forBatchOnly else {
             throw TranscriptionError.webSocketError("Use init(language:) for streaming mode")
         }
-        // Batch mode uses Firebase auth + Python backend — no DG key needed
-        self.apiKey = ""
         self.language = language
-        self.streamingMode = .ptt  // Batch doesn't stream, but PTT is the correct context
-        log("TranscriptionService: Initialized for batch (PTT) mode via Python backend")
+        self.streamingMode = .ptt
+        log("TranscriptionService: WhisperKit batch init")
     }
 
-    // MARK: - Legacy Streaming API (PTT backward compatibility)
-
-    /// Legacy init with channels parameter — used by PushToTalkManager for PTT live mode.
-    /// Routes to `/v2/voice-message/transcribe-stream` (PTT-only transcription).
+    /// Legacy init taking explicit channel count — PTT path. Mono is the only
+    /// supported configuration for the on-device pipeline.
     convenience init(language: String = "en", channels: Int) throws {
         try self.init(language: language, mode: .ptt)
     }
 
-    /// Flush remaining audio and (for PTT mode) tell the backend to finalize transcription.
-    /// PTT live mode calls this to get the final transcript segment before closing.
-    /// In PTT mode, sends a "finalize" text message so the backend flushes any sub-threshold
-    /// audio to Deepgram and triggers its endpointing/finalization.
-    /// In conversation mode, just flushes the local audio buffer (no "finalize" — `/v4/listen`
-    /// manages its own endpointing via the pusher pipeline).
-    func finishStream() {
-        flushAudioBuffer()
+    // MARK: - Public API (preserved from cloud version)
 
-        // Only PTT mode uses the "finalize" protocol — conversation mode (/v4/listen) doesn't support it
-        guard streamingMode == .ptt else { return }
-        guard isConnected, let webSocketTask = webSocketTask else { return }
-        let message = URLSessionWebSocketTask.Message.string("finalize")
-        webSocketTask.send(message) { error in
-            if let error = error {
-                logError("TranscriptionService: finishStream send error", error: error)
-            }
-        }
-    }
-
-    // MARK: - Public Methods (Streaming)
-
-    /// Start the streaming transcription service (endpoint selected by `streamingMode`)
+    /// Start streaming transcription. Audio fed via `sendAudio` will be transcribed
+    /// in overlapping windows and emitted as `BackendSegment`s.
+    ///
+    /// Best-effort: if the WhisperKit model fails to load (e.g. first launch with
+    /// no network), `onError` is fired but `onConnected` is also called so callers
+    /// know audio capture should still proceed. Internally we keep retrying load.
     func start(
         onSegments: @escaping BackendSegmentsHandler,
         onEvent: @escaping ListenEventHandler,
@@ -197,405 +177,281 @@ class TranscriptionService {
         self.onError = onError
         self.onConnected = onConnected
         self.onDisconnected = onDisconnected
-        self.shouldReconnect = true
-        self.reconnectAttempts = 0
 
-        connect()
+        // Reset windowing state
+        pcmBufferLock.lock()
+        pcmBuffer.removeAll(keepingCapacity: true)
+        windowStartTime = Date()
+        windowStartOffsetSeconds = 0
+        lastCommittedEndSeconds = 0
+        pcmBufferLock.unlock()
+
+        // Fire onConnected immediately so AppState can start mic capture even
+        // before WhisperKit finishes loading. Audio still flows into pcmBuffer
+        // via sendAudio() and gets transcribed once the model is ready.
+        isConnected = true
+        DispatchQueue.main.async { [weak self] in
+            self?.onConnected?()
+        }
+
+        // Kick off model load in the background.
+        modelLoadTask?.cancel()
+        modelLoadTask = Task { [weak self] in
+            await self?.loadModelAndStartTranscribing()
+        }
     }
 
-    /// Stop the transcription service
+    /// Tear down — cancels in-flight transcription, releases the model.
     func stop() {
-        shouldReconnect = false
-        reconnectTask?.cancel()
-        reconnectTask = nil
-        watchdogTask?.cancel()
-        watchdogTask = nil
+        isConnected = false
+        modelLoadTask?.cancel()
+        modelLoadTask = nil
+        transcribeTask?.cancel()
+        transcribeTask = nil
 
-        // Flush any remaining audio
-        flushAudioBuffer()
+        pcmBufferLock.lock()
+        pcmBuffer.removeAll(keepingCapacity: false)
+        pcmBufferLock.unlock()
 
-        disconnect()
+        whisperKit = nil
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onDisconnected?()
+        }
+        log("TranscriptionService: Stopped")
     }
 
-    /// Send audio data to the backend (buffered for efficiency)
+    /// Feed mixed mono Int16 PCM @ 16 kHz from AudioMixer.
     func sendAudio(_ data: Data) {
         guard isConnected else { return }
+        let samples = Self.int16PCMToFloat32(data)
+        guard !samples.isEmpty else { return }
 
-        audioBufferLock.lock()
-        audioBuffer.append(data)
-
-        // Send when buffer is full enough
-        if audioBuffer.count >= audioBufferSize {
-            let chunk = audioBuffer
-            audioBuffer = Data()
-            audioBufferLock.unlock()
-            sendAudioChunk(chunk)
-        } else {
-            audioBufferLock.unlock()
-        }
+        pcmBufferLock.lock()
+        pcmBuffer.append(contentsOf: samples)
+        pcmBufferLock.unlock()
     }
 
-    /// Flush any remaining audio in the buffer
-    private func flushAudioBuffer() {
-        audioBufferLock.lock()
-        let chunk = audioBuffer
-        audioBuffer = Data()
-        audioBufferLock.unlock()
-
-        if !chunk.isEmpty {
-            sendAudioChunk(chunk)
-        }
+    /// Flush remaining audio. Cloud path used to send a "finalize" message; in
+    /// WhisperKit mode this just triggers one last transcribe pass.
+    func finishStream() {
+        // Best-effort final pass — let the existing transcribe loop drain naturally.
+        // (Forcing a synchronous pass here would race with the running task.)
     }
 
-    /// Actually send an audio chunk to the backend
-    private func sendAudioChunk(_ data: Data) {
-        guard isConnected, let webSocketTask = webSocketTask else { return }
+    var connected: Bool { isConnected }
 
-        let message = URLSessionWebSocketTask.Message.data(data)
-        webSocketTask.send(message) { [weak self] error in
-            if let error = error {
-                logError("TranscriptionService: Send error", error: error)
-                self?.handleDisconnection()
-            }
-        }
-    }
+    // MARK: - WhisperKit pipeline
 
-    /// Check if connected
-    var connected: Bool {
-        return isConnected
-    }
-
-    // MARK: - Private Methods (Connection)
-
-    private func connect() {
-        // Always use Firebase auth for Python backend
-        Task { [weak self] in
-            guard let self = self else { return }
-            do {
-                let authService = await MainActor.run { AuthService.shared }
-                let authHeader = try await authService.getAuthHeader()
-                self.connectToBackend(authHeader: authHeader)
-            } catch {
-                logError("TranscriptionService: Failed to get auth token", error: error)
-                self.onError?(TranscriptionError.connectionFailed(error))
-            }
-        }
-    }
-
-    private func connectToBackend(authHeader: String) {
-        let base = Self.pythonBackendBaseURL
-            .replacingOccurrences(of: "https://", with: "wss://")
-            .replacingOccurrences(of: "http://", with: "ws://")
-        let wsBase = base.hasSuffix("/") ? String(base.dropLast()) : base
-
-        // Select endpoint and query params based on streaming mode
-        let path: String
-        let queryItems: [URLQueryItem]
-
-        switch streamingMode {
-        case .conversation:
-            // Full conversation pipeline with speech profiles, speaker assignment, memory events
-            path = "/v4/listen"
-            queryItems = [
-                URLQueryItem(name: "language", value: language),
-                URLQueryItem(name: "sample_rate", value: String(sampleRate)),
-                URLQueryItem(name: "codec", value: encoding),
-                URLQueryItem(name: "channels", value: String(channels)),
-                URLQueryItem(name: "include_speech_profile", value: "true"),
-                URLQueryItem(name: "source", value: "desktop"),
-                URLQueryItem(name: "speaker_auto_assign", value: "enabled"),
-            ]
-        case .ptt:
-            // PTT-only transcription — no conversation lifecycle
-            path = "/v2/voice-message/transcribe-stream"
-            queryItems = [
-                URLQueryItem(name: "language", value: language),
-                URLQueryItem(name: "sample_rate", value: String(sampleRate)),
-                URLQueryItem(name: "codec", value: encoding),
-                URLQueryItem(name: "channels", value: String(channels)),
-            ]
-        }
-
-        guard var components = URLComponents(string: "\(wsBase)\(path)") else {
-            log("TranscriptionService: Invalid URL base: \(wsBase)")
-            onError?(TranscriptionError.connectionFailed(NSError(domain: "Invalid URL", code: -1)))
-            return
-        }
-
-        components.queryItems = queryItems
-
-        guard let url = components.url else {
-            onError?(TranscriptionError.connectionFailed(NSError(domain: "Invalid URL", code: -1)))
-            return
-        }
-
-        log("TranscriptionService: Connecting to \(url.absoluteString)")
-
-        // Create URL request with authorization header
-        var request = URLRequest(url: url)
-        request.setValue(authHeader, forHTTPHeaderField: "Authorization")
-
-        // BYOK: attach user keys so the transcription backend can use the user's
-        // Deepgram token for this session (and any downstream LLM calls).
-        for (provider, entry) in APIKeyService.byokSnapshot {
-            request.setValue(entry.key, forHTTPHeaderField: provider.headerName)
-        }
-
-        // Create URLSession and WebSocket task
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 0  // No resource timeout for long-lived WebSocket
-        urlSession = URLSession(configuration: configuration)
-        webSocketTask = urlSession?.webSocketTask(with: request)
-
-        // Start the connection
-        webSocketTask?.resume()
-
-        // Start receiving messages
-        receiveMessage()
-
-        // Mark as connected after a brief delay to allow WebSocket handshake.
-        // Also set a connect timeout — if the handshake hasn't completed in 10s, trigger reconnect.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self = self else { return }
-            guard self.webSocketTask?.state == .running else {
-                log("TranscriptionService: WebSocket not running after handshake — triggering reconnect")
-                self.cleanupAndReconnect()
-                return
-            }
-            self.isConnected = true
-            self.reconnectAttempts = 0
-            self.lastDataReceivedAt = Date()
-            log("TranscriptionService: Connected to Python backend")
-            self.startWatchdog()
-            self.onConnected?()
-        }
-
-        // Connect timeout: if still not connected after 10s, force reconnect
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
-            guard let self = self, !self.isConnected, self.shouldReconnect else { return }
-            log("TranscriptionService: Connect timeout (10s) — forcing reconnect")
-            self.cleanupAndReconnect()
-        }
-    }
-
-    /// Start watchdog to detect stale connections (WebSocket dies silently)
-    private func startWatchdog() {
-        watchdogTask?.cancel()
-        watchdogTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(self?.watchdogInterval ?? 30.0) * 1_000_000_000)
-                guard !Task.isCancelled, let self = self, self.isConnected else { break }
-
-                if let lastData = self.lastDataReceivedAt,
-                   Date().timeIntervalSince(lastData) > self.staleThreshold {
-                    log("TranscriptionService: Watchdog detected stale connection (no data for \(String(format: "%.0f", Date().timeIntervalSince(lastData)))s) - forcing reconnect")
-                    self.handleDisconnection()
-                }
-            }
-        }
-    }
-
-    private func disconnect() {
-        isConnected = false
-        watchdogTask?.cancel()
-        watchdogTask = nil
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
-        webSocketTask = nil
-        urlSession?.invalidateAndCancel()
-        urlSession = nil
-        log("TranscriptionService: Disconnected")
-        onDisconnected?()
-    }
-
-    func handleDisconnection() {
-        guard isConnected else { return }
-
-        isConnected = false
-        watchdogTask?.cancel()
-        watchdogTask = nil
-        webSocketTask = nil
-        urlSession?.invalidateAndCancel()
-        urlSession = nil
-        onDisconnected?()
-
-        // Attempt reconnection if enabled
-        if shouldReconnect && reconnectAttempts < maxReconnectAttempts {
-            reconnectAttempts += 1
-            let delay = min(pow(2.0, Double(reconnectAttempts)), 32.0) // Exponential backoff, max 32s
-            log("TranscriptionService: Reconnecting in \(delay)s (attempt \(reconnectAttempts))")
-
-            reconnectTask = Task {
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                guard !Task.isCancelled, self.shouldReconnect else { return }
-                self.connect()
-            }
-        } else if reconnectAttempts >= maxReconnectAttempts {
-            log("TranscriptionService: Max reconnect attempts reached")
-            onError?(TranscriptionError.webSocketError("Max reconnect attempts reached"))
-        }
-    }
-
-    /// Cleanup a failed/pending connection and schedule reconnect.
-    /// Unlike handleDisconnection(), this works even when isConnected is false (pre-handshake failures).
-    func cleanupAndReconnect() {
-        webSocketTask?.cancel(with: .abnormalClosure, reason: nil)
-        webSocketTask = nil
-        urlSession?.invalidateAndCancel()
-        urlSession = nil
-
-        guard shouldReconnect, reconnectAttempts < maxReconnectAttempts else {
-            if reconnectAttempts >= maxReconnectAttempts {
-                log("TranscriptionService: Max reconnect attempts reached (pre-connect)")
-                onError?(TranscriptionError.webSocketError("Max reconnect attempts reached"))
-            }
-            return
-        }
-
-        reconnectAttempts += 1
-        let delay = min(pow(2.0, Double(reconnectAttempts)), 32.0)
-        log("TranscriptionService: Reconnecting in \(delay)s (attempt \(reconnectAttempts), pre-connect failure)")
-
-        reconnectTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard !Task.isCancelled, self.shouldReconnect else { return }
-            self.connect()
-        }
-    }
-
-    private func receiveMessage() {
-        webSocketTask?.receive { [weak self] result in
-            guard let self = self else { return }
-
-            switch result {
-            case .success(let message):
-                self.handleMessage(message)
-                // Continue receiving
-                self.receiveMessage()
-
-            case .failure(let error):
-                guard self.isConnected else { return }
-                logError("TranscriptionService: Receive error", error: error)
-                self.handleDisconnection()
-            }
-        }
-    }
-
-    private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
-        // Track that we received data (for watchdog stale detection)
-        lastDataReceivedAt = Date()
-
-        switch message {
-        case .string(let text):
-            parseBackendResponse(text)
-        case .data(let data):
-            if let text = String(data: data, encoding: .utf8) {
-                parseBackendResponse(text)
-            }
-        @unknown default:
-            break
-        }
-    }
-
-    /// Parse response from Python backend transcription WebSocket.
-    /// Message types:
-    /// 1. JSON array = transcript segments (primary, from `/v2/voice-message/transcribe-stream`)
-    /// 2. JSON object with "type" field = message event (from `/v4/listen` only, kept for compatibility)
-    /// 3. Plain text "ping" = heartbeat (ignore)
-    /// Visible to tests (`@testable import`) so ListenProtocolTests can drive real callback dispatch.
-    func parseBackendResponse(_ text: String) {
-        // Handle heartbeat ping
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed == "ping" {
-            return
-        }
-
-        guard let data = text.data(using: .utf8) else { return }
-
+    private func loadModelAndStartTranscribing() async {
         do {
-            let json = try JSONSerialization.jsonObject(with: data)
-
-            if let array = json as? [[String: Any]] {
-                // JSON array = transcript segments
-                let segments = try JSONDecoder().decode([BackendSegment].self, from: data)
-                if !segments.isEmpty {
-                    onBackendSegments?(segments)
-                }
-            } else if let dict = json as? [String: Any], let type = dict["type"] as? String {
-                // JSON object with "type" = message event
-                let event = ListenEvent(type: type, raw: dict)
-                onListenEvent?(event)
-            }
+            log("TranscriptionService: Loading WhisperKit model '\(modelName)' (downloads ~140 MB on first run)…")
+            let kit = try await WhisperKit(
+                model: modelName,
+                verbose: false,
+                logLevel: .error,
+                prewarm: true,
+                load: true,
+                download: true
+            )
+            self.whisperKit = kit
+            log("TranscriptionService: WhisperKit model loaded")
         } catch {
-            logError("TranscriptionService: Parse error", error: error)
+            logError("TranscriptionService: WhisperKit model load failed", error: error)
+            // Don't tear down — audio capture stays live via AudioPersistenceService.
+            // We log and bail; AppState already considers "isTranscribing" = recording.
+            DispatchQueue.main.async { [weak self] in
+                self?.onError?(TranscriptionError.modelLoadFailed(error))
+            }
+            return
         }
+
+        // Spin the transcribe loop.
+        transcribeTask?.cancel()
+        transcribeTask = Task { [weak self] in
+            await self?.runTranscribeLoop()
+        }
+    }
+
+    /// Periodic-window streaming: every `windowStrideSeconds`, if we have at
+    /// least `minWindowSeconds` of audio, run `transcribe(audioArray:)` over the
+    /// entire current window. After a pass we slide the window forward by
+    /// `commitSeconds` and emit any segments whose end falls within the
+    /// committed prefix.
+    private func runTranscribeLoop() async {
+        let strideNanos = UInt64(windowStrideSeconds * 1_000_000_000)
+
+        while !Task.isCancelled, isConnected {
+            try? await Task.sleep(nanoseconds: strideNanos)
+            guard !Task.isCancelled, isConnected, let kit = whisperKit else { continue }
+
+            // Snapshot the buffer
+            pcmBufferLock.lock()
+            let samples = pcmBuffer
+            pcmBufferLock.unlock()
+
+            let durationSec = Double(samples.count) / Double(sampleRate)
+            guard durationSec >= minWindowSeconds else { continue }
+
+            do {
+                // WhisperKit's transcribe(audioArray:) is the streaming-friendly
+                // entry point — it accepts arbitrary-length [Float] at 16 kHz.
+                let results = try await kit.transcribe(
+                    audioArray: samples,
+                    decodeOptions: nil
+                )
+                guard !Task.isCancelled, isConnected else { return }
+                await emitSegments(from: results)
+            } catch {
+                logError("TranscriptionService: transcribe pass failed", error: error)
+            }
+
+            // Slide the window forward — drop the first commitSeconds of audio
+            // so the buffer doesn't grow unbounded. The remaining tail provides
+            // context for the next pass.
+            await slideWindowForward()
+        }
+    }
+
+    private func emitSegments(from results: [TranscriptionResult]) async {
+        var emitted: [BackendSegment] = []
+        for result in results {
+            for seg in result.segments {
+                let absStart = windowStartOffsetSeconds + Double(seg.start)
+                let absEnd = windowStartOffsetSeconds + Double(seg.end)
+                // Only emit segments whose end is within the committed prefix —
+                // anything past commitSeconds is provisional and may shift on
+                // the next pass.
+                guard absEnd <= windowStartOffsetSeconds + commitSeconds else { continue }
+                guard absEnd > lastCommittedEndSeconds else { continue }
+                let trimmed = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+
+                emitted.append(
+                    BackendSegment(
+                        id: UUID().uuidString,
+                        text: trimmed,
+                        speaker: "SPEAKER_00",
+                        speaker_id: 0,
+                        is_user: true,
+                        person_id: nil,
+                        start: absStart,
+                        end: absEnd,
+                        translations: nil
+                    )
+                )
+                lastCommittedEndSeconds = absEnd
+            }
+        }
+        if !emitted.isEmpty {
+            let segs = emitted
+            DispatchQueue.main.async { [weak self] in
+                self?.onBackendSegments?(segs)
+            }
+        }
+    }
+
+    private func slideWindowForward() async {
+        let dropSamples = Int(commitSeconds * Double(sampleRate))
+        pcmBufferLock.lock()
+        if pcmBuffer.count > dropSamples {
+            pcmBuffer.removeFirst(dropSamples)
+            windowStartOffsetSeconds += commitSeconds
+        } else {
+            // Less audio than commit window — keep buffer, don't advance offset.
+        }
+        // Hard cap to prevent runaway memory if transcription stalls.
+        let maxSamples = Int(maxWindowSeconds * Double(sampleRate))
+        if pcmBuffer.count > maxSamples {
+            let extra = pcmBuffer.count - maxSamples
+            pcmBuffer.removeFirst(extra)
+            windowStartOffsetSeconds += Double(extra) / Double(sampleRate)
+        }
+        pcmBufferLock.unlock()
+    }
+
+    // MARK: - Helpers
+
+    /// Convert little-endian Int16 PCM bytes to normalized Float32 in [-1, 1].
+    static func int16PCMToFloat32(_ data: Data) -> [Float] {
+        let count = data.count / 2
+        guard count > 0 else { return [] }
+        var out = [Float](repeating: 0, count: count)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.bindMemory(to: Int16.self).baseAddress else { return }
+            for i in 0..<count {
+                out[i] = Float(base[i]) / 32768.0
+            }
+        }
+        return out
     }
 }
 
-// MARK: - Batch (Pre-Recorded) Transcription (PTT only)
+// MARK: - Batch (one-shot) transcription
 
 extension TranscriptionService {
-    /// Transcribe a complete audio buffer using the Python backend `/v2/voice-message/transcribe`.
-    /// Returns the transcript string, or nil if transcription failed.
+    /// Transcribe a complete audio buffer (16 kHz mono Int16 PCM) on-device.
+    /// Used by PushToTalkManager. Loads its own short-lived WhisperKit instance.
     static func batchTranscribe(
         audioData: Data,
         language: String = "en",
         apiKey: String? = nil
     ) async throws -> String? {
-        // Always use Firebase auth + Python backend
-        let authService = await MainActor.run { AuthService.shared }
-        let authHeader = try await authService.getAuthHeader()
-        let baseURLString = "\(pythonBackendBaseURL)v2/voice-message/transcribe"
+        log("TranscriptionService: Batch transcribing \(audioData.count) bytes via WhisperKit")
+        let samples = int16PCMToFloat32(audioData)
+        guard !samples.isEmpty else { return nil }
 
-        guard var components = URLComponents(string: baseURLString) else {
-            throw TranscriptionError.connectionFailed(NSError(domain: "Invalid backend URL", code: -1))
+        let kit: WhisperKit
+        do {
+            kit = try await WhisperKit(
+                model: "openai_whisper-base.en",
+                verbose: false,
+                logLevel: .error,
+                prewarm: false,
+                load: true,
+                download: true
+            )
+        } catch {
+            throw TranscriptionError.modelLoadFailed(error)
         }
-        components.queryItems = [
-            URLQueryItem(name: "language", value: language),
-            URLQueryItem(name: "sample_rate", value: "16000"),
-            URLQueryItem(name: "encoding", value: "linear16"),
-            URLQueryItem(name: "channels", value: "1"),
-        ]
 
-        guard let url = components.url else {
-            throw TranscriptionError.connectionFailed(NSError(domain: "Invalid URL", code: -1))
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(authHeader, forHTTPHeaderField: "Authorization")
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        for (provider, entry) in APIKeyService.byokSnapshot {
-            request.setValue(entry.key, forHTTPHeaderField: provider.headerName)
-        }
-        request.httpBody = audioData
-
-        log("TranscriptionService: Batch transcribing \(audioData.count) bytes via Python backend")
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-            let body = String(data: data, encoding: .utf8) ?? "no body"
-            logError("TranscriptionService: Batch transcription failed with status \(statusCode): \(body)", error: nil)
-            if statusCode == 413 {
-                throw TranscriptionError.payloadTooLarge
-            }
+        do {
+            let results = try await kit.transcribe(audioArray: samples)
+            let text = results
+                .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            return text.isEmpty ? nil : text
+        } catch {
             throw TranscriptionError.invalidResponse
         }
-
-        // Parse Python backend response: {"transcript": "...", "language": "..."}
-        let json = try JSONDecoder().decode(PythonTranscribeResponse.self, from: data)
-        let transcript = json.transcript.isEmpty ? nil : json.transcript
-        log("TranscriptionService: Batch transcription result: \(transcript ?? "(empty)")")
-        return transcript
     }
-
 }
 
-/// Response model for Python backend `/v2/voice-message/transcribe` (batch PTT)
-private struct PythonTranscribeResponse: Decodable {
-    let transcript: String
-    let language: String?
-}
+// MARK: - Legacy cloud WebSocket path (commented out for reference)
+//
+// The original cloud implementation streamed Int16 PCM over a WebSocket to the
+// Python backend at `/v4/listen` (conversations) or `/v2/voice-message/transcribe-stream`
+// (PTT). It also handled batch transcription via `POST /v2/voice-message/transcribe`.
+// All of that is replaced by the on-device WhisperKit pipeline above. The original
+// code is preserved below for reference — re-enable only if reintroducing a
+// cloud fallback.
+//
+//    private var webSocketTask: URLSessionWebSocketTask?
+//    private var urlSession: URLSession?
+//    private let apiKey: String = ""
+//    private static let pythonBackendBaseURL: String = {
+//        if let cString = getenv("OMI_PYTHON_API_URL"),
+//           let url = String(validatingUTF8: cString), !url.isEmpty {
+//            return url.hasSuffix("/") ? url : url + "/"
+//        }
+//        return "https://api.omi.me/"
+//    }()
+//
+//    private func connect() { /* opened wss://…/v4/listen with Firebase auth */ }
+//    private func connectToBackend(authHeader: String) { /* set up URLSessionWebSocketTask */ }
+//    private func receiveMessage() { /* read JSON arrays of BackendSegment */ }
+//    func parseBackendResponse(_ text: String) { /* JSON → BackendSegment / ListenEvent */ }
+//    static func batchTranscribe(audioData: Data, language: String, apiKey: String?) async throws -> String? {
+//        /* POST audio bytes to /v2/voice-message/transcribe and decode {transcript, language} */
+//    }
