@@ -1960,80 +1960,49 @@ class AppState: ObservableObject {
       // Continue to API fetch even if local fails
     }
 
-    // Step 2: Fetch from API in background to get fresh data
-    // Calculate date range if date filter is set
-    let startDate: Date?
-    let endDate: Date?
-    if let filterDate = selectedDateFilter {
-      let calendar = Calendar.current
-      startDate = calendar.startOfDay(for: filterDate)
-      endDate = calendar.date(byAdding: .day, value: 1, to: startDate!)
-    } else {
-      startDate = nil
-      endDate = nil
-    }
-
-    // Fetch conversations and count in parallel
-    async let conversationsTask = APIClient.shared.getConversations(
-      limit: 50,
-      offset: 0,
-      statuses: [.completed, .processing],
-      includeDiscarded: false,
-      startDate: startDate,
-      endDate: endDate,
-      folderId: selectedFolderId,
-      starred: showStarredOnly ? true : nil
-    )
-    async let countTask = APIClient.shared.getConversationsCount(includeDiscarded: false)
-
-    do {
-      let fetchedConversations = try await conversationsTask
-      conversations = fetchedConversations
-      log(
-        "Conversations: Refreshed \(fetchedConversations.count) from API (starred=\(showStarredOnly), date=\(selectedDateFilter?.description ?? "nil"))"
-      )
-
-      // DEBUG: Log any conversations with empty titles
-      for conv in fetchedConversations where conv.structured.title.isEmpty {
-        log(
-          "DEBUG: Conversation \(conv.id) has EMPTY title! overview=\(conv.structured.overview.prefix(50))..."
-        )
-      }
-
-      // Sync conversations to local database in background
-      Task.detached(priority: .background) {
-        var syncedCount = 0
-        for conversation in fetchedConversations {
-          do {
-            try await TranscriptionStorage.shared.syncServerConversation(conversation)
-            syncedCount += 1
-          } catch {
-            log(
-              "Conversations: Failed to sync \(conversation.id) to local DB: \(error.localizedDescription)"
-            )
-          }
-        }
-        log("Conversations: Synced \(syncedCount)/\(fetchedConversations.count) to local database")
-      }
-    } catch {
-      logError("Conversations: API fetch failed", error: error)
-      // Only set error if we don't have cached data
-      // Infinite Recall fork: local-only mode — return empty result instead of throwing
-      if conversations.isEmpty, !isLocalOnlyError(error) {
-        conversationsError = error.localizedDescription
+    // Step 2: Fetch from API in background to get fresh data.
+    //
+    // Infinite Recall fork: in local-only mode the API short-circuits to an
+    // empty array. We MUST NOT overwrite the local cache with that empty
+    // result — doing so silently wipes the live conversation list whenever
+    // a user opens the page. The local SQLite is the source of truth here.
+    // Skip the API path entirely; the local cache load above is sufficient.
+    if false /* localOnlyMode */ {
+      let startDate: Date?
+      let endDate: Date?
+      if let filterDate = selectedDateFilter {
+        let calendar = Calendar.current
+        startDate = calendar.startOfDay(for: filterDate)
+        endDate = calendar.date(byAdding: .day, value: 1, to: startDate!)
       } else {
-        log("Conversations: Using cached data after API failure")
+        startDate = nil
+        endDate = nil
+      }
+      async let conversationsTask = APIClient.shared.getConversations(
+        limit: 50, offset: 0, statuses: [.completed, .processing],
+        includeDiscarded: false, startDate: startDate, endDate: endDate,
+        folderId: selectedFolderId, starred: showStarredOnly ? true : nil
+      )
+      do {
+        let fetchedConversations = try await conversationsTask
+        conversations = fetchedConversations
+      } catch {
+        if conversations.isEmpty, !isLocalOnlyError(error) {
+          conversationsError = error.localizedDescription
+        }
       }
     }
-
-    // Update total count from API (more accurate than local)
-    do {
-      let count = try await countTask
-      totalConversationsCount = count
-      log("Conversations: Total count from API = \(count)")
-    } catch {
-      logError("Conversations: Failed to get count from API", error: error)
-      // Keep local count if API fails
+    // Infinite Recall fork: API count would clobber the local count to 0 in
+    // local-only mode. The local count from Step 1 is the truth.
+    if false /* localOnlyMode */ {
+      async let countTask = APIClient.shared.getConversationsCount(includeDiscarded: false)
+      do {
+        let count = try await countTask
+        totalConversationsCount = count
+        log("Conversations: Total count from API = \(count)")
+      } catch {
+        logError("Conversations: Failed to get count from API", error: error)
+      }
     }
 
     isLoadingConversations = false
