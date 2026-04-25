@@ -373,6 +373,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // every 5s so the AI / Models settings panel can show fresh state.
     Task { @MainActor in
       MLXLifecycleManager.shared.startPolling()
+      IdleAIController.shared.start()
     }
 
     // Tier gating: migrate old boolean key to new 6-tier system
@@ -1362,6 +1363,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Stop MLX status polling
     Task { @MainActor in
       MLXLifecycleManager.shared.stopPolling()
+      IdleAIController.shared.stop()
     }
 
     // Remove window observers

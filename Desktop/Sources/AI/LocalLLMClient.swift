@@ -137,6 +137,9 @@ actor LocalLLMClient: LLMClient {
     messages: [LLM.ChatMessage],
     stream: Bool = true
   ) async throws -> AsyncThrowingStream<LLM.ChatChunk, Error> {
+    // Bump the idle-watchdog and auto-restart the server if it was stopped
+    // due to idle. Must complete before the HTTP request goes out.
+    await IdleAIController.shared.recordAICall()
     let request = try makeChatRequest(messages: messages, stream: stream)
 
     if stream {
@@ -148,6 +151,7 @@ actor LocalLLMClient: LLMClient {
 
   /// Convenience: single-prompt completion. Returns the full text.
   func complete(prompt: String, maxTokens: Int = 512) async throws -> String {
+    await IdleAIController.shared.recordAICall()
     let messages = [LLM.ChatMessage(role: .user, content: prompt)]
     let request = try makeChatRequest(
       messages: messages, stream: false, maxTokens: maxTokens)
