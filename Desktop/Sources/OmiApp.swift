@@ -353,6 +353,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     AnalyticsManager.shared.appLaunched()
     AnalyticsManager.shared.trackDisplayInfo()
 
+    // Local MLX server lifecycle: poll status (running/installed/model-present)
+    // every 5s so the AI / Models settings panel can show fresh state.
+    Task { @MainActor in
+      MLXLifecycleManager.shared.startPolling()
+    }
+
     // Tier gating: migrate old boolean key to new 6-tier system
     TierManager.migrateExistingUsersIfNeeded()
 
@@ -1300,6 +1306,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationWillTerminate(_ notification: Notification) {
     // Mark clean exit so crash detection works on next launch
     UserDefaults.standard.set(true, forKey: "lastSessionCleanExit")
+
+    // Stop MLX status polling
+    Task { @MainActor in
+      MLXLifecycleManager.shared.stopPolling()
+    }
 
     // Remove window observers
     for observer in windowObservers {
