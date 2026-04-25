@@ -55,8 +55,10 @@ struct MemoryGraphPage: View {
         Spacer()
       }
 
-      // Loading / empty state — centered spinner, no extra chrome
-      if viewModel.isLoading || (viewModel.isEmpty && !viewModel.isRebuilding) {
+      // Loading / rebuild state — centered spinner only while work is in flight.
+      // (Previously this also fired on isEmpty, which made the spinner permanent
+      // on a fresh install since no rebuild kicks itself off.)
+      if viewModel.isLoading || viewModel.isRebuilding {
         ProgressView()
           .scaleEffect(1.2)
           .tint(.white.opacity(0.4))
@@ -106,7 +108,7 @@ struct MemoryGraphInlineCard: View {
           MemoryGraphSceneView(viewModel: viewModel)
         }
 
-        if viewModel.isLoading || (viewModel.isEmpty && !viewModel.isRebuilding) {
+        if viewModel.isLoading || viewModel.isRebuilding {
           ProgressView()
             .scaleEffect(1.1)
             .tint(.white.opacity(0.45))
