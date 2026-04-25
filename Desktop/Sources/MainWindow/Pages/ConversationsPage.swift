@@ -458,7 +458,10 @@ struct ConversationsPage: View {
         isSearching = false
       } catch {
         logError("Search: Failed", error: error)
-        searchError = error.localizedDescription
+        // Infinite Recall fork: local-only mode — return empty result instead of throwing
+        if !isLocalOnlyError(error) {
+          searchError = error.localizedDescription
+        }
         searchResults = []
         isSearching = false
       }

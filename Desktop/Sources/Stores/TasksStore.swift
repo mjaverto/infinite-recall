@@ -554,7 +554,7 @@ class TasksStore: ObservableObject {
             log("TasksStore: Showing \(mergedTasks.count) incomplete tasks from merged local cache")
         } catch {
             if incompleteTasks.isEmpty {
-                self.error = error.localizedDescription
+                if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             }
             logError("TasksStore: Failed to load incomplete tasks from API", error: error)
         }
@@ -679,7 +679,7 @@ class TasksStore: ObservableObject {
             }
         } catch {
             if completedTasks.isEmpty {
-                self.error = error.localizedDescription
+                if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             }
             logError("TasksStore: Failed to load completed tasks from API", error: error)
         }
@@ -750,7 +750,7 @@ class TasksStore: ObservableObject {
             }
         } catch {
             if deletedTasks.isEmpty {
-                self.error = error.localizedDescription
+                if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             }
             logError("TasksStore: Failed to load deleted tasks from API", error: error)
         }
@@ -1127,7 +1127,7 @@ class TasksStore: ObservableObject {
             )
         } catch {
             logError("TasksStore: Failed to update task locally", error: error)
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             return
         }
 
@@ -1216,7 +1216,7 @@ class TasksStore: ObservableObject {
                 incompleteTasks.removeAll { $0.id == task.id }
                 completedTasks.insert(task, at: 0)
             }
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
         }
     }
 
@@ -1308,7 +1308,7 @@ class TasksStore: ObservableObject {
 
             return localTask
         } catch {
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             logError("TasksStore: Failed to create task locally", error: error)
             return nil
         }
@@ -1422,7 +1422,7 @@ class TasksStore: ObservableObject {
             )
         } catch {
             logError("TasksStore: Failed to update task locally", error: error)
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             localUpdateSucceeded = false
         }
 
@@ -1462,7 +1462,7 @@ class TasksStore: ObservableObject {
             }
         } catch {
             // Local change persists; next successful sync will reconcile
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             logError("TasksStore: Failed to update task on backend (local update preserved)", error: error)
         }
     }
@@ -1486,7 +1486,7 @@ class TasksStore: ObservableObject {
             )
         } catch {
             logError("TasksStore: Failed to update task tags locally", error: error)
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             return
         }
 
@@ -1511,7 +1511,7 @@ class TasksStore: ObservableObject {
             )
             try await ActionItemStorage.shared.syncTaskActionItems([apiResult])
         } catch {
-            self.error = error.localizedDescription
+            if !isLocalOnlyError(error) { self.error = error.localizedDescription }
             logError("TasksStore: Failed to update task tags on backend (local update preserved)", error: error)
         }
     }

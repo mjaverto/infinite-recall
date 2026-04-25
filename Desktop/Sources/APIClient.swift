@@ -86,6 +86,32 @@ actor APIClient {
     return decoder
   }
 
+  // MARK: - Local-only mode helpers
+
+  // Infinite Recall fork: local-only mode — return empty result instead of throwing
+  /// True when there is no Firebase user and no test auth override; in that case
+  /// remote API calls should no-op and return empty/successful results. Reads
+  /// UserDefaults directly so this is safe to call from any actor context.
+  fileprivate var isLocalOnlyMode: Bool {
+    if testAuthHeader != nil { return false }
+    return !UserDefaults.standard.bool(forKey: "auth_isSignedIn")
+  }
+
+  /// Best-effort synthesizer that produces an "empty" decoded value for type T.
+  /// Tries common empty JSON forms ("[]", "{}", "null", "\"\"", "0"). Returns nil
+  /// when none of them decode into T (e.g. response wrappers with required fields).
+  fileprivate func synthesizeEmpty<T: Decodable>(_ type: T.Type = T.self) -> T? {
+    let candidates: [String] = ["[]", "{}", "null", "\"\"", "0"]
+    for s in candidates {
+      if let data = s.data(using: .utf8),
+         let v = try? decoder.decode(T.self, from: data)
+      {
+        return v
+      }
+    }
+    return nil
+  }
+
   // MARK: - Request Building
 
   func buildHeaders(requireAuth: Bool = true) async throws -> [String: String] {
@@ -100,8 +126,11 @@ actor APIClient {
         headers["Authorization"] = testHeader
       } else {
         let authService = await MainActor.run { AuthService.shared }
-        let authHeader = try await authService.getAuthHeader()
-        headers["Authorization"] = authHeader
+        // Infinite Recall fork: local-only mode — skip Authorization header when
+        // no Firebase user is present rather than throwing notSignedIn.
+        if let authHeader = try? await authService.getAuthHeader() {
+          headers["Authorization"] = authHeader
+        }
       }
     }
 
@@ -121,6 +150,11 @@ actor APIClient {
     requireAuth: Bool = true,
     customBaseURL: String? = nil
   ) async throws -> T {
+    // Infinite Recall fork: local-only mode — return empty result instead of throwing
+    if requireAuth, isLocalOnlyMode {
+      if let empty: T = synthesizeEmpty() { return empty }
+      throw APIError.localOnlyMode
+    }
     let base = customBaseURL ?? baseURL
     let url = URL(string: base + endpoint)!
     var request = URLRequest(url: url)
@@ -136,6 +170,11 @@ actor APIClient {
     requireAuth: Bool = true,
     customBaseURL: String? = nil
   ) async throws -> T {
+    // Infinite Recall fork: local-only mode — return empty result instead of throwing
+    if requireAuth, isLocalOnlyMode {
+      if let empty: T = synthesizeEmpty() { return empty }
+      throw APIError.localOnlyMode
+    }
     let base = customBaseURL ?? baseURL
     let url = URL(string: base + endpoint)!
     log("APIClient: POST \(url.absoluteString)")
@@ -152,6 +191,11 @@ actor APIClient {
     requireAuth: Bool = true,
     customBaseURL: String? = nil
   ) async throws -> T {
+    // Infinite Recall fork: local-only mode — return empty result instead of throwing
+    if requireAuth, isLocalOnlyMode {
+      if let empty: T = synthesizeEmpty() { return empty }
+      throw APIError.localOnlyMode
+    }
     let base = customBaseURL ?? baseURL
     let url = URL(string: base + endpoint)!
     var request = URLRequest(url: url)
@@ -166,6 +210,10 @@ actor APIClient {
     requireAuth: Bool = true,
     customBaseURL: String? = nil
   ) async throws {
+    // Infinite Recall fork: local-only mode — return empty result instead of throwing
+    if requireAuth, isLocalOnlyMode {
+      return
+    }
     let base = customBaseURL ?? baseURL
     let url = URL(string: base + endpoint)!
     var request = URLRequest(url: url)
@@ -257,11 +305,25 @@ actor APIClient {
 
 // MARK: - API Errors
 
+// Infinite Recall fork: local-only mode — return empty result instead of throwing.
+// Returns true when the given error indicates we're in local-only mode and the
+// failure should be treated as an empty/successful response (not surfaced in UI).
+func isLocalOnlyError(_ error: Error) -> Bool {
+  if case APIError.localOnlyMode = error { return true }
+  if case AuthError.notSignedIn = error { return true }
+  return false
+}
+
 enum APIError: LocalizedError {
   case invalidResponse
   case unauthorized
   case httpError(statusCode: Int)
   case decodingError(Error)
+  // Infinite Recall fork: local-only mode — return empty result instead of throwing.
+  // Thrown only for typed responses where an empty value couldn't be synthesized
+  // (e.g. wrapper structs with required fields). Stores should treat this as a
+  // silent no-op, not an error to surface.
+  case localOnlyMode
 
   var errorDescription: String? {
     switch self {
@@ -273,6 +335,8 @@ enum APIError: LocalizedError {
       return "HTTP error: \(statusCode)"
     case .decodingError(let error):
       return "Failed to decode response: \(error.localizedDescription)"
+    case .localOnlyMode:
+      return "Local-only mode"
     }
   }
 }
@@ -1429,6 +1493,11 @@ extension APIClient {
     requireAuth: Bool = true,
     customBaseURL: String? = nil
   ) async throws -> T {
+    // Infinite Recall fork: local-only mode — return empty result instead of throwing
+    if requireAuth, isLocalOnlyMode {
+      if let empty: T = synthesizeEmpty() { return empty }
+      throw APIError.localOnlyMode
+    }
     let base = customBaseURL ?? baseURL
     let url = URL(string: base + endpoint)!
     var request = URLRequest(url: url)
