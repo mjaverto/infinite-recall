@@ -278,6 +278,15 @@ class TranscriptionService: @unchecked Sendable {
     /// entire current window. After a pass we slide the window forward by
     /// `commitSeconds` and emit any segments whose end falls within the
     /// committed prefix.
+    ///
+    /// Battery gating: before each `kit.transcribe(...)` call we consult
+    /// `BatteryAwareScheduler.shared.allowHeavyWork`. If the machine is on
+    /// battery (or in low-power-mode / thermal throttling), we skip the live
+    /// Whisper pass and enqueue a `PendingWork(kind: .transcribe, payload:)`
+    /// describing the wall-clock window. The handler registered on the
+    /// scheduler then drains by fetching the matching `audio_chunks` rows and
+    /// transcribing them on AC. Audio capture itself (AudioPersistenceService
+    /// → audio_chunks) is unchanged on battery.
     private func runTranscribeLoop() async {
         let strideNanos = UInt64(windowStrideSeconds * 1_000_000_000)
 
@@ -292,6 +301,17 @@ class TranscriptionService: @unchecked Sendable {
 
             let durationSec = Double(samples.count) / Double(sampleRate)
             guard durationSec >= minWindowSeconds else { continue }
+
+            // Battery gate: if heavy work is not allowed, skip the live Whisper
+            // pass and enqueue a marker referencing the current window's
+            // wall-clock range. The handler will fetch matching audio_chunks
+            // rows from GRDB and transcribe them when we're back on AC.
+            let allow = await MainActor.run { BatteryAwareScheduler.shared.allowHeavyWork }
+            if !allow {
+                await enqueueDeferredTranscribeForCurrentWindow(durationSec: durationSec)
+                await slideWindowForward()
+                continue
+            }
 
             do {
                 // WhisperKit's transcribe(audioArray:) is the streaming-friendly
@@ -310,6 +330,32 @@ class TranscriptionService: @unchecked Sendable {
             // so the buffer doesn't grow unbounded. The remaining tail provides
             // context for the next pass.
             await slideWindowForward()
+        }
+    }
+
+    /// Encode and enqueue a deferred-transcription marker covering the current
+    /// window's wall-clock range. The audio itself is in `audio_chunks` already
+    /// (written by AudioPersistenceService independently of Whisper state), so
+    /// we only persist *which* chunks need transcribing.
+    private func enqueueDeferredTranscribeForCurrentWindow(durationSec: Double) async {
+        guard let started = windowStartTime else { return }
+        let ended = Date()
+        let language = self.language
+        let mode = self.streamingMode == .ptt ? "ptt" : "conversation"
+        let payloadDict: [String: Any] = [
+            "started_at": ISO8601DateFormatter().string(from: started),
+            "ended_at": ISO8601DateFormatter().string(from: ended),
+            "duration_sec": durationSec,
+            "language": language,
+            "mode": mode,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payloadDict, options: []) else {
+            return
+        }
+        await MainActor.run {
+            BatteryAwareScheduler.shared.enqueue(
+                PendingWork(kind: .transcribe, payload: data)
+            )
         }
     }
 

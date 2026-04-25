@@ -223,6 +223,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var relaunchOnLoginSuppressedForOnboarding = false
   private var safeModeStateObserver: NSObjectProtocol?
   private var safeModeStatusBarTickTimer: Timer?
+  private var schedulerStatusItem: NSMenuItem?
+  private var schedulerStatusTickTimer: Timer?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     if ViewExporter.shouldExport() {
@@ -381,6 +383,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Start resource monitoring (memory, CPU, disk)
     ResourceMonitor.shared.start()
+
+    // Start the battery-aware scheduler bridge: registers .transcribe and
+    // .ocr handlers and begins observing power transitions so heavy ML defers
+    // on battery and drains on AC.
+    PowerWorkBridge.shared.start()
 
     // Recover any pending/failed transcription sessions from previous runs
     Task {
@@ -827,6 +834,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     audioRecordingItem.view = audioRecordingView
     menu.addItem(audioRecordingItem)
 
+    // Scheduler status row — surfaces BatteryAwareScheduler.statusText
+    // ("Up to date" or "N items waiting (battery)" etc.) so the user can see
+    // at a glance whether heavy ML work is currently deferred.
+    let schedulerItem = NSMenuItem(
+      title: "[scheduler] \(BatteryAwareScheduler.shared.statusText)",
+      action: nil,
+      keyEquivalent: ""
+    )
+    schedulerItem.isEnabled = false
+    menu.addItem(schedulerItem)
+    self.schedulerStatusItem = schedulerItem
+    startSchedulerStatusTimer()
+
     menu.addItem(NSMenuItem.separator())
 
     // Safe Mode submenu — pauses BOTH audio + screen capture with one click.
@@ -1251,6 +1271,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       safeModeStatusBarTickTimer?.invalidate()
       safeModeStatusBarTickTimer = nil
     }
+  }
+
+  /// Start a 1-Hz timer that refreshes the scheduler status menu item title.
+  /// Idempotent — second call is a no-op.
+  @MainActor private func startSchedulerStatusTimer() {
+    if schedulerStatusTickTimer != nil { return }
+    let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+      DispatchQueue.main.async { self?.refreshSchedulerStatusItem() }
+    }
+    RunLoop.main.add(t, forMode: .common)
+    schedulerStatusTickTimer = t
+  }
+
+  /// Update the scheduler status menu item title from
+  /// `BatteryAwareScheduler.shared.statusText`.
+  @MainActor private func refreshSchedulerStatusItem() {
+    guard let item = schedulerStatusItem else { return }
+    item.title = "[scheduler] \(BatteryAwareScheduler.shared.statusText)"
   }
 
   /// Subscribe to Safe Mode state changes (called once after setupMenuBar).

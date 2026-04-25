@@ -131,9 +131,29 @@ actor RewindIndexer {
         }
     }
 
-    /// Check if OCR should be paused due to battery power
-    private func shouldPauseOCRForBattery() -> Bool {
-        return RewindSettings.shared.pauseOCROnBattery && PowerMonitor.checkBatteryState()
+    /// Check if OCR should be paused due to battery / low-power / thermal
+    /// throttling. Single source of truth is `BatteryAwareScheduler` (Sprint M)
+    /// — the legacy `PowerMonitor.checkBatteryState()` path is no longer
+    /// consulted here. We still respect the user's `pauseOCROnBattery`
+    /// preference: if they've disabled it, OCR runs regardless of power state.
+    private func shouldPauseOCRForBattery() async -> Bool {
+        guard RewindSettings.shared.pauseOCROnBattery else { return false }
+        let allow = await MainActor.run { BatteryAwareScheduler.shared.allowHeavyWork }
+        return !allow
+    }
+
+    /// Encode and enqueue an `.ocr` work item for the given screenshot id, so
+    /// it can be picked up on AC reconnect by `PowerWorkBridge`.
+    private func enqueueDeferredOCR(screenshotId: Int64) async {
+        let payload: [String: Any] = ["screenshot_id": Int(screenshotId)]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            return
+        }
+        await MainActor.run {
+            BatteryAwareScheduler.shared.enqueue(
+                PendingWork(kind: .ocr, payload: data)
+            )
+        }
     }
 
     // MARK: - Frame Processing
@@ -180,7 +200,7 @@ actor RewindIndexer {
             } else if await RewindOCRService.shared.shouldSkipOCR(for: cgImage) {
                 recordOCROutcome(.skippedDedup)
                 isIndexed = true
-            } else if shouldPauseOCRForBattery() {
+            } else if await shouldPauseOCRForBattery() {
                 framesSinceLastOCR = 0
                 recordOCROutcome(.skippedBattery)
                 skippedForBattery = true
@@ -216,6 +236,12 @@ actor RewindIndexer {
             )
 
             let inserted = try await RewindDatabase.shared.insertScreenshot(screenshot)
+
+            // Battery deferral: if we skipped OCR for power reasons, queue the
+            // row id with BatteryAwareScheduler so it gets OCR'd on AC.
+            if skippedForBattery, let id = inserted.id {
+                await enqueueDeferredOCR(screenshotId: id)
+            }
 
             // Embed OCR text for semantic search (non-blocking)
             if let ocrText = ocrText, !ocrText.isEmpty, let id = inserted.id {
@@ -262,7 +288,7 @@ actor RewindIndexer {
             } else if await RewindOCRService.shared.shouldSkipOCR(for: cgImage) {
                 recordOCROutcome(.skippedDedup)
                 isIndexed = true
-            } else if shouldPauseOCRForBattery() {
+            } else if await shouldPauseOCRForBattery() {
                 framesSinceLastOCR = 0
                 recordOCROutcome(.skippedBattery)
                 skippedForBattery = true
@@ -297,6 +323,12 @@ actor RewindIndexer {
             )
 
             let inserted = try await RewindDatabase.shared.insertScreenshot(screenshot)
+
+            // Battery deferral: if we skipped OCR for power reasons, queue the
+            // row id with BatteryAwareScheduler so it gets OCR'd on AC.
+            if skippedForBattery, let id = inserted.id {
+                await enqueueDeferredOCR(screenshotId: id)
+            }
 
             // Embed OCR text for semantic search (non-blocking)
             if let ocrText = ocrText, !ocrText.isEmpty, let id = inserted.id {
@@ -355,7 +387,7 @@ actor RewindIndexer {
             } else if await RewindOCRService.shared.shouldSkipOCR(for: cgImage) {
                 recordOCROutcome(.skippedDedup)
                 isIndexed = true
-            } else if shouldPauseOCRForBattery() {
+            } else if await shouldPauseOCRForBattery() {
                 framesSinceLastOCR = 0
                 recordOCROutcome(.skippedBattery)
                 skippedForBattery = true
@@ -402,6 +434,12 @@ actor RewindIndexer {
             )
 
             let inserted = try await RewindDatabase.shared.insertScreenshot(screenshot)
+
+            // Battery deferral: if we skipped OCR for power reasons, queue the
+            // row id with BatteryAwareScheduler so it gets OCR'd on AC.
+            if skippedForBattery, let id = inserted.id {
+                await enqueueDeferredOCR(screenshotId: id)
+            }
 
             // Embed OCR text for semantic search (non-blocking)
             if let ocrText = ocrText, !ocrText.isEmpty, let id = inserted.id {
@@ -491,7 +529,7 @@ actor RewindIndexer {
         do {
             while true {
                 // Stop backfill if we went back to battery
-                if shouldPauseOCRForBattery() {
+                if await shouldPauseOCRForBattery() {
                     log("RewindIndexer: Backfill paused — back on battery after \(totalProcessed) screenshots")
                     return
                 }
@@ -501,7 +539,7 @@ actor RewindIndexer {
 
                 for screenshot in pending {
                     // Check battery again between frames
-                    if shouldPauseOCRForBattery() {
+                    if await shouldPauseOCRForBattery() {
                         log("RewindIndexer: Backfill paused — back on battery after \(totalProcessed) screenshots")
                         return
                     }
