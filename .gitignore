@@ -80,6 +80,9 @@ linkedin-*.md
 # Agent configs (user-local)
 .agents/
 
+# Claude Code worktrees and per-session state (never commit)
+.claude/
+
 # Node.js projects
 **/node_modules/
 **/dist/
