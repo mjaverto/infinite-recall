@@ -243,83 +243,45 @@ class MemoryGraphViewModel: ObservableObject {
 
   func prepareGraph() async {
     await loadGraph()
-    if isEmpty {
-      await rebuildGraph()
-      for _ in 1...10 {
-        try? await Task.sleep(nanoseconds: 3_000_000_000)
-        await loadGraph()
-        if !isEmpty { break }
-      }
-    }
   }
 
   func loadGraph() async {
     isLoading = true
     defer { isLoading = false }
 
-    do {
-      let response = try await fetchGraph()
+    let response = await fetchGraph()
 
-      log("Knowledge graph: \(response.nodes.count) nodes, \(response.edges.count) edges")
-      isEmpty = response.nodes.isEmpty
+    log("Knowledge graph: \(response.nodes.count) nodes, \(response.edges.count) edges")
+    isEmpty = response.nodes.isEmpty
 
-      guard !isEmpty else { return }
+    guard !isEmpty else { return }
 
-      // Populate simulation with user node at center
-      let userName = AuthService.shared.displayName.isEmpty ? nil : AuthService.shared.givenName
-      log("User name for center node: \(userName ?? "nil")")
-      simulation.populate(graphResponse: response, userNodeLabel: userName)
-      log(
-        "Simulation populated: \(simulation.nodes.count) nodes (including user), \(simulation.edges.count) edges"
-      )
+    // Populate simulation with user node at center
+    let userName = AuthService.shared.displayName.isEmpty ? nil : AuthService.shared.givenName
+    log("User name for center node: \(userName ?? "nil")")
+    simulation.populate(graphResponse: response, userNodeLabel: userName)
+    log(
+      "Simulation populated: \(simulation.nodes.count) nodes (including user), \(simulation.edges.count) edges"
+    )
 
-      // Run initial layout off main thread for responsiveness
-      await Task.detached(priority: .userInitiated) { [simulation] in
-        simulation.runSync(ticks: 800)
-      }.value
+    // Run initial layout off main thread for responsiveness
+    await Task.detached(priority: .userInitiated) { [simulation] in
+      simulation.runSync(ticks: 800)
+    }.value
 
-      // Create scene nodes
-      createSceneNodes()
+    // Create scene nodes
+    createSceneNodes()
 
-      // Brief animation to settle, then stop
-      isAnimating = true
-      Task {
-        try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3s of live physics
-        await MainActor.run { isAnimating = false }
-      }
-    } catch {
-      log("Failed to load knowledge graph: \(error.localizedDescription)")
+    // Brief animation to settle, then stop
+    isAnimating = true
+    Task {
+      try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3s of live physics
+      await MainActor.run { isAnimating = false }
     }
   }
 
-  private func fetchGraph() async throws -> KnowledgeGraphResponse {
-    var response = await KnowledgeGraphStorage.shared.loadGraph()
-    if !response.nodes.isEmpty {
-      return response
-    }
-
-    for attempt in 0..<4 {
-      if AuthState.shared.isRestoringAuth {
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        continue
-      }
-
-      do {
-        return try await APIClient.shared.getKnowledgeGraph()
-      } catch {
-        if case AuthError.notSignedIn = error,
-          AuthState.shared.isSignedIn || AuthState.shared.isRestoringAuth,
-          attempt < 3
-        {
-          try? await Task.sleep(nanoseconds: 1_000_000_000)
-          continue
-        }
-        throw error
-      }
-    }
-
-    response = await KnowledgeGraphStorage.shared.loadGraph()
-    return response
+  private func fetchGraph() async -> KnowledgeGraphResponse {
+    return await KnowledgeGraphStorage.shared.loadGraph()
   }
 
   // MARK: - Rebuild Graph
@@ -328,17 +290,9 @@ class MemoryGraphViewModel: ObservableObject {
     isRebuilding = true
     defer { isRebuilding = false }
 
-    do {
-      _ = try await APIClient.shared.rebuildKnowledgeGraph()
-
-      // Wait a bit for the backend to process
-      try await Task.sleep(nanoseconds: 2_000_000_000)
-
-      // Reload the graph
-      await loadGraph()
-    } catch {
-      log("Failed to rebuild knowledge graph: \(error.localizedDescription)")
-    }
+    // Brief pause to let any in-flight storage writes settle, then reload from local store.
+    try? await Task.sleep(nanoseconds: 1_000_000_000)
+    await loadGraph()
   }
 
   // MARK: - Incremental Graph Update
