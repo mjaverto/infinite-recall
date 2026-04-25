@@ -17,6 +17,8 @@ let package = Package(
     .package(
       url: "https://github.com/microsoft/onnxruntime-swift-package-manager.git", from: "1.20.0"),
     .package(url: "https://github.com/heap/heap-swift-core-sdk.git", from: "0.8.0"),
+    // On-device Whisper transcription (Apache 2.0). Repo redirects to argmax-oss-swift.
+    .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.9.0"),
   ],
   targets: [
     .target(
@@ -47,6 +49,7 @@ let package = Package(
         .product(name: "MarkdownUI", package: "swift-markdown-ui"),
         .product(name: "onnxruntime", package: "onnxruntime-swift-package-manager"),
         .product(name: "HeapSwiftCore", package: "heap-swift-core-sdk"),
+        .product(name: "WhisperKit", package: "WhisperKit"),
       ],
       path: "Sources",
       resources: [

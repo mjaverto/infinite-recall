@@ -2156,6 +2156,31 @@ actor RewindDatabase {
             }
         }
 
+        // Migration: Always-on audio capture chunks (~30s each, 16kHz mono Int16 PCM blobs).
+        // Stores raw audio independent of transcription so capture survives Whisper failures.
+        migrator.registerMigration("createAudioChunks") { db in
+            try db.create(table: "audio_chunks", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                // Wall-clock timestamp at which this chunk's first sample was recorded
+                t.column("startedAt", .datetime).notNull().indexed()
+                // Wall-clock timestamp at which this chunk's last sample was recorded
+                t.column("endedAt", .datetime).notNull()
+                // Duration in seconds (denormalized for fast scans)
+                t.column("durationSeconds", .double).notNull()
+                // "mixed" (mic+system mono mix), "mic", or "system"
+                t.column("source", .text).notNull()
+                // Sample rate (always 16000 today, kept for future flexibility)
+                t.column("sampleRate", .integer).notNull().defaults(to: 16000)
+                // 1 = mono Int16 PCM
+                t.column("channels", .integer).notNull().defaults(to: 1)
+                // Raw PCM blob (Int16 little-endian)
+                t.column("pcm", .blob).notNull()
+                // Optional link to a transcription session if one was active at capture time
+                t.column("transcriptionSessionId", .integer).indexed()
+                t.column("createdAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+            }
+        }
+
         try migrator.migrate(queue)
     }
 
