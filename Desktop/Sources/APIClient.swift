@@ -786,8 +786,17 @@ struct ServerConversation: Codable, Identifiable, Equatable {
       return Int(end.timeIntervalSince(start))
     }
     // Fallback to transcript duration
-    guard let lastSegment = transcriptSegments.last else { return 0 }
-    return Int(lastSegment.end)
+    if let lastSegment = transcriptSegments.last {
+      return Int(lastSegment.end)
+    }
+    // Infinite Recall fork: in-progress sessions have nil finishedAt and the
+    // list view passes empty segments for O(1) loading. Wall-clock since
+    // startedAt is the right answer for active recordings — without this the
+    // list shows "0s" while the detail view shows the real duration.
+    if let start = startedAt {
+      return max(0, Int(Date().timeIntervalSince(start)))
+    }
+    return 0
   }
 
   /// Formatted duration string (e.g., "5m 30s")
