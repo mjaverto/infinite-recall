@@ -1633,6 +1633,7 @@ struct SettingsContentView: View {
       aiLocalModelCard
       aiVisionModelCard
       aiMCPAPICard
+      VisualActivityStatusBanner()
     }
     .onAppear {
       mlxLifecycle.refreshSync()

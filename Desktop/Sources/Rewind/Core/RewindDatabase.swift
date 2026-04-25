@@ -2218,6 +2218,97 @@ actor RewindDatabase {
             }
         }
 
+        // Visual activity index — VLM-derived 1-2 sentence summary + structured
+        // UI state per sampled frame, joined back to `screenshots` via id.
+        // Sampling policy lives in `VisualActivitySampler`; this table is the
+        // searchable artifact (FTS5 mirror created in the next migration).
+        migrator.registerMigration("createVisualActivity") { db in
+            try db.create(table: "visual_activity", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("screenshotId", .integer).notNull()
+                    .references("screenshots", onDelete: .cascade)
+                t.column("sampledAt", .datetime).notNull()
+                t.column("appName", .text)
+                t.column("windowTitle", .text)
+                // 1-2 sentence VLM description of what's happening on screen
+                t.column("visualSummary", .text)
+                // JSON blob of structured UI state (extractStructured call), if any
+                t.column("uiState", .text)
+                // Snapshot of the OCR text at sampling time, for joinless search
+                t.column("ocrTextSnapshot", .text)
+                // Perceptual hash (hex string) for dedup against the previous sample
+                t.column("perceptualHash", .text)
+                t.column("createdAt", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+            }
+            try db.create(index: "idx_visual_activity_sampledAt",
+                          on: "visual_activity", columns: ["sampledAt"])
+            try db.create(index: "idx_visual_activity_screenshot",
+                          on: "visual_activity", columns: ["screenshotId"])
+            try db.create(index: "idx_visual_activity_appName",
+                          on: "visual_activity", columns: ["appName"])
+            try db.create(index: "idx_visual_activity_phash",
+                          on: "visual_activity", columns: ["perceptualHash"])
+        }
+
+        // FTS5 mirror over the searchable text columns of `visual_activity`.
+        // Uses external content so we don't double-store; triggers keep it
+        // in sync. `unicode61` tokenizer matches the existing OCR FTS index.
+        migrator.registerMigration("createVisualActivityFTS") { db in
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE visual_activity_fts USING fts5(
+                    visualSummary,
+                    uiState,
+                    ocrTextSnapshot,
+                    appName,
+                    windowTitle,
+                    content='visual_activity',
+                    content_rowid='id',
+                    tokenize='unicode61'
+                )
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER visual_activity_ai AFTER INSERT ON visual_activity BEGIN
+                    INSERT INTO visual_activity_fts(
+                        rowid, visualSummary, uiState, ocrTextSnapshot, appName, windowTitle
+                    ) VALUES (
+                        new.id, new.visualSummary, new.uiState,
+                        new.ocrTextSnapshot, new.appName, new.windowTitle
+                    );
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER visual_activity_ad AFTER DELETE ON visual_activity BEGIN
+                    INSERT INTO visual_activity_fts(
+                        visual_activity_fts, rowid, visualSummary, uiState,
+                        ocrTextSnapshot, appName, windowTitle
+                    ) VALUES (
+                        'delete', old.id, old.visualSummary, old.uiState,
+                        old.ocrTextSnapshot, old.appName, old.windowTitle
+                    );
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER visual_activity_au AFTER UPDATE ON visual_activity BEGIN
+                    INSERT INTO visual_activity_fts(
+                        visual_activity_fts, rowid, visualSummary, uiState,
+                        ocrTextSnapshot, appName, windowTitle
+                    ) VALUES (
+                        'delete', old.id, old.visualSummary, old.uiState,
+                        old.ocrTextSnapshot, old.appName, old.windowTitle
+                    );
+                    INSERT INTO visual_activity_fts(
+                        rowid, visualSummary, uiState, ocrTextSnapshot, appName, windowTitle
+                    ) VALUES (
+                        new.id, new.visualSummary, new.uiState,
+                        new.ocrTextSnapshot, new.appName, new.windowTitle
+                    );
+                END
+                """)
+        }
+
         try migrator.migrate(queue)
     }
 
@@ -3054,5 +3145,103 @@ actor RewindDatabase {
         }
 
         return deletedCount
+    }
+
+    // MARK: - Visual Activity CRUD
+
+    /// Insert a new visual_activity row. The corresponding FTS5 row is
+    /// populated automatically via the `visual_activity_ai` trigger.
+    @discardableResult
+    func insertVisualActivity(_ record: VisualActivityRecord) throws -> VisualActivityRecord {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+        return try dbQueue.write { db -> VisualActivityRecord in
+            var copy = record
+            try copy.insert(db)
+            return copy
+        }
+    }
+
+    /// Count visual_activity rows whose `sampledAt` is within the calendar
+    /// day containing `date`. Used by the Settings banner.
+    func visualActivityCount(forDayContaining date: Date) throws -> Int {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+        let cal = Calendar.current
+        let startOfDay = cal.startOfDay(for: date)
+        guard let endOfDay = cal.date(byAdding: .day, value: 1, to: startOfDay) else {
+            return 0
+        }
+        return try dbQueue.read { db in
+            try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM visual_activity
+                WHERE sampledAt >= ? AND sampledAt < ?
+                """,
+                arguments: [startOfDay, endOfDay]
+            ) ?? 0
+        }
+    }
+
+    /// Total visual_activity row count.
+    func visualActivityCount() throws -> Int {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+        return try dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM visual_activity") ?? 0
+        }
+    }
+
+    /// Trim oldest `visual_activity` rows so the table doesn't grow without
+    /// bound. Returns the number of rows deleted.
+    @discardableResult
+    func trimVisualActivity(keeping maxRows: Int) throws -> Int {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+        guard maxRows > 0 else { return 0 }
+        return try dbQueue.write { db -> Int in
+            let total = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM visual_activity"
+            ) ?? 0
+            if total <= maxRows { return 0 }
+            let toDelete = total - maxRows
+            // Oldest-first by sampledAt.
+            try db.execute(
+                sql: """
+                DELETE FROM visual_activity
+                WHERE id IN (
+                    SELECT id FROM visual_activity
+                    ORDER BY sampledAt ASC
+                    LIMIT ?
+                )
+                """,
+                arguments: [toDelete]
+            )
+            return toDelete
+        }
+    }
+
+    /// Most recent perceptual hash recorded by the indexer. Used by the
+    /// sampler to seed dedup state across app restarts.
+    func mostRecentVisualActivityPerceptualHash() throws -> String? {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+        return try dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                SELECT perceptualHash FROM visual_activity
+                WHERE perceptualHash IS NOT NULL
+                ORDER BY sampledAt DESC
+                LIMIT 1
+                """
+            )
+        }
     }
 }

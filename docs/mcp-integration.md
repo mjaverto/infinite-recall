@@ -59,12 +59,17 @@ All routes are **read-only**. The Swift app owns writes.
 | GET    | `/v1/action-items`                | `limit`, `offset`, `completed`            |
 | GET    | `/v1/people`                      |                                           |
 | GET    | `/v1/people/:id`                  |                                           |
-| GET    | `/v1/search`                      | `q`, `content_type=audio\|ocr\|both`, `app`, `start`, `end` |
+| GET    | `/v1/search`                      | `q`, `content_type=audio\|ocr\|visual\|both`, `app`, `start`, `end` |
 | GET    | `/v1/scores`                      | `date=YYYY-MM-DD`. Activity rollup.       |
 
 `/v1/search` uses the existing `screenshots_fts` FTS5 index for OCR search;
 audio search uses a `LIKE` scan on `transcription_segments.text` (no FTS
-mirror exists for transcripts yet).
+mirror exists for transcripts yet). `content_type=visual` queries the
+`visual_activity_fts` FTS5 mirror — VLM-derived 1-2 sentence summaries plus
+a per-frame OCR snapshot, indexed by `VisualActivitySampler` /
+`VisualActivityIndexer` on the Swift side. `content_type=both` returns OCR,
+audio, and visual hits in a single response under `ocr_hits`, `audio_hits`,
+and `visual_hits` keys respectively.
 
 ## Environment
 
