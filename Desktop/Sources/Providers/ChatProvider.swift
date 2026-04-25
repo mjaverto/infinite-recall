@@ -767,10 +767,16 @@ A screenshot may be attached — use it silently only if relevant. Never mention
 
     private var terminationObserver: NSObjectProtocol?
 
-    /// Pre-start the active bridge so the first query doesn't wait for process launch
+    /// Pre-start the active bridge so the first query doesn't wait for process launch.
+    ///
+    /// Infinite Recall fork: the Node.js agent bridge is intentionally stubbed
+    /// (AgentBridge.start unconditionally throws — it used to call api.omi.me).
+    /// Chat now goes through LocalLLMClient directly to mlx-lm. Warm-up the
+    /// prompt context for that path, but DO NOT call ensureBridgeStarted —
+    /// it would set errorMessage to "AI components missing" on every launch
+    /// and surface a banner in the home-screen chat.
     func warmupBridge() async {
         await preparePromptContextIfNeeded()
-        _ = await ensureBridgeStarted()
     }
 
     /// Drop a cached ACP session so the next query recreates it with fresh prompt context.
@@ -810,11 +816,20 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     ///   which already holds modeSwitchInProgress. External callers (sendMessage)
     ///   pass false (the default) and will wait for any in-flight switch.
     private func ensureBridgeStarted(fromModeSwitch: Bool = false) async -> Bool {
-        // Wait for any in-flight mode switch to finish before touching the bridge.
-        // Without this, a query arriving mid-switch could restart the OLD bridge
-        // with the wrong harness mode. Skipped when called from switchBridgeMode
-        // itself (which holds the flag). External callers join the waiters array
-        // and are woken when the switch (including warmup) completes — no timeout.
+        // Infinite Recall fork: the Node.js agent bridge is intentionally stubbed
+        // out (AgentBridge.start unconditionally throws — it used to call
+        // api.omi.me). The home-screen chat path uses LocalLLMClient directly
+        // and never enters this function. Remaining callers (switchBridgeMode,
+        // labRunQuestion) treat a `false` return as "bridge unavailable" and
+        // degrade gracefully. Short-circuit here so we don't set errorMessage
+        // (which surfaces as a permanent banner on the home chat).
+        return false
+    }
+
+    /// Stale bridge-start path retained only to keep the upstream Omi diff small.
+    /// Never reached — gated by the early `return false` above.
+    @available(*, deprecated, message: "Bridge is stubbed in Infinite Recall fork")
+    private func ensureBridgeStarted_legacy(fromModeSwitch: Bool = false) async -> Bool {
         while !fromModeSwitch && modeSwitchInProgress {
             log("ChatProvider: ensureBridgeStarted waiting for mode switch to complete")
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
