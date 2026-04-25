@@ -789,10 +789,6 @@ struct SidebarView: View {
 
   // MARK: - Profile Menu
 
-  private var shouldShowReferFriend: Bool {
-    currentTierLevel == 0 || currentTierLevel >= 4
-  }
-
   private var shouldShowScreenRecordingStatus: Bool {
     appState.hasScreenRecordingPermission || !appState.hasScreenRecordingPermission
       || appState.isScreenCaptureKitBroken
@@ -894,18 +890,6 @@ struct SidebarView: View {
   private var profileMenuPopover: some View {
     VStack(alignment: .leading, spacing: 4) {
       VStack(spacing: 4) {
-        if shouldShowReferFriend {
-          ProfileMenuActionRow(icon: "gift.fill", label: "Refer a Friend") {
-            isProfileMenuPresented = false
-            openReferFriend()
-          }
-        }
-
-        ProfileMenuActionRow(icon: "message.fill", label: "Discord") {
-          isProfileMenuPresented = false
-          openDiscord()
-        }
-
         ProfileMenuActionRow(
           icon: "gearshape.fill",
           label: "Settings",
@@ -919,17 +903,6 @@ struct SidebarView: View {
     .padding(10)
     .frame(width: 220)
     .background(OmiColors.backgroundPrimary)
-  }
-
-  private func openReferFriend() {
-    if let url = URL(string: "https://affiliate.omi.me") {
-      NSWorkspace.shared.open(url)
-    }
-  }
-
-  private func openDiscord() {
-    guard let url = URL(string: "https://discord.com/invite/8MP3b9ymvx") else { return }
-    NSWorkspace.shared.open(url)
   }
 
   // MARK: - Permission Warning Button
