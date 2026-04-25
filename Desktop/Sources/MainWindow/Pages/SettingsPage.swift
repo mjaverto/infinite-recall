@@ -792,13 +792,12 @@ struct SettingsContentView: View {
                   // Banners off — user needs to change style in System Settings
                   appState.openNotificationPreferences()
                 } else {
-                  // Auth not granted — try lsregister repair first
-                  AnalyticsManager.shared.notificationRepairTriggered(
-                    reason: "settings_fix_button",
-                    previousStatus: "not_authorized",
-                    currentStatus: "not_authorized"
-                  )
-                  appState.repairNotificationAndFallback()
+                  // Auth not granted. Use requestNotificationPermission which:
+                  //   .notDetermined → triggers TCC prompt
+                  //   .denied        → opens System Settings as fallback
+                  // (repairNotificationAndFallback never asks for auth and was
+                  // a fix-only path for the lsregister launch-disabled bug.)
+                  appState.requestNotificationPermission()
                 }
               }) {
                 Text(appState.isNotificationBannerDisabled ? "Fix" : "Enable")
