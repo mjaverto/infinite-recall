@@ -301,6 +301,9 @@ struct SettingsContentView: View {
   @ObservedObject private var aiProviderRegistry = AIProviderRegistry.shared
   @ObservedObject private var mlxLifecycle = MLXLifecycleManager.shared
 
+  // In-app installer sheet (replaces the prior Terminal-launch flow).
+  @State private var presentingInstallSheet: Bool = false
+
   // Inline state for API key entry (Anthropic / OpenAI)
   @State private var anthropicKeyDraft: String = ""
   @State private var openaiKeyDraft: String = ""
@@ -2012,24 +2015,26 @@ struct SettingsContentView: View {
 
         Divider().overlay(OmiColors.backgroundQuaternary)
 
-        // Install button (primary)
-        Button(action: { runSetupScriptInTerminal() }) {
+        // Install button (primary) — opens the native install sheet.
+        Button(action: { presentingInstallSheet = true }) {
           HStack {
             Image(systemName: "arrow.down.circle.fill")
-            Text("Install local model")
-              .scaledFont(size: 13, weight: .semibold)
+            Text(
+              mlxLifecycle.agentInstalled && mlxLifecycle.modelPresent
+                ? "Reinstall local model"
+                : "Install local model"
+            )
+            .scaledFont(size: 13, weight: .semibold)
           }
           .frame(maxWidth: .infinity)
           .padding(.vertical, 4)
         }
         .buttonStyle(.borderedProminent)
         .tint(OmiColors.purplePrimary)
-        .disabled(mlxLifecycle.agentInstalled && mlxLifecycle.modelPresent)
-        .help(
-          mlxLifecycle.agentInstalled && mlxLifecycle.modelPresent
-            ? "Already installed"
-            : "Opens Terminal so you can confirm the ~18 GB model download"
-        )
+        .help("Installs uv, mlx-lm, and the ~18 GB Qwen 2.5-32B model in the background.")
+        .sheet(isPresented: $presentingInstallSheet) {
+          LocalAIInstallSheet()
+        }
 
         // Secondary action row
         HStack(spacing: 8) {
