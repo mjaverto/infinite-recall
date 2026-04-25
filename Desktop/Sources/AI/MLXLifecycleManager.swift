@@ -23,7 +23,14 @@ final class MLXLifecycleManager: ObservableObject {
 
   /// Default model id. Mirrors the `--model` flag in the plist template and the
   /// default in `LocalLLMClient`.
-  static let defaultModelID = "mlx-community/Qwen2.5-32B-Instruct-4bit"
+  ///
+  /// Switched from Qwen2.5-32B-Instruct-4bit (~18 GB disk, ~20 GB RAM) to the
+  /// 7B variant (~4.3 GB disk, ~7-9 GB RAM) for new installs. Existing users
+  /// who already pulled the 32B snapshot keep working — the launchd plist they
+  /// have on disk still points at the 32B path; only fresh `setup-mlx-server.sh`
+  /// runs default to the new model. Same Qwen2.5 family / chat template, so the
+  /// prompt formats in the rest of the app are unchanged.
+  static let defaultModelID = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 
   /// Path to the launchd plist once installed.
   static var installedPlistURL: URL {

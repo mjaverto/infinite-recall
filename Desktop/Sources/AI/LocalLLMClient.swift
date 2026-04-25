@@ -93,7 +93,7 @@ actor LocalLLMClient: LLMClient {
 
   init(
     baseURL: URL = URL(string: "http://127.0.0.1:8080")!,
-    modelName: String = "mlx-community/Qwen2.5-32B-Instruct-4bit",
+    modelName: String = "mlx-community/Qwen2.5-7B-Instruct-4bit",
     requestTimeout: TimeInterval = 30
   ) {
     self.baseURL = baseURL

@@ -4,11 +4,19 @@
 # What this does:
 #   1. Installs `uv` (fast Python tool runner) if missing.
 #   2. Installs the `mlx-lm` Python package via `uv tool install`.
-#   3. Optionally pulls the default 4-bit Qwen 32B model from Hugging Face
-#      (~18 GB on disk — prompts before downloading, unless --yes / env var
-#      INFINITE_RECALL_AUTO_CONFIRM=1 is set).
+#   3. Optionally pulls the default 4-bit Qwen 7B-Instruct model from Hugging
+#      Face (~4.3 GB on disk, ~7-9 GB resident — prompts before downloading,
+#      unless --yes / env INFINITE_RECALL_AUTO_CONFIRM=1 is set).
 #   4. Drops a launchd plist at ~/Library/LaunchAgents/com.infiniterecall.mlx.plist
 #      and `launchctl load`s it so the server runs at login on 127.0.0.1:8080.
+#
+# Model override (highest priority wins):
+#   --model <hf-path>            CLI flag
+#   INFINITE_RECALL_MODEL=<path> env var (preferred)
+#   INFINITE_RECALL_MLX_MODEL    legacy env var (still honored)
+# Otherwise falls back to the built-in default below. This lets a user who
+# already pulled Qwen 2.5-32B keep using it without re-downloading the 7B
+# model — they just pass --model mlx-community/Qwen2.5-32B-Instruct-4bit.
 #
 # Re-running is safe — every step is idempotent.
 #
@@ -19,7 +27,10 @@
 set -euo pipefail
 
 LABEL="com.infiniterecall.mlx"
-DEFAULT_MODEL="mlx-community/Qwen2.5-32B-Instruct-4bit"
+# Default LLM. Smaller-by-default for new installs (was Qwen2.5-32B-Instruct-4bit).
+# Verified on huggingface.co: Apache 2.0, ~4.3 GB on disk, 32k context, same
+# Qwen2.5 chat template as the previous 32B default.
+DEFAULT_MODEL="mlx-community/Qwen2.5-7B-Instruct-4bit"
 HOST="127.0.0.1"
 PORT="8080"
 
@@ -30,11 +41,22 @@ LOG_DIR="${HOME}/Library/Logs/InfiniteRecall"
 
 # Non-interactive mode for the in-app installer.
 AUTO_CONFIRM="${INFINITE_RECALL_AUTO_CONFIRM:-0}"
-for arg in "$@"; do
-  case "$arg" in
-    --yes|-y) AUTO_CONFIRM=1 ;;
+# Resolve model override: --model wins over env, env wins over default.
+# Honor both INFINITE_RECALL_MODEL (preferred) and INFINITE_RECALL_MLX_MODEL
+# (legacy — already referenced in the embedded Python heredoc below).
+MODEL="${INFINITE_RECALL_MODEL:-${INFINITE_RECALL_MLX_MODEL:-${DEFAULT_MODEL}}}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes|-y) AUTO_CONFIRM=1; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --model=*) MODEL="${1#--model=}"; shift ;;
+    *) shift ;;
   esac
 done
+# Re-export so the embedded Python sees the resolved value regardless of which
+# env var the caller used.
+export INFINITE_RECALL_MLX_MODEL="${MODEL}"
+export INFINITE_RECALL_MODEL="${MODEL}"
 
 bold() { printf "\033[1m%s\033[0m\n" "$1"; }
 warn() { printf "\033[33m%s\033[0m\n" "$1"; }
@@ -77,7 +99,7 @@ uv tool install --upgrade mlx-lm
 # 3. Optionally download the default model
 # ---------------------------------------------------------------------------
 progress "STEP=downloading_model"
-MODEL_CACHE_DIR="${HOME}/.cache/huggingface/hub/models--${DEFAULT_MODEL//\//--}"
+MODEL_CACHE_DIR="${HOME}/.cache/huggingface/hub/models--${MODEL//\//--}"
 DOWNLOAD_OK=0
 if [ -d "${MODEL_CACHE_DIR}" ]; then
   bold "✓ Model already present at ${MODEL_CACHE_DIR}"
@@ -88,8 +110,8 @@ else
   if [ "${AUTO_CONFIRM}" = "1" ]; then
     PROCEED=1
   else
-    warn "The default model is ~18 GB on disk."
-    warn "Model: ${DEFAULT_MODEL}"
+    warn "Model: ${MODEL}"
+    warn "(The default 7B model is ~4.3 GB; larger overrides will be larger.)"
     printf "Download it now? [y/N] "
     read -r REPLY
     case "${REPLY}" in
@@ -111,7 +133,7 @@ else
 import os, sys, threading, time
 from huggingface_hub import snapshot_download, HfApi
 
-MODEL = os.environ.get("INFINITE_RECALL_MLX_MODEL", "mlx-community/Qwen2.5-32B-Instruct-4bit")
+MODEL = os.environ.get("INFINITE_RECALL_MODEL") or os.environ.get("INFINITE_RECALL_MLX_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit")
 
 def emit(msg: str) -> None:
     sys.stdout.write(f"PROGRESS:{msg}\n")
@@ -175,7 +197,7 @@ bold "→ Rendering launchd plist to ${PLIST_DEST}"
 sed \
   -e "s|__USER_HOME__|${HOME}|g" \
   -e "s|__UV_BIN__|${UV_BIN}|g" \
-  -e "s|__MODEL__|${DEFAULT_MODEL}|g" \
+  -e "s|__MODEL__|${MODEL}|g" \
   -e "s|__HOST__|${HOST}|g" \
   -e "s|__PORT__|${PORT}|g" \
   "${PLIST_TEMPLATE}" > "${PLIST_DEST}"
