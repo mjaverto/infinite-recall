@@ -439,10 +439,20 @@ extension TranscriptionSegmentRecord {
         if let json = translationsJson, let data = json.data(using: .utf8) {
             translations = (try? JSONDecoder().decode([TranscriptTranslation].self, from: data)) ?? []
         }
+        // Infinite Recall fork: belt-and-suspenders strip of WhisperKit special
+        // tokens at display time. New segments are cleaned at ingest, but the
+        // ~679 existing segments in the DB still contain raw <|startoftranscript|>
+        // / <|0.00|> / <|endoftext|> markers. This filter cleans them on read
+        // so we don't need a destructive DB migration.
+        let cleanedText = text.replacingOccurrences(
+            of: #"<\|[^|>]+\|>"#,
+            with: "",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
         return TranscriptSegment(
             id: segmentId ?? UUID().uuidString,
             backendId: segmentId,
-            text: text,
+            text: cleanedText,
             speaker: speakerLabel,
             isUser: isUser,
             personId: personId,

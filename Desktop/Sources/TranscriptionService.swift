@@ -370,7 +370,16 @@ class TranscriptionService: @unchecked Sendable {
                 // the next pass.
                 guard absEnd <= windowStartOffsetSeconds + commitSeconds else { continue }
                 guard absEnd > lastCommittedEndSeconds else { continue }
-                let trimmed = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Infinite Recall fork: WhisperKit's raw output contains special
+                // tokens like <|startoftranscript|>, <|0.00|>, <|endoftext|>,
+                // <|en|>, <|transcribe|>. Strip them before persisting so the
+                // UI shows clean speech.
+                let stripped = seg.text.replacingOccurrences(
+                    of: #"<\|[^|>]+\|>"#,
+                    with: "",
+                    options: .regularExpression
+                )
+                let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
 
                 // Infinite Recall fork: consult the on-device diarization
