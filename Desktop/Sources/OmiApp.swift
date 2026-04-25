@@ -221,6 +221,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var screenCaptureSwitch: NSSwitch?
   private var audioRecordingSwitch: NSSwitch?
   private var relaunchOnLoginSuppressedForOnboarding = false
+  private var safeModeStateObserver: NSObjectProtocol?
+  private var safeModeStatusBarTickTimer: Timer?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     if ViewExporter.shouldExport() {
@@ -457,6 +459,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Called synchronously on main thread to ensure status item is created before app finishes launching
     Task { @MainActor in
       self.setupMenuBar()
+      // Subscribe to Safe Mode state changes (icon + submenu refresh) and
+      // restore any persisted Safe Mode pause from a previous launch.
+      self.observeSafeModeState()
+      SafeModeController.shared.restoreOnLaunch()
+      self.refreshStatusBarForSafeMode()
     }
 
     // Periodic health check: verify menu bar icon is still visible every 30 seconds.
@@ -641,6 +648,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
           log("AppDelegate: [HOTKEY] Posted navigateToRewind notification")
         }
       }
+
+      // Cmd+Shift+S — toggle Safe Mode (pause both pipelines / resume).
+      let isCmdShift = modifiers.contains(.command) && modifiers.contains(.shift)
+      let isS = keyCode == 1  // S key
+      if isCmdShift && isS {
+        log("AppDelegate: [HOTKEY] Safe Mode hotkey MATCHED (Cmd+Shift+S)")
+        DispatchQueue.main.async {
+          SafeModeController.shared.toggle()
+        }
+      }
       return event
     }
 
@@ -803,6 +820,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
     audioRecordingItem.view = audioRecordingView
     menu.addItem(audioRecordingItem)
+
+    menu.addItem(NSMenuItem.separator())
+
+    // Safe Mode submenu — pauses BOTH audio + screen capture with one click.
+    let safeModeItem = NSMenuItem(title: "Safe Mode", action: nil, keyEquivalent: "")
+    safeModeItem.submenu = buildSafeModeSubmenu()
+    menu.addItem(safeModeItem)
 
     menu.addItem(NSMenuItem.separator())
 
@@ -1028,6 +1052,213 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
   }
 
+  // MARK: - Safe Mode
+
+  private static let safeModePresetSeconds: [(label: String, seconds: Int)] = [
+    ("Pause for 15 minutes", 15 * 60),
+    ("Pause for 30 minutes", 30 * 60),
+    ("Pause for 1 hour", 60 * 60),
+    ("Pause for 2 hours", 120 * 60),
+  ]
+
+  /// Build the Safe Mode submenu reflecting current state. Rebuilt on every
+  /// state change so checkmarks / "Resume" visibility stay current.
+  @MainActor private func buildSafeModeSubmenu() -> NSMenu {
+    let submenu = NSMenu(title: "Safe Mode")
+    let controller = SafeModeController.shared
+    let state = controller.state
+
+    // Status header.
+    let header: String = {
+      switch state {
+      case .off: return "Safe Mode: Off (recording)"
+      case .pausedFor: return "Safe Mode: \(controller.displayCountdown)"
+      case .pausedIndefinitely: return "Safe Mode: Until I resume"
+      }
+    }()
+    let headerItem = NSMenuItem(title: header, action: nil, keyEquivalent: "")
+    headerItem.isEnabled = false
+    submenu.addItem(headerItem)
+    submenu.addItem(NSMenuItem.separator())
+
+    // Resume — only visible while paused.
+    if state.isPaused {
+      let resumeItem = NSMenuItem(
+        title: "Resume Recording",
+        action: #selector(safeModeResume),
+        keyEquivalent: "")
+      resumeItem.target = self
+      submenu.addItem(resumeItem)
+      submenu.addItem(NSMenuItem.separator())
+    }
+
+    // Most-recently-used preset bubbles to the top.
+    let lastUsed = state.lastUsedDuration
+    var presets = Self.safeModePresetSeconds
+    if let last = lastUsed, let idx = presets.firstIndex(where: { $0.seconds == last }) {
+      let recent = presets.remove(at: idx)
+      presets.insert(recent, at: 0)
+    }
+
+    for preset in presets {
+      let item = NSMenuItem(
+        title: preset.label,
+        action: #selector(safeModePauseForPreset(_:)),
+        keyEquivalent: "")
+      item.target = self
+      item.tag = preset.seconds
+      // Mark current-active or last-used.
+      switch state {
+      case .pausedFor(let s, _, _) where s == preset.seconds:
+        item.state = .on
+      case .off where lastUsed == preset.seconds:
+        item.state = .on
+      default:
+        item.state = .off
+      }
+      submenu.addItem(item)
+    }
+
+    submenu.addItem(NSMenuItem.separator())
+
+    let indefiniteItem = NSMenuItem(
+      title: "Pause until I resume",
+      action: #selector(safeModePauseIndefinite),
+      keyEquivalent: "")
+    indefiniteItem.target = self
+    if case .pausedIndefinitely = state { indefiniteItem.state = .on }
+    submenu.addItem(indefiniteItem)
+
+    let customItem = NSMenuItem(
+      title: "Pause for custom...",
+      action: #selector(safeModePauseCustom),
+      keyEquivalent: "")
+    customItem.target = self
+    submenu.addItem(customItem)
+
+    return submenu
+  }
+
+  @MainActor @objc private func safeModePauseForPreset(_ sender: NSMenuItem) {
+    let seconds = sender.tag
+    guard seconds > 0 else { return }
+    log("AppDelegate: [SAFEMODE] Preset selected: \(seconds)s")
+    AnalyticsManager.shared.menuBarActionClicked(action: "safe_mode_pause_\(seconds)")
+    SafeModeController.shared.pause(forSeconds: seconds)
+  }
+
+  @MainActor @objc private func safeModePauseIndefinite() {
+    log("AppDelegate: [SAFEMODE] Pause indefinitely")
+    AnalyticsManager.shared.menuBarActionClicked(action: "safe_mode_pause_indefinite")
+    SafeModeController.shared.pause(forSeconds: nil)
+  }
+
+  @MainActor @objc private func safeModePauseCustom() {
+    log("AppDelegate: [SAFEMODE] Custom duration sheet")
+    AnalyticsManager.shared.menuBarActionClicked(action: "safe_mode_custom")
+    SafeModeCustomDurationWindow.shared.show()
+  }
+
+  @MainActor @objc private func safeModeResume() {
+    log("AppDelegate: [SAFEMODE] Resume")
+    AnalyticsManager.shared.menuBarActionClicked(action: "safe_mode_resume")
+    SafeModeController.shared.resume()
+  }
+
+  /// Update the menu-bar status item icon and title to reflect the current
+  /// Safe Mode state. Called on launch + every state change + every 1s while
+  /// time-boxed (so the countdown is always live).
+  @MainActor private func refreshStatusBarForSafeMode() {
+    guard let item = statusBarItem, let button = item.button else { return }
+    let controller = SafeModeController.shared
+    let state = controller.state
+
+    // Three logical states for the icon:
+    //   - Recording (red dot) — Safe Mode off, audio + screen on
+    //   - Idle (gray) — Safe Mode off, but recording isn't actually running
+    //   - Paused (yellow) — Safe Mode is active
+    let symbolName: String
+    let tint: NSColor?
+    let titleSuffix: String
+
+    if state.isPaused {
+      symbolName = "pause.circle.fill"
+      tint = .systemYellow
+      switch state {
+      case .pausedFor(_, let until, _):
+        let remaining = max(0, Int(until.timeIntervalSinceNow.rounded()))
+        titleSuffix = "Recall · \(SafeModeController.formatStatusBarTitle(remaining))"
+      case .pausedIndefinitely:
+        titleSuffix = "Recall · paused"
+      case .off:
+        titleSuffix = ""
+      }
+    } else {
+      let audioOn = AssistantSettings.shared.transcriptionEnabled
+      let screenOn = ProactiveAssistantsPlugin.shared.isMonitoring
+      if audioOn || screenOn {
+        symbolName = "circle.fill"
+        tint = .systemRed
+        titleSuffix = ""
+      } else {
+        symbolName = "circle.dotted"
+        tint = .secondaryLabelColor
+        titleSuffix = ""
+      }
+    }
+
+    let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+    if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Recall")?
+      .withSymbolConfiguration(config)
+    {
+      img.isTemplate = (tint == nil)  // tint colors require non-template image
+      button.image = img
+      button.contentTintColor = tint
+    }
+    button.title = titleSuffix.isEmpty ? "" : " \(titleSuffix)"
+    button.imagePosition = titleSuffix.isEmpty ? .imageOnly : .imageLeft
+  }
+
+  /// Refresh the existing menu's Safe Mode submenu (and the toggle states)
+  /// so the menu looks current the next time the user opens it. Also rebuild
+  /// the status bar icon.
+  @MainActor private func handleSafeModeStateChanged() {
+    refreshStatusBarForSafeMode()
+
+    // The screen + audio toggles in the menu may need to flip off when Safe
+    // Mode pauses, or back on when it resumes. They re-read state in
+    // menuWillOpen, but we also nudge here so the next open looks right.
+    screenCaptureSwitch?.state = ProactiveAssistantsPlugin.shared.isMonitoring ? .on : .off
+    audioRecordingSwitch?.state = AssistantSettings.shared.transcriptionEnabled ? .on : .off
+
+    // Manage the 1-second status-bar tick so the countdown title is live
+    // without waiting for the user to open the menu.
+    if case .pausedFor = SafeModeController.shared.state {
+      if safeModeStatusBarTickTimer == nil {
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+          DispatchQueue.main.async { self?.refreshStatusBarForSafeMode() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        safeModeStatusBarTickTimer = t
+      }
+    } else {
+      safeModeStatusBarTickTimer?.invalidate()
+      safeModeStatusBarTickTimer = nil
+    }
+  }
+
+  /// Subscribe to Safe Mode state changes (called once after setupMenuBar).
+  @MainActor private func observeSafeModeState() {
+    if safeModeStateObserver != nil { return }
+    safeModeStateObserver = NotificationCenter.default.addObserver(
+      forName: SafeModeController.stateDidChange,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.handleSafeModeStateChanged()
+    }
+  }
+
   // MARK: - NSMenuDelegate
   func menuWillOpen(_ menu: NSMenu) {
     log("AppDelegate: [MENUBAR] Menu opened by user")
@@ -1035,6 +1266,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Refresh toggle states to match current runtime state
     screenCaptureSwitch?.state = ProactiveAssistantsPlugin.shared.isMonitoring ? .on : .off
     audioRecordingSwitch?.state = AssistantSettings.shared.transcriptionEnabled ? .on : .off
+    // Rebuild the Safe Mode submenu so it reflects current state.
+    for item in menu.items where item.title == "Safe Mode" {
+      item.submenu = buildSafeModeSubmenu()
+    }
   }
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1075,6 +1310,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       NotificationCenter.default.removeObserver(observer)
       userDefaultsObserver = nil
     }
+    if let observer = safeModeStateObserver {
+      NotificationCenter.default.removeObserver(observer)
+      safeModeStateObserver = nil
+    }
+    safeModeStatusBarTickTimer?.invalidate()
+    safeModeStatusBarTickTimer = nil
     // Remove hotkey monitors
     if let monitor = globalHotkeyMonitor {
       NSEvent.removeMonitor(monitor)
