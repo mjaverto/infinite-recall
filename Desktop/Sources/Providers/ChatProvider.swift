@@ -2296,17 +2296,6 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         }
         usageLimiter.recordQuery()
 
-        // Ensure bridge is running
-        guard await ensureBridgeStarted() else {
-            errorMessage = "AI not available"
-            return
-        }
-
-        // Show upgrade prompt if over threshold but don't block the message
-        if bridgeMode != BridgeMode.userClaude.rawValue && omiAICumulativeCostUsd >= 50.0 {
-            showOmiThresholdAlert = true
-        }
-
         // Determine session ID based on mode
         // In default chat mode (isInDefaultChat=true): no session ID (compatible with Flutter)
         // In session mode: require session ID
@@ -2329,36 +2318,35 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         let sendGen = sendGeneration
 
         // Safety-net watchdog: if this specific send is still "in flight"
-        // 3 minutes from now, something in the bridge / stream pipeline has
-        // hung (commonly: stale ACP subprocess after laptop sleep emits a
-        // "stray turn_end" that Swift's waitForMessage never sees). Force-
-        // release isSending so the user's next query isn't silently dropped
-        // by the "already sending" guard. The generation check means the
-        // watchdog only fires if no later send has replaced this one.
+        // 3 minutes from now, something in the stream pipeline has hung.
+        // Force-release isSending so the user's next query isn't silently
+        // dropped by the "already sending" guard.
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 180_000_000_000)
             await MainActor.run {
                 guard let self = self, self.isSending, self.sendGeneration == sendGen else { return }
-                log("ChatProvider: send watchdog fired at 180s — bridge is stuck; force-resetting")
+                log("ChatProvider: send watchdog fired at 180s — stuck; force-resetting")
                 self.isSending = false
                 self.isStopping = false
                 self.errorMessage = "Response took too long. Try again."
             }
         }
 
-        // Save user message to backend and add to UI.
-        // (skip for follow-ups — sendFollowUp already did both)
-        //
-        // The save is fire-and-forget (unstructured Task) so it doesn't block
-        // the ACP query from starting. This is safe because isSending=true for
-        // the entire duration of the ACP query, so the poll timer is suppressed
-        // the whole time — by the time isSending is released the user message
-        // save has almost always already completed and its ID has been synced.
+        // Append the user bubble immediately so the UI never shows a black hole.
+        // This happens before any network or LLM work so the message always renders.
         let userMessageId = UUID().uuidString
         let isFirstMessage = messages.isEmpty
         let capturedSessionId = sessionId
         let capturedAppId = overrideAppId ?? selectedAppId
         if !isFollowUp {
+            let userMessage = ChatMessage(
+                id: userMessageId,
+                text: trimmedText,
+                sender: .user
+            )
+            messages.append(userMessage)
+
+            // Fire-and-forget backend persistence — non-critical path.
             Task { [weak self] in
                 do {
                     let response = try await APIClient.shared.saveMessage(
@@ -2367,8 +2355,6 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                         appId: capturedAppId,
                         sessionId: capturedSessionId
                     )
-                    // Adopt the server ID (local UUID → server ID) and mark synced.
-                    // isSynced=true enables rating buttons on the message bubble.
                     await MainActor.run {
                         if let index = self?.messages.firstIndex(where: { $0.id == userMessageId }) {
                             self?.messages[index].id = response.id
@@ -2378,16 +2364,8 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                     log("Saved user message to backend: \(response.id)")
                 } catch {
                     logError("Failed to persist user message", error: error)
-                    // Non-critical - continue with chat
                 }
             }
-
-            let userMessage = ChatMessage(
-                id: userMessageId,
-                text: trimmedText,
-                sender: .user
-            )
-            messages.append(userMessage)
 
             // Track onboarding user messages with full content
             if isOnboarding {
@@ -2411,23 +2389,13 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         )
         messages.append(aiMessage)
 
-        // Analytics: track timing and tool usage
+        // Analytics: track timing
         let queryStartTime = Date()
-        var toolNames: [String] = []
-        var toolStartTimes: [String: Date] = [:]
-        var sqlRowsReturned = 0
-        var sqlQueryCount = 0
 
         do {
-            // Use the system prompt built at warmup. The agent bridge applies it only
-            // at session/new; for the normal reused-session path it is ignored.
-            // Passing it here ensures it is applied if the session was invalidated
-            // (e.g. cwd change) and a new session/new is triggered mid-conversation.
+            // Build the system prompt for this turn.
             var systemPrompt: String
             if isOnboarding, let prefix = systemPromptPrefix, !prefix.isEmpty {
-                // Onboarding uses its own prompt exclusively — the main chat prompt
-                // contains rules like "don't ask follow-up questions" that conflict
-                // with the onboarding deep-dive step.
                 systemPrompt = prefix
             } else {
                 systemPrompt = cachedMainSystemPrompt
@@ -2439,180 +2407,70 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 systemPrompt += "\n\n" + suffix
             }
 
-            // Auto-inject notification context: if the most recent AI message before
-            // the user's new message is a proactive notification, tell Claude about it
-            // so it can answer follow-up questions about the notification.
-            var effectiveImageData = imageData
+            // Auto-inject notification context from the previous AI turn.
             if systemPromptSuffix == nil {
-                // Find the last AI message before the user's current message
-                let aiMessages = messages.filter { $0.sender == .ai && !$0.isStreaming }
-                if let lastAI = aiMessages.last, let ctx = lastAI.notificationContext {
+                let priorAI = messages.filter { $0.sender == .ai && !$0.isStreaming }
+                if let lastAI = priorAI.last, let ctx = lastAI.notificationContext {
                     systemPrompt += "\n\n" + ctx
-                    // Attach the notification screenshot if no other image is provided
-                    if effectiveImageData == nil, let screenshotData = lastAI.notificationScreenshot {
-                        effectiveImageData = screenshotData
-                    }
                 }
             }
 
-            // Query the active bridge with streaming
-            // Callbacks for agent bridge
-            let textDeltaHandler: AgentBridge.TextDeltaHandler = { [weak self] delta in
-                Task { @MainActor [weak self] in
-                    self?.appendToMessage(id: aiMessageId, text: delta)
-                }
+            // Build OpenAI-style message history for LocalLLMClient.
+            // System prompt goes first, then all prior non-streaming turns, then the
+            // new user message (already appended to messages[] above).
+            // TODO(local-tools): plug ChatToolExecutor in here once tool-calling over
+            // OpenAI function-call protocol is wired (v2). Plain chat is fine for v1.
+            var llmMessages: [LLM.ChatMessage] = []
+            if !systemPrompt.isEmpty {
+                llmMessages.append(LLM.ChatMessage(role: .system, content: systemPrompt))
             }
-            let toolCallHandler: AgentBridge.ToolCallHandler = { callId, name, input in
-                let toolCall = ToolCall(name: name, arguments: input, thoughtSignature: nil)
-                let result = await ChatToolExecutor.execute(toolCall)
-                log("OMI tool \(name) executed for callId=\(callId)")
-                // Track SQL query stats for metadata
-                if name == "execute_sql" {
-                    sqlQueryCount += 1
-                    // Parse row count from result (format: "\nN row(s)" at end)
-                    if let match = result.range(of: #"(\d+) row\(s\)"#, options: .regularExpression) {
-                        let numStr = result[match].components(separatedBy: " ").first ?? "0"
-                        sqlRowsReturned += Int(numStr) ?? 0
-                    }
-                }
-                return result
-            }
-            let toolActivityHandler: AgentBridge.ToolActivityHandler = { [weak self] name, status, toolUseId, input in
-                Task { @MainActor [weak self] in
-                    self?.addToolActivity(
-                        messageId: aiMessageId,
-                        toolName: name,
-                        status: status == "started" ? .running : .completed,
-                        toolUseId: toolUseId,
-                        input: input
-                    )
-                    if status == "started" {
-                        toolNames.append(name)
-                        toolStartTimes[name] = Date()
-                        if (name.contains("browser") || name.contains("playwright")) {
-                            let token = UserDefaults.standard.string(forKey: "playwrightExtensionToken") ?? ""
-                            if token.isEmpty {
-                                log("ChatProvider: Browser tool \(name) called without extension token — aborting query and prompting setup")
-                                self?.needsBrowserExtensionSetup = true
-                                self?.stopAgent()
-                                // Keep floating-bar sessions non-intrusive: do not foreground
-                                // the main window when the query originated from the floating bar.
-                                if sessionKey != "floating" {
-                                    // Bring the app to the foreground so the setup sheet is visible
-                                    // (the failed browser attempt may have opened Chrome, stealing focus)
-                                    NSApp.activate()
-                                    for window in NSApp.windows where window.title.hasPrefix("Infinite Recall") {
-                                        window.makeKeyAndOrderFront(nil)
-                                    }
-                                }
-                            }
-                            // Show the floating bar so the user has an always-on-top UI
-                            // when Chrome takes focus (important on small screens)
-                            if !FloatingControlBarManager.shared.isVisible {
-                                log("ChatProvider: Browser tool active — showing floating bar so it stays above Chrome")
-                                FloatingControlBarManager.shared.showTemporarily()
-                            }
-                        }
-                    } else if status == "completed", let startTime = toolStartTimes.removeValue(forKey: name) {
-                        let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
-                        AnalyticsManager.shared.chatToolCallCompleted(toolName: name, durationMs: durationMs)
-                    }
-                }
-            }
-            let thinkingDeltaHandler: AgentBridge.ThinkingDeltaHandler = { [weak self] text in
-                Task { @MainActor [weak self] in
-                    self?.appendThinking(messageId: aiMessageId, text: text)
-                }
-            }
-            let toolResultDisplayHandler: AgentBridge.ToolResultDisplayHandler = { [weak self] toolUseId, name, output in
-                Task { @MainActor [weak self] in
-                    self?.addToolResult(messageId: aiMessageId, toolUseId: toolUseId, name: name, output: output)
-                }
+            let priorMessages = messages.filter { $0.id != aiMessageId && !$0.isStreaming }
+            for msg in priorMessages {
+                let role: LLM.ChatMessage.Role = msg.sender == .user ? .user : .assistant
+                llmMessages.append(LLM.ChatMessage(role: role, content: msg.text))
             }
 
-            let queryResult = try await agentBridge.query(
-                prompt: trimmedText,
-                systemPrompt: systemPrompt,
-                sessionKey: isOnboarding ? "onboarding" : (sessionKey ?? "main"),
-                cwd: workingDirectory,
-                mode: chatMode.rawValue,
-                model: model ?? modelOverride,
-                resume: resume,
-                imageData: effectiveImageData,
-                onTextDelta: textDeltaHandler,
-                onToolCall: toolCallHandler,
-                onToolActivity: toolActivityHandler,
-                onThinkingDelta: thinkingDeltaHandler,
-                onToolResultDisplay: toolResultDisplayHandler,
-                onAuthRequired: { [weak self] methods, authUrl in
-                    Task { @MainActor [weak self] in
-                        self?.claudeAuthMethods = methods
-                        self?.claudeAuthUrl = authUrl
-                        self?.isClaudeAuthRequired = true
-                    }
-                },
-                onAuthSuccess: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        self?.isClaudeAuthRequired = false
-                        self?.checkClaudeConnectionStatus()
-                    }
-                }
+            // IdleAIController.shared.recordAICall() is called inside
+            // LocalLLMClient.chat() before every HTTP request — no need to call
+            // it here separately.
+            let stream = try await LocalLLMClient.shared.chat(
+                messages: llmMessages,
+                stream: true
             )
+
+            var fullResponseText = ""
+            for try await chunk in stream {
+                guard !Task.isCancelled else { break }
+                if !chunk.delta.isEmpty {
+                    fullResponseText += chunk.delta
+                    let capturedDelta = chunk.delta
+                    await MainActor.run { [weak self] in
+                        self?.appendToMessage(id: aiMessageId, text: capturedDelta)
+                    }
+                }
+            }
 
             // Flush any remaining buffered streaming text before finalizing
             streamingFlushWorkItem?.cancel()
             streamingFlushWorkItem = nil
             flushStreamingBuffer()
 
-            // Determine the final text to display and save
+            // Finalize the AI message in-place.
             let messageText: String
             if let index = messages.firstIndex(where: { $0.id == aiMessageId }) {
-                // Message still in memory — update it in-place
-                messageText = messages[index].text.isEmpty ? queryResult.text : messages[index].text
+                messageText = messages[index].text.isEmpty ? fullResponseText : messages[index].text
                 messages[index].text = messageText
                 messages[index].isStreaming = false
-                messages[index].metadata = MessageMetadata(
-                    model: model ?? modelOverride,
-                    inputTokens: queryResult.inputTokens,
-                    outputTokens: queryResult.outputTokens,
-                    cacheReadTokens: queryResult.cacheReadTokens,
-                    cacheWriteTokens: queryResult.cacheWriteTokens,
-                    costUsd: queryResult.costUsd,
-                    systemPrompt: systemPrompt,
-                    hasScreenshot: imageData != nil,
-                    screenshotSizeBytes: imageData?.count,
-                    toolNames: toolNames,
-                    sqlRowsReturned: sqlRowsReturned,
-                    sqlQueryCount: sqlQueryCount
-                )
                 completeRemainingToolCalls(messageId: aiMessageId)
             } else {
-                // Message no longer in memory (user switched away from this session).
-                messageText = queryResult.text
+                messageText = fullResponseText
                 log("Chat response arrived after session switch")
             }
 
-            // Release the sending lock as soon as the AI response is visible in the
-            // UI. Backend persistence is slow (can timeout at 30s+) and should not
-            // block the user from making new queries to Claude.
-            //
-            // IMPORTANT: releasing isSending here opens a race window with the poll
-            // timer. The poll can now fetch backend messages while saveMessage() is
-            // still in-flight. The AI message still has a local UUID at this point
-            // (isSynced=false). pollForNewMessages() handles this by merging the
-            // backend copy into the local message rather than appending a duplicate.
             isSending = false
             isStopping = false
 
-            // Save AI response to backend. aiMessageId is captured above so we can
-            // locate the right message even if the user has started a new query by
-            // the time this completes.
-            //
-            // After save: update the in-memory message's ID from local UUID to the
-            // server-assigned ID, and mark isSynced=true. This is the normal path
-            // (no race). The poll's merge logic handles the case where the poll fires
-            // before this update runs.
-            let textToSave = queryResult.text.isEmpty ? messageText : queryResult.text
+            let textToSave = fullResponseText.isEmpty ? messageText : fullResponseText
             if !textToSave.isEmpty {
                 do {
                     let toolMetadata = serializeToolCallMetadata(messageId: aiMessageId)
@@ -2643,21 +2501,16 @@ A screenshot may be attached — use it silently only if relevant. Never mention
 
             log("Chat response complete")
 
-            // Track onboarding AI responses with full content and tool calls
+            // Track onboarding AI responses with full content
             if isOnboarding {
-                let aiText = messages.first(where: { $0.id == aiMessageId })?.text ?? queryResult.text
+                let aiText = messages.first(where: { $0.id == aiMessageId })?.text ?? fullResponseText
                 AnalyticsManager.shared.onboardingChatMessageDetailed(
                     role: "assistant",
                     text: aiText,
                     step: "chat",
-                    toolCalls: toolNames.isEmpty ? nil : toolNames,
+                    toolCalls: nil,
                     model: model ?? modelOverride
                 )
-            }
-
-            // Persist the ACP session ID during onboarding so we can resume after app restart
-            if isOnboarding && !queryResult.sessionId.isEmpty {
-                OnboardingChatPersistence.saveSessionId(queryResult.sessionId)
             }
 
             // Analytics: track query completion
@@ -2665,40 +2518,11 @@ A screenshot may be attached — use it silently only if relevant. Never mention
             let responseLength = messages.first(where: { $0.id == aiMessageId })?.text.count ?? 0
             AnalyticsManager.shared.chatAgentQueryCompleted(
                 durationMs: durationMs,
-                toolCallCount: toolNames.count,
-                toolNames: toolNames,
-                costUsd: queryResult.costUsd,
+                toolCallCount: 0,
+                toolNames: [],
+                costUsd: 0,
                 messageLength: responseLength
             )
-
-            // Skip client-side usage recording for piMono — the backend already
-            // logs usage server-side via POST /v2/chat/completions, so recording
-            // here would double-count.
-            let isOmiMode = bridgeMode != BridgeMode.userClaude.rawValue
-            let isPiMono = bridgeMode == BridgeMode.piMono.rawValue
-            if !isPiMono {
-                let accountType = isOmiMode ? "omi" : "personal"
-                let r = queryResult
-                Task.detached(priority: .background) {
-                    await APIClient.shared.recordLlmUsage(
-                        inputTokens: r.inputTokens,
-                        outputTokens: r.outputTokens,
-                        cacheReadTokens: r.cacheReadTokens,
-                        cacheWriteTokens: r.cacheWriteTokens,
-                        totalTokens: r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens,
-                        costUsd: r.costUsd,
-                        account: accountType
-                    )
-                }
-            }
-            if isOmiMode {
-                sessionTokensUsed += queryResult.inputTokens + queryResult.outputTokens
-                omiAICumulativeCostUsd += queryResult.costUsd
-                // Show the upgrade flow when the free Omi usage threshold is reached.
-                if omiAICumulativeCostUsd >= 50.0 {
-                    showOmiThresholdAlert = true
-                }
-            }
 
             // Fire-and-forget: check if user's message mentions goal progress
             let chatText = trimmedText
@@ -2706,18 +2530,12 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 await GoalsAIService.shared.extractProgressFromAllGoals(text: chatText)
             }
         } catch {
-            // On timeout, cancel the stuck ACP session so it's not left dangling
-            if let bridgeError = error as? BridgeError, case .timeout = bridgeError {
-                log("ChatProvider: ACP query timed out, sending interrupt to cancel stuck session")
-                await agentBridge.interrupt()
-            }
-
             // Flush any remaining buffered streaming text before handling the error
             streamingFlushWorkItem?.cancel()
             streamingFlushWorkItem = nil
             flushStreamingBuffer()
 
-            // Only remove the AI message if it's still empty (no streamed text yet).
+            // Only remove the AI placeholder if it's still empty (no streamed text yet).
             // If text was already streamed and visible, keep it and just stop streaming.
             if let index = messages.firstIndex(where: { $0.id == aiMessageId }) {
                 if messages[index].text.isEmpty && messages[index].contentBlocks.isEmpty {
@@ -2725,10 +2543,8 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 } else {
                     messages[index].isStreaming = false
                     completeRemainingToolCalls(messageId: aiMessageId)
-                    log("Bridge error after partial response — keeping \(messages[index].text.count) chars of streamed text")
-                    // Still try to persist the partial response
+                    log("LLM error after partial response — keeping \(messages[index].text.count) chars of streamed text")
                     let partialText = messages[index].text
-                    let partialToolMetadata = self.serializeToolCallMetadata(messageId: aiMessageId)
                     Task { [weak self] in
                         do {
                             let response = try await APIClient.shared.saveMessage(
@@ -2736,7 +2552,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                                 sender: "ai",
                                 appId: capturedAppId,
                                 sessionId: capturedSessionId,
-                                metadata: partialToolMetadata
+                                metadata: nil
                             )
                             await MainActor.run {
                                 if let syncIndex = self?.messages.firstIndex(where: { $0.id == aiMessageId }) {
@@ -2753,16 +2569,9 @@ A screenshot may be attached — use it silently only if relevant. Never mention
             }
 
             logError("Failed to get AI response", error: error)
-            // Send both user-friendly and raw error to analytics for remote debugging
-            let rawError: String
-            if let bridgeError = error as? BridgeError {
-                rawError = String(describing: bridgeError)
-            } else {
-                rawError = "\(error)"
-            }
+            let rawError = "\(error)"
             AnalyticsManager.shared.chatAgentError(error: error.localizedDescription, rawError: rawError)
 
-            // Track onboarding errors with full context
             if isOnboarding {
                 AnalyticsManager.shared.onboardingChatMessageDetailed(
                     role: "error", text: trimmedText, step: "chat",
@@ -2770,12 +2579,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 )
             }
 
-            // Show error to user (unless they intentionally stopped)
-            if let bridgeError = error as? BridgeError, case .stopped = bridgeError {
-                // User stopped — no error to show
-            } else {
-                errorMessage = error.localizedDescription
-            }
+            errorMessage = error.localizedDescription
         }
 
         isSending = false

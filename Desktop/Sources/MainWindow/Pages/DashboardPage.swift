@@ -249,6 +249,30 @@ struct DashboardPage: View {
                 )
             )
 
+            // Error banner — mirrors ChatPage pattern, dismissable.
+            if let error = chatProvider.errorMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(OmiColors.warning)
+                        .scaledFont(size: 14)
+                    Text(error)
+                        .scaledFont(size: 13)
+                        .foregroundColor(OmiColors.textSecondary)
+                    Spacer()
+                    Button {
+                        chatProvider.errorMessage = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .scaledFont(size: 11)
+                            .foregroundColor(OmiColors.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 30)
+                .padding(.vertical, 10)
+                .background(OmiColors.backgroundSecondary)
+            }
+
             ChatInputView(
                 onSend: { text in
                     AnalyticsManager.shared.chatMessageSent(
