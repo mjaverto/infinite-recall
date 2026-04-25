@@ -1,9 +1,12 @@
 import Foundation
-import Mixpanel
 import FirebaseAuth
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
-// SDK imports are kept so the rest of the codebase compiles.
+// Mixpanel SPM dep removed; `import Mixpanel` dropped along with it.
+// `MixpanelType` was the SDK's marker protocol for property values — we replace
+// it with a local typealias to `Any` so the no-op API surface still compiles
+// for any caller that still passes [String: MixpanelType] dictionaries.
+typealias MixpanelType = Any
 
 /// Singleton manager for MixPanel analytics
 /// Mirrors the functionality from the Flutter app's MixpanelManager

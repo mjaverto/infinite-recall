@@ -44,15 +44,24 @@ enum BYOKValidator {
           "anthropic-version": "2023-06-01",
         ]
       )
+    // Infinite Recall fork: Anthropic/OpenAI key validation only.
+    // Gemini/Deepgram providers are not exposed in the UI — their network
+    // validators are removed so we never reach generativelanguage.googleapis.com
+    // or api.deepgram.com. Returning .ok keeps the BYOKProvider switch exhaustive
+    // without changing the enum or any callers.
     case .gemini:
-      var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models")!
-      components.queryItems = [URLQueryItem(name: "key", value: trimmed)]
-      return await ping(url: components.url!, headers: [:])
+      // Disabled for local-first fork:
+      // var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models")!
+      // components.queryItems = [URLQueryItem(name: "key", value: trimmed)]
+      // return await ping(url: components.url!, headers: [:])
+      return .ok
     case .deepgram:
-      return await ping(
-        url: URL(string: "https://api.deepgram.com/v1/projects")!,
-        headers: ["Authorization": "Token \(trimmed)"]
-      )
+      // Disabled for local-first fork:
+      // return await ping(
+      //   url: URL(string: "https://api.deepgram.com/v1/projects")!,
+      //   headers: ["Authorization": "Token \(trimmed)"]
+      // )
+      return .ok
     }
   }
 

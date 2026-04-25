@@ -1,6 +1,6 @@
 import FirebaseAuth
 import FirebaseCore
-import Mixpanel
+// Infinite Recall fork: Mixpanel/PostHog/Heap SPM deps removed (telemetry no-op'd).
 import Sentry
 import Sparkle
 import SwiftUI
@@ -331,14 +331,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // }
     log("[telemetry-stripped] Sentry init skipped (Infinite Recall is local-first; isDev=\(isDev))")
 
-    // Initialize Firebase
-    let plistPath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist")
+    // Infinite Recall fork: never initialize Firebase. The local-only build
+    // doesn't need it. If a future cloud-sync feature ships, gate it behind
+    // an explicit user opt-in here.
+    if false /* localOnlyMode */ {
+      // Initialize Firebase
+      let plistPath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist")
 
-    if let path = plistPath,
-      let options = FirebaseOptions(contentsOfFile: path)
-    {
-      FirebaseApp.configure(options: options)
-      AuthService.shared.configure()
+      if let path = plistPath,
+        let options = FirebaseOptions(contentsOfFile: path)
+      {
+        FirebaseApp.configure(options: options)
+        AuthService.shared.configure()
+      }
     }
 
     // Infinite Recall fork: force anonymous local-only mode on every launch.
