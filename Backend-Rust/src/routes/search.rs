@@ -1,11 +1,14 @@
-//! /v1/search — unified search across OCR (screenshots) and audio (transcript segments).
+//! /v1/search — unified search across OCR (screenshots), audio (transcript
+//! segments), and VLM-derived visual activity summaries.
 //!
-//! - `content_type=ocr`   → FTS5 query against `screenshots_fts`
-//! - `content_type=audio` → LIKE on `transcription_segments.text`
-//! - `content_type=both`  → both, merged
+//! - `content_type=ocr`    → FTS5 query against `screenshots_fts`
+//! - `content_type=audio`  → LIKE on `transcription_segments.text`
+//! - `content_type=visual` → FTS5 query against `visual_activity_fts`
+//!                           (visual summary + UI state + OCR snapshot, all from VLM pipeline)
+//! - `content_type=both`   → ocr + audio + visual, merged
 //!
-//! The Swift app maintains FTS5 mirrors for screenshots; transcript segments
-//! have no FTS table so we fall back to LIKE there.
+//! The Swift app maintains FTS5 mirrors for screenshots and visual_activity;
+//! transcript segments have no FTS table so we fall back to LIKE there.
 
 use axum::{
     extract::{Query, State},
@@ -47,6 +50,17 @@ struct AudioHit {
     pub text: String,
 }
 
+#[derive(Debug, Serialize)]
+struct VisualHit {
+    pub visual_activity_id: i64,
+    pub screenshot_id: i64,
+    pub sampled_at: Option<String>,
+    pub app_name: Option<String>,
+    pub window_title: Option<String>,
+    pub visual_summary: Option<String>,
+    pub snippet: String,
+}
+
 pub async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
@@ -59,6 +73,7 @@ pub async fn search(
 
     let want_ocr = kind == "ocr" || kind == "both";
     let want_audio = kind == "audio" || kind == "both";
+    let want_visual = kind == "visual" || kind == "both";
 
     let qstr = q.q.clone();
     let app = q.app.clone();
@@ -68,6 +83,7 @@ pub async fn search(
     let result = with_conn(&state.pool, move |c| {
         let mut ocr_hits: Vec<OcrHit> = Vec::new();
         let mut audio_hits: Vec<AudioHit> = Vec::new();
+        let mut visual_hits: Vec<VisualHit> = Vec::new();
 
         if want_ocr {
             // FTS5 MATCH; sanitize by quoting to treat as a phrase.
@@ -133,11 +149,58 @@ pub async fn search(
             }
         }
 
+        if want_visual {
+            // FTS5 MATCH against the visual_activity FTS mirror. Same
+            // phrase-quoting trick as the OCR branch to stay literal.
+            let fts_query = format!("\"{}\"", qstr.replace('"', " "));
+            let mut sql = String::from(
+                "SELECT v.id, v.screenshotId, v.sampledAt, v.appName, v.windowTitle,
+                        v.visualSummary,
+                        snippet(visual_activity_fts, 0, '<b>', '</b>', '…', 16)
+                 FROM visual_activity_fts
+                 JOIN visual_activity v ON v.rowid = visual_activity_fts.rowid
+                 WHERE visual_activity_fts MATCH ?",
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            params.push(Box::new(fts_query));
+            if let Some(a) = app.clone() {
+                sql.push_str(" AND v.appName = ?");
+                params.push(Box::new(a));
+            }
+            if let Some(s) = start.clone() {
+                sql.push_str(" AND v.sampledAt >= ?");
+                params.push(Box::new(s));
+            }
+            if let Some(e) = end.clone() {
+                sql.push_str(" AND v.sampledAt < ?");
+                params.push(Box::new(e));
+            }
+            sql.push_str(" ORDER BY v.sampledAt DESC LIMIT ?");
+            params.push(Box::new(limit));
+
+            let mut stmt = c.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p.as_ref() as &dyn rusqlite::ToSql).collect();
+            let mut rows = stmt.query(rusqlite::params_from_iter(param_refs))?;
+            while let Some(r) = rows.next()? {
+                visual_hits.push(VisualHit {
+                    visual_activity_id: r.get(0)?,
+                    screenshot_id: r.get(1)?,
+                    sampled_at: r.get(2)?,
+                    app_name: r.get(3)?,
+                    window_title: r.get(4)?,
+                    visual_summary: r.get(5)?,
+                    snippet: r.get(6)?,
+                });
+            }
+        }
+
         Ok::<_, anyhow::Error>(json!({
             "query": qstr,
             "content_type": kind,
             "ocr_hits": ocr_hits,
             "audio_hits": audio_hits,
+            "visual_hits": visual_hits,
         }))
     })
     .await

@@ -71,6 +71,13 @@ actor RewindIndexer {
         Task(priority: .background) {
             await RewindDatabase.shared.reduceOCRDataPrecisionIfNeeded()
         }
+
+        // Visual activity sampler: lifecycle is bound to the indexer so the
+        // sampler comes online once the database is ready and the screenshots
+        // pipeline starts pumping frames into `considerFrame(_:)`.
+        await MainActor.run {
+            VisualActivitySampler.shared.start()
+        }
     }
 
     /// Try to initialize with exponential backoff. Returns true if initialized.
@@ -250,6 +257,12 @@ actor RewindIndexer {
                 }
             }
 
+            // Visual activity sampling: forward to the sampler, which decides
+            // whether this frame is worth a VLM describe() pass.
+            await MainActor.run {
+                Task { await VisualActivitySampler.shared.considerFrame(inserted) }
+            }
+
             // Notify that a new frame was captured (for live UI updates)
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .rewindFrameCaptured, object: nil)
@@ -335,6 +348,12 @@ actor RewindIndexer {
                 Task(priority: .utility) {
                     await OCREmbeddingService.shared.embedScreenshot(id: id, ocrText: ocrText, appName: appName, windowTitle: windowTitle)
                 }
+            }
+
+            // Visual activity sampling: forward to the sampler, which decides
+            // whether this frame is worth a VLM describe() pass.
+            await MainActor.run {
+                Task { await VisualActivitySampler.shared.considerFrame(inserted) }
             }
 
             DispatchQueue.main.async {
@@ -446,6 +465,12 @@ actor RewindIndexer {
                 Task(priority: .utility) {
                     await OCREmbeddingService.shared.embedScreenshot(id: id, ocrText: ocrText, appName: frame.appName, windowTitle: frame.windowTitle)
                 }
+            }
+
+            // Visual activity sampling: forward to the sampler, which decides
+            // whether this frame is worth a VLM describe() pass.
+            await MainActor.run {
+                Task { await VisualActivitySampler.shared.considerFrame(inserted) }
             }
 
             // Notify that a new frame was captured (for live UI updates)
