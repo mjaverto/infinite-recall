@@ -131,6 +131,23 @@ struct SettingsSearchItem: Identifiable {
       ], section: .privacy,
       icon: "lock.shield", settingId: "privacy.localfirst"),
 
+    // AI / Models
+    SettingsSearchItem(
+      name: "Provider",
+      subtitle: "Choose where memory extraction, action items, and chat run",
+      keywords: ["provider", "ai", "llm", "mlx", "anthropic", "openai", "claude", "model"],
+      section: .aiModels, icon: "cpu", settingId: "ai.provider"),
+    SettingsSearchItem(
+      name: "API Keys",
+      subtitle: "Manage Anthropic and OpenAI API keys",
+      keywords: ["api", "keys", "anthropic", "openai", "keychain", "byok"],
+      section: .aiModels, icon: "cpu", settingId: "ai.apikeys"),
+    SettingsSearchItem(
+      name: "Local Model",
+      subtitle: "Install and manage the local MLX server",
+      keywords: ["local", "mlx", "qwen", "model", "server", "launchd", "download"],
+      section: .aiModels, icon: "cpu", settingId: "ai.localmodel"),
+
     // Account
     SettingsSearchItem(
       name: "Account", subtitle: "Your profile and email", keywords: ["profile", "email"],
@@ -294,6 +311,7 @@ struct SettingsSidebar: View {
     .transcription,
     .notifications,
     .privacy,
+    .aiModels,
     .account,
     .floatingBar,
     .shortcuts,
@@ -477,6 +495,7 @@ struct SettingsSidebarItem: View {
     case .transcription: return "waveform"
     case .notifications: return "bell"
     case .privacy: return "lock.shield"
+    case .aiModels: return "cpu"
     case .account: return "person.circle"
     case .aiChat: return "cpu"
     case .floatingBar: return "sparkles"

@@ -297,12 +297,21 @@ struct SettingsContentView: View {
   // Launch at login manager
   @ObservedObject private var launchAtLoginManager = LaunchAtLoginManager.shared
 
+  // AI / Models — provider registry + MLX server lifecycle
+  @ObservedObject private var aiProviderRegistry = AIProviderRegistry.shared
+  @ObservedObject private var mlxLifecycle = MLXLifecycleManager.shared
+
+  // Inline state for API key entry (Anthropic / OpenAI)
+  @State private var anthropicKeyDraft: String = ""
+  @State private var openaiKeyDraft: String = ""
+
   enum SettingsSection: String, CaseIterable {
     case general = "General"
     case rewind = "Rewind"
     case transcription = "Transcription"
     case notifications = "Notifications"
     case privacy = "Privacy"
+    case aiModels = "AI / Models"
     case account = "Account"
     case aiChat = "AI Chat"
     case floatingBar = "Floating Bar"
@@ -453,6 +462,8 @@ struct SettingsContentView: View {
           notificationsSection
         case .privacy:
           privacySection
+        case .aiModels:
+          aiModelsSection
         case .account:
           accountSection
         case .aiChat:
@@ -1653,6 +1664,423 @@ struct SettingsContentView: View {
     selectedSection = .advanced
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
       highlightedSettingId = "advanced.devkeys.info"
+    }
+  }
+
+  // MARK: - AI / Models Section
+
+  /// Display string for an API key — last 4 characters or "Not set".
+  private func maskedKeyDisplay(_ key: String?) -> String {
+    guard let key = key, !key.isEmpty else { return "Not set" }
+    if key.count <= 4 { return "••• \(key)" }
+    return "••• \(key.suffix(4))"
+  }
+
+  /// Resolve the on-disk path to `scripts/setup-mlx-server.sh`.
+  /// The desktop app runs from `/Applications/...` and has no notion of the
+  /// source repo at runtime, so we look in the developer's well-known
+  /// location: `~/src/infinite-recall/scripts/setup-mlx-server.sh`.
+  private var mlxSetupScriptPath: String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    return "\(home)/src/infinite-recall/scripts/setup-mlx-server.sh"
+  }
+
+  /// Open Terminal.app at the given shell command via osascript so the user
+  /// can see the 18 GB model-download confirmation prompt.
+  private func runSetupScriptInTerminal() {
+    let scriptPath = mlxSetupScriptPath
+    let appleScript = """
+      tell application "Terminal"
+        activate
+        do script "bash \(scriptPath.replacingOccurrences(of: " ", with: "\\\\ "))"
+      end tell
+      """
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    task.arguments = ["-e", appleScript]
+    do {
+      try task.run()
+    } catch {
+      // Fall back to revealing the script in Finder so the user can run it manually
+      NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: scriptPath)])
+    }
+  }
+
+  /// Reveal the InfiniteRecall log directory in Finder.
+  private func openLogsFolder() {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let logsDir = home.appendingPathComponent("Library/Logs/InfiniteRecall")
+    // Create it if missing so reveal doesn't silently fail.
+    try? FileManager.default.createDirectory(
+      at: logsDir, withIntermediateDirectories: true)
+    NSWorkspace.shared.open(logsDir)
+  }
+
+  private var aiModelsSection: some View {
+    VStack(spacing: 20) {
+      aiProviderCard
+      aiAPIKeysCard
+      aiLocalModelCard
+    }
+    .onAppear {
+      mlxLifecycle.refreshSync()
+      Task { await mlxLifecycle.refresh() }
+    }
+  }
+
+  // MARK: Provider picker card
+
+  private var aiProviderCard: some View {
+    settingsCard(settingId: "ai.provider") {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 10) {
+          Image(systemName: "cpu")
+            .scaledFont(size: 14)
+            .foregroundColor(OmiColors.purplePrimary)
+            .frame(width: 20)
+
+          Text("AI Provider")
+            .scaledFont(size: 14, weight: .medium)
+            .foregroundColor(OmiColors.textPrimary)
+        }
+
+        Text("Where memory extraction, action items, and chat run.")
+          .scaledFont(size: 13)
+          .foregroundColor(OmiColors.textSecondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+        VStack(spacing: 8) {
+          providerRow(
+            provider: .localMLX,
+            title: "Local MLX (recommended)",
+            subtitle: "Runs on this Mac. No API key needed.",
+            chip: nil,
+            disabled: false
+          )
+          providerRow(
+            provider: .anthropic,
+            title: "Anthropic API",
+            subtitle: "Cloud Claude. Requires your API key. Data leaves this Mac.",
+            chip: "Cloud",
+            disabled: false
+          )
+          providerRow(
+            provider: .openai,
+            title: "OpenAI API",
+            subtitle: "Cloud GPT. Requires your API key. Data leaves this Mac.",
+            chip: "Cloud",
+            disabled: false
+          )
+          providerRow(
+            provider: .localCLI,
+            title: "Local Claude Code CLI",
+            subtitle: "Use your local `claude` CLI. Coming soon.",
+            chip: nil,
+            disabled: true
+          )
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func providerRow(
+    provider: LLMProvider,
+    title: String,
+    subtitle: String,
+    chip: String?,
+    disabled: Bool
+  ) -> some View {
+    let isSelected = aiProviderRegistry.current == provider
+    Button(action: {
+      guard !disabled else { return }
+      aiProviderRegistry.setProvider(provider)
+    }) {
+      HStack(alignment: .top, spacing: 12) {
+        Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+          .scaledFont(size: 16)
+          .foregroundColor(
+            disabled
+              ? OmiColors.textTertiary.opacity(0.4)
+              : (isSelected ? OmiColors.purplePrimary : OmiColors.textTertiary)
+          )
+          .padding(.top, 1)
+
+        VStack(alignment: .leading, spacing: 3) {
+          HStack(spacing: 6) {
+            Text(title)
+              .scaledFont(size: 13, weight: .medium)
+              .foregroundColor(
+                disabled ? OmiColors.textTertiary : OmiColors.textPrimary)
+
+            if let chip = chip {
+              Text(chip)
+                .scaledFont(size: 10, weight: .semibold)
+                .foregroundColor(OmiColors.warning)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                  RoundedRectangle(cornerRadius: 4)
+                    .fill(OmiColors.warning.opacity(0.15))
+                )
+            }
+          }
+
+          Text(subtitle)
+            .scaledFont(size: 12)
+            .foregroundColor(
+              disabled ? OmiColors.textTertiary.opacity(0.6) : OmiColors.textTertiary
+            )
+            .fixedSize(horizontal: false, vertical: true)
+        }
+
+        Spacer()
+      }
+      .padding(.horizontal, 12)
+      .padding(.vertical, 10)
+      .contentShape(Rectangle())
+      .background(
+        RoundedRectangle(cornerRadius: 8)
+          .fill(
+            isSelected
+              ? OmiColors.purplePrimary.opacity(0.08)
+              : OmiColors.backgroundQuaternary.opacity(0.18)
+          )
+          .overlay(
+            RoundedRectangle(cornerRadius: 8)
+              .stroke(
+                isSelected
+                  ? OmiColors.purplePrimary.opacity(0.4) : Color.clear,
+                lineWidth: 1)
+          )
+      )
+    }
+    .buttonStyle(.plain)
+    .disabled(disabled)
+  }
+
+  // MARK: API Keys card
+
+  private var aiAPIKeysCard: some View {
+    settingsCard(settingId: "ai.apikeys") {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 10) {
+          Image(systemName: "key.fill")
+            .scaledFont(size: 14)
+            .foregroundColor(OmiColors.purplePrimary)
+            .frame(width: 20)
+
+          Text("API Keys")
+            .scaledFont(size: 14, weight: .medium)
+            .foregroundColor(OmiColors.textPrimary)
+        }
+
+        apiKeyRow(
+          provider: .anthropic,
+          label: "Anthropic",
+          draft: $anthropicKeyDraft
+        )
+
+        Divider().overlay(OmiColors.backgroundQuaternary)
+
+        apiKeyRow(
+          provider: .openai,
+          label: "OpenAI",
+          draft: $openaiKeyDraft
+        )
+
+        Text(
+          "Keys are stored in your macOS Keychain. Never sent over the network from this app."
+        )
+        .scaledFont(size: 11)
+        .foregroundColor(OmiColors.textTertiary)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.top, 4)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func apiKeyRow(
+    provider: LLMProvider,
+    label: String,
+    draft: Binding<String>
+  ) -> some View {
+    let storedKey = aiProviderRegistry.apiKey(for: provider)
+    let isActiveProvider = aiProviderRegistry.current == provider
+    let dimmed = !isActiveProvider
+
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Text(label)
+          .scaledFont(size: 13, weight: .semibold)
+          .foregroundColor(dimmed ? OmiColors.textTertiary : OmiColors.textPrimary)
+
+        Spacer()
+
+        Text(maskedKeyDisplay(storedKey))
+          .scaledFont(size: 12)
+          .foregroundColor(
+            storedKey == nil ? OmiColors.textTertiary : OmiColors.textSecondary
+          )
+          .monospacedDigit()
+      }
+
+      HStack(spacing: 8) {
+        SecureField("Paste \(label) API key", text: draft)
+          .textFieldStyle(.roundedBorder)
+          .scaledFont(size: 12)
+          .frame(maxWidth: .infinity)
+
+        Button("Save to Keychain") {
+          let trimmed = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+          guard !trimmed.isEmpty else { return }
+          aiProviderRegistry.setAPIKey(trimmed, for: provider)
+          draft.wrappedValue = ""
+        }
+        .buttonStyle(.bordered)
+        .disabled(
+          draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+        if storedKey != nil {
+          Button("Remove") {
+            aiProviderRegistry.clearAPIKey(for: provider)
+          }
+          .buttonStyle(.bordered)
+          .tint(OmiColors.error)
+        }
+      }
+    }
+    .opacity(dimmed ? 0.65 : 1.0)
+  }
+
+  // MARK: Local Model card
+
+  private var aiLocalModelCard: some View {
+    settingsCard(settingId: "ai.localmodel") {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 10) {
+          Image(systemName: "internaldrive")
+            .scaledFont(size: 14)
+            .foregroundColor(OmiColors.purplePrimary)
+            .frame(width: 20)
+
+          Text("Local Model")
+            .scaledFont(size: 14, weight: .medium)
+            .foregroundColor(OmiColors.textPrimary)
+
+          Spacer()
+        }
+
+        // Status rows
+        VStack(alignment: .leading, spacing: 8) {
+          statusRow(
+            ok: mlxLifecycle.serverRunning,
+            okText: "Server: Running",
+            failText: "Server: Stopped"
+          )
+          statusRow(
+            ok: mlxLifecycle.agentInstalled,
+            okText: "launchd agent installed",
+            failText: "launchd agent: Not installed"
+          )
+          statusRow(
+            ok: mlxLifecycle.modelPresent,
+            okText: "Model present",
+            failText: "Model: Not downloaded"
+          )
+
+          if let progress = mlxLifecycle.modelDownloadProgress {
+            VStack(alignment: .leading, spacing: 4) {
+              Text("Downloading model — \(Int(progress * 100))%")
+                .scaledFont(size: 11)
+                .foregroundColor(OmiColors.textTertiary)
+              ProgressView(value: progress)
+                .progressViewStyle(
+                  LinearProgressViewStyle(tint: OmiColors.purplePrimary)
+                )
+            }
+          }
+
+          if let err = mlxLifecycle.lastError, !err.isEmpty {
+            Text(err)
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.warning)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
+
+        Divider().overlay(OmiColors.backgroundQuaternary)
+
+        // Install button (primary)
+        Button(action: { runSetupScriptInTerminal() }) {
+          HStack {
+            Image(systemName: "arrow.down.circle.fill")
+            Text("Install local model")
+              .scaledFont(size: 13, weight: .semibold)
+          }
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 4)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(OmiColors.purplePrimary)
+        .disabled(mlxLifecycle.agentInstalled && mlxLifecycle.modelPresent)
+        .help(
+          mlxLifecycle.agentInstalled && mlxLifecycle.modelPresent
+            ? "Already installed"
+            : "Opens Terminal so you can confirm the ~18 GB model download"
+        )
+
+        // Secondary action row
+        HStack(spacing: 8) {
+          Button("Restart Server") {
+            Task {
+              await mlxLifecycle.startServer()
+              await mlxLifecycle.refresh()
+            }
+          }
+          .buttonStyle(.bordered)
+          .disabled(!mlxLifecycle.agentInstalled)
+
+          Button("Stop Server") {
+            Task {
+              await mlxLifecycle.stopServer()
+              await mlxLifecycle.refresh()
+            }
+          }
+          .buttonStyle(.bordered)
+          .disabled(!mlxLifecycle.agentInstalled || !mlxLifecycle.serverRunning)
+
+          Spacer()
+
+          Button("Open Logs") {
+            openLogsFolder()
+          }
+          .buttonStyle(.bordered)
+        }
+
+        // Footer
+        // TODO: allow selecting alternative MLX models in a future sprint.
+        Text(
+          "Default model: mlx-community/Qwen2.5-32B-Instruct-4bit (~18 GB)"
+        )
+        .scaledFont(size: 11)
+        .foregroundColor(OmiColors.textTertiary)
+        .padding(.top, 4)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func statusRow(ok: Bool, okText: String, failText: String) -> some View {
+    HStack(spacing: 8) {
+      Circle()
+        .fill(ok ? Color.green : OmiColors.error)
+        .frame(width: 8, height: 8)
+      Text(ok ? okText : failText)
+        .scaledFont(size: 12)
+        .foregroundColor(ok ? OmiColors.textPrimary : OmiColors.textSecondary)
+      Spacer()
     }
   }
 
