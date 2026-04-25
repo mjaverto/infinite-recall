@@ -300,8 +300,7 @@ struct LocalAIInstallSheet: View {
           .scaledFont(size: 12)
           .foregroundColor(OmiColors.textSecondary)
       }
-      .toggleStyle(.button)
-      .buttonStyle(.plain)
+      .disclosureGroupStyle(ClickableLabelDisclosureGroupStyle())
 
       Spacer()
 

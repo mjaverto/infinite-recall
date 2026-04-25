@@ -561,6 +561,7 @@ struct SettingsContentView: View {
       .transition(.opacity)
       .animation(.easeInOut(duration: 0.15), value: selectedSection)
     }
+    .disclosureGroupStyle(ClickableLabelDisclosureGroupStyle())
     .onAppear {
       // Infinite Recall fork: redirect deprecated sections (.aiChat, .account) to .advanced / .general.
       if selectedSection == .aiChat {
@@ -8624,6 +8625,38 @@ struct RunningAppChip: View {
     .buttonStyle(.plain)
     .onHover { hovering in
       isHovered = hovering
+    }
+  }
+}
+
+// MARK: - Clickable Label DisclosureGroupStyle
+
+/// Default macOS DisclosureGroup makes only the chevron a hit target — clicking
+/// the label text does nothing. This style wraps the chevron + label in a single
+/// Button so the whole row toggles. Apply via `.disclosureGroupStyle(...)`.
+struct ClickableLabelDisclosureGroupStyle: DisclosureGroupStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    VStack(alignment: .leading, spacing: 0) {
+      Button {
+        withAnimation(.easeInOut(duration: 0.2)) {
+          configuration.isExpanded.toggle()
+        }
+      } label: {
+        HStack(spacing: 6) {
+          Image(systemName: "chevron.right")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(OmiColors.textTertiary)
+            .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
+          configuration.label
+          Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+
+      if configuration.isExpanded {
+        configuration.content
+      }
     }
   }
 }
