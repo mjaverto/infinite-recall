@@ -300,9 +300,14 @@ struct SettingsContentView: View {
   // AI / Models — provider registry + MLX server lifecycle
   @ObservedObject private var aiProviderRegistry = AIProviderRegistry.shared
   @ObservedObject private var mlxLifecycle = MLXLifecycleManager.shared
+  @ObservedObject private var mcpAPI = MCPAPIService.shared
 
   // In-app installer sheet (replaces the prior Terminal-launch flow).
   @State private var presentingInstallSheet: Bool = false
+
+  // MCP API card — expandable response viewer + transient "copied" feedback.
+  @State private var mcpAPIShowResponse: Bool = false
+  @State private var mcpAPICopyFeedback: String? = nil
 
   // Inline state for API key entry (Anthropic / OpenAI)
   @State private var anthropicKeyDraft: String = ""
@@ -1620,10 +1625,13 @@ struct SettingsContentView: View {
       aiProviderCard
       aiAPIKeysCard
       aiLocalModelCard
+      aiMCPAPICard
     }
     .onAppear {
       mlxLifecycle.refreshSync()
       Task { await mlxLifecycle.refresh() }
+      mcpAPI.refreshSync()
+      Task { await mcpAPI.refresh() }
     }
   }
 
@@ -1982,6 +1990,240 @@ struct SettingsContentView: View {
         .scaledFont(size: 12)
         .foregroundColor(ok ? OmiColors.textPrimary : OmiColors.textSecondary)
       Spacer()
+    }
+  }
+
+  // MARK: MCP API card
+
+  private var aiMCPAPICard: some View {
+    settingsCard(settingId: "ai.mcpapi") {
+      VStack(alignment: .leading, spacing: 14) {
+        // Header
+        HStack(spacing: 10) {
+          Image(systemName: "network")
+            .scaledFont(size: 14)
+            .foregroundColor(OmiColors.purplePrimary)
+            .frame(width: 20)
+
+          Text("MCP API")
+            .scaledFont(size: 14, weight: .medium)
+            .foregroundColor(OmiColors.textPrimary)
+
+          Spacer()
+        }
+
+        Text(
+          "Local read-only HTTP API. Connects MCP-compatible clients "
+            + "(Claude Code, Cursor) to your conversations and memories."
+        )
+        .scaledFont(size: 13)
+        .foregroundColor(OmiColors.textSecondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+        // Status block
+        VStack(alignment: .leading, spacing: 8) {
+          statusRow(
+            ok: mcpAPI.isRunning,
+            okText: "Server: Running",
+            failText: mcpAPI.isInstalled ? "Server: Stopped" : "Server: Not installed"
+          )
+
+          HStack(spacing: 8) {
+            Text("Endpoint:")
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textTertiary)
+              .frame(width: 70, alignment: .leading)
+            Text(MCPAPIService.baseURL.absoluteString)
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textSecondary)
+              .textSelection(.enabled)
+              .monospacedDigit()
+            Spacer()
+          }
+
+          HStack(spacing: 8) {
+            Text("Token:")
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textTertiary)
+              .frame(width: 70, alignment: .leading)
+            Text(mcpAPI.maskedToken())
+              .scaledFont(size: 12)
+              .foregroundColor(
+                mcpAPI.apiToken == nil ? OmiColors.warning : OmiColors.textSecondary
+              )
+              .textSelection(.enabled)
+            Spacer()
+            Button("Copy") {
+              if mcpAPI.copyToken() {
+                showMCPCopyFeedback("Token copied")
+              } else {
+                showMCPCopyFeedback("No token to copy")
+              }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(mcpAPI.apiToken == nil)
+          }
+        }
+
+        Divider().overlay(OmiColors.backgroundQuaternary)
+
+        // Primary action(s).
+        if !mcpAPI.isInstalled {
+          Button(action: { presentingInstallSheet = true }) {
+            HStack {
+              Image(systemName: "arrow.down.circle.fill")
+              Text("Install MCP API")
+                .scaledFont(size: 13, weight: .semibold)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+          }
+          .buttonStyle(.borderedProminent)
+          .tint(OmiColors.purplePrimary)
+          .help(
+            "Builds the local Rust API daemon and registers a launchd agent so it starts at login."
+          )
+          .sheet(isPresented: $presentingInstallSheet) {
+            LocalAIInstallSheet()
+          }
+        }
+
+        // Secondary actions: start/stop/test always visible (disabled when
+        // not applicable), so the row geometry doesn't jump as state flips.
+        HStack(spacing: 8) {
+          Button("Start") {
+            Task {
+              await mcpAPI.startServer()
+              await mcpAPI.refresh()
+            }
+          }
+          .buttonStyle(.bordered)
+          .disabled(!mcpAPI.isInstalled || mcpAPI.isRunning)
+
+          Button("Stop") {
+            Task {
+              await mcpAPI.stopServer()
+              await mcpAPI.refresh()
+            }
+          }
+          .buttonStyle(.bordered)
+          .disabled(!mcpAPI.isInstalled || !mcpAPI.isRunning)
+
+          Button("Test connection") {
+            Task { await mcpAPI.testConnection() }
+          }
+          .buttonStyle(.bordered)
+          .disabled(mcpAPITestingInFlight)
+
+          Spacer()
+        }
+
+        Button("Copy claude mcp add command") {
+          if mcpAPI.copyClaudeMCPAddCommand() {
+            showMCPCopyFeedback("Command copied")
+          } else {
+            showMCPCopyFeedback("Need a token first")
+          }
+        }
+        .buttonStyle(.bordered)
+        .disabled(mcpAPI.apiToken == nil)
+        .help(
+          "Pastes the npx mcp-rest-bridge invocation that wires this API into Claude Code."
+        )
+
+        if let feedback = mcpAPICopyFeedback {
+          Text(feedback)
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textTertiary)
+        }
+
+        // Test result strip
+        mcpAPITestResultRow
+
+        // Expandable response viewer (only when we have something to show).
+        if !mcpAPI.lastTestResponse.isEmpty {
+          DisclosureGroup(isExpanded: $mcpAPIShowResponse) {
+            ScrollView {
+              Text(mcpAPI.lastTestResponse)
+                .scaledFont(size: 11)
+                .foregroundColor(OmiColors.textSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .monospaced()
+            }
+            .frame(maxHeight: 220)
+            .background(
+              RoundedRectangle(cornerRadius: 6)
+                .fill(OmiColors.backgroundQuaternary.opacity(0.3))
+            )
+            .padding(.top, 4)
+          } label: {
+            Text("Show response")
+              .scaledFont(size: 12)
+              .foregroundColor(OmiColors.textTertiary)
+          }
+        }
+
+        // Footer
+        Text(
+          "Token at ~/Library/Application Support/InfiniteRecall/api-token.txt (mode 0600)."
+        )
+        .scaledFont(size: 11)
+        .foregroundColor(OmiColors.textTertiary)
+        .padding(.top, 4)
+      }
+    }
+  }
+
+  /// True while a `testConnection()` is in flight — used to disable the
+  /// Test button so users can't queue overlapping requests.
+  private var mcpAPITestingInFlight: Bool {
+    if case .testing = mcpAPI.lastTestStatus { return true }
+    return false
+  }
+
+  @ViewBuilder
+  private var mcpAPITestResultRow: some View {
+    switch mcpAPI.lastTestStatus {
+    case .idle:
+      EmptyView()
+    case .testing:
+      HStack(spacing: 6) {
+        ProgressView().controlSize(.small)
+        Text("Testing…")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textTertiary)
+      }
+    case .ok(let status, let elapsed):
+      HStack(spacing: 6) {
+        Image(systemName: "checkmark.circle.fill")
+          .foregroundColor(OmiColors.success)
+        Text("Last test: \(status) OK · \(elapsed) ms")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+      }
+    case .failed(let message):
+      HStack(alignment: .top, spacing: 6) {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundColor(OmiColors.warning)
+        Text(message)
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.warning)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+
+  /// Show a transient pasteboard-feedback toast; auto-clears after 1.5s.
+  private func showMCPCopyFeedback(_ message: String) {
+    mcpAPICopyFeedback = message
+    let token = message
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+      if mcpAPICopyFeedback == token {
+        mcpAPICopyFeedback = nil
+      }
     }
   }
 
