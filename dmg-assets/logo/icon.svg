@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Infinite Recall">
+  <title>Infinite Recall</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B3CFF"/>
+      <stop offset="1" stop-color="#2B1B8B"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded square background, corner radius ~22% (225/1024) -->
+  <rect x="0" y="0" width="1024" height="1024" rx="225" ry="225" fill="url(#bg)"/>
+  <!-- infinity glyph: single continuous cubic-bezier path, centered at (512,512) -->
+  <!-- Path traces a smooth lemniscate. Stroke width ~104 (~10% of side). -->
+  <path d="M 512 512
+           C 512 380, 612 308, 712 308
+           C 824 308, 904 392, 904 512
+           C 904 632, 824 716, 712 716
+           C 612 716, 512 644, 512 512
+           C 512 380, 412 308, 312 308
+           C 200 308, 120 392, 120 512
+           C 120 632, 200 716, 312 716
+           C 412 716, 512 644, 512 512 Z"
+        fill="none"
+        stroke="#FFFFFF"
+        stroke-width="104"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+  <!-- recording dot inside right lobe (~6% diameter) -->
+  <circle cx="712" cy="512" r="32" fill="#FF4D4D"/>
+</svg>
