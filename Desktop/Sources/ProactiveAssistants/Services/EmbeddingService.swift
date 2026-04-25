@@ -1,56 +1,131 @@
 import Accelerate
 import Foundation
+import NaturalLanguage
 
-/// Actor-based service for embeddings using Gemini (3072-dim)
+/// Actor-based service for on-device embeddings using Apple's NaturalLanguage
+/// framework (NLEmbedding.sentenceEmbedding(for: .english), 512-dim).
+///
+/// Embeddings via Apple NLEmbedding — on-device, no download. L2-normalized
+/// so cosine similarity reduces to a simple dot product (see vDSP path in
+/// `cosineSimilarity`).
+///
+/// Upgrade path: if quality is insufficient, swap `Self.loadModel` to load a
+/// Core ML port of `mxbai-embed-large-v1` or `snowflake-arctic-embed-m`,
+/// update `embeddingDimension`, and run a one-shot rebuild against existing
+/// rows. Old rows are filtered out at search time by exact-dimension match
+/// (see `dataToFloats`).
 actor EmbeddingService {
   static let shared = EmbeddingService()
 
-  /// Gemini embedding-001 outputs 3072 dimensions by default
-  static let embeddingDimension = 3072
-  static var modelName: String { ModelQoS.Gemini.embedding }
+  /// Apple NLEmbedding sentence model is 512-dim on English (macOS 14+).
+  /// Validated at first load; if Apple ever changes this we'll log + clamp.
+  static let embeddingDimension = 512
+  static let modelName = "NLEmbedding.sentenceEmbedding(.english)"
 
   /// In-memory index: action_item.id -> normalized embedding
   private var index: [Int64: [Float]] = [:]
   private var isIndexLoaded = false
 
-  /// Cap in-memory embeddings to limit memory (~12KB each, 5000 = ~60MB max)
+  /// Cap in-memory embeddings to limit memory (~2KB each at 512-dim, 5000 = ~10MB max)
   private let maxIndexSize = 5000
-
-  /// Backend proxy base URL (from OMI_API_URL env var)
-  private static var proxyBaseURL: String {
-    if let cString = getenv("OMI_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty {
-      return url.hasSuffix("/") ? url : url + "/"
-    }
-    return ""
-  }
-
-  /// Get Firebase auth header for proxy requests
-  private func authHeader() async throws -> String {
-    let authService = await MainActor.run { AuthService.shared }
-    return try await authService.getAuthHeader()
-  }
 
   private init() {}
 
-  // MARK: - Embedding API
+  // MARK: - Model Loading
 
-  /// Generate embedding for a single text. Currently returns a zero-vector
-  /// placeholder because the v1 local LLM provider (mlx-lm.server, OpenAI-compat
-  /// chat only) does not expose an embeddings endpoint. Vector similarity search
-  /// will degrade to "no useful match" until a local embedding model lands.
-  /// TODO(local-embeddings): ship a real local embedding model (e.g. nomic-embed
-  /// via a sidecar) and route this call through it.
-  func embed(text: String, taskType: String? = nil) async throws -> [Float] {
-    log("[embeddings] not supported by current provider — using placeholder")
-    return [Float](repeating: 0, count: Self.embeddingDimension)
+  /// Lazily-loaded NLEmbedding models. Loading is heavy (mmaps a model file),
+  /// so we do it once. `nonisolated(unsafe)` is fine because NLEmbedding is
+  /// thread-safe for inference and we only assign once via dispatch_once
+  /// semantics in Swift's lazy static.
+  private struct Models {
+    let sentence: NLEmbedding?
+    let word: NLEmbedding?
   }
 
-  /// Batch embed multiple texts. Returns zero-vector placeholders, see `embed`.
-  /// TODO(local-embeddings): ship a real local embedding model.
+  private static let models: Models = {
+    let sentence = NLEmbedding.sentenceEmbedding(for: .english)
+    let word = NLEmbedding.wordEmbedding(for: .english)
+    if let s = sentence {
+      log("EmbeddingService: loaded NLEmbedding.sentence (\(s.dimension)-dim)")
+    } else if let w = word {
+      log("EmbeddingService: sentence model unavailable, falling back to word embeddings (\(w.dimension)-dim, will average)")
+    } else {
+      logError("EmbeddingService: no NLEmbedding models available for English — returning zero vectors")
+    }
+    return Models(sentence: sentence, word: word)
+  }()
+
+  // MARK: - Embedding API
+
+  /// Embed a single text using Apple NLEmbedding (on-device).
+  /// L2-normalized output. Empty/whitespace input returns the zero vector
+  /// (signal "no info"). `taskType` is accepted for source-compat with the
+  /// previous Gemini-shaped API but is unused locally.
+  func embed(text: String, taskType: String? = nil) async throws -> [Float] {
+    return Self.embedSync(text)
+  }
+
+  /// Batch embed. NLEmbedding has no true batch API — we just loop.
+  /// Still cheap because the model is loaded once and inference is local.
   func embedBatch(texts: [String], taskType: String? = nil) async throws -> [[Float]] {
-    log("[embeddings] not supported by current provider — using placeholder (texts=\(texts.count))")
-    let zero = [Float](repeating: 0, count: Self.embeddingDimension)
-    return Array(repeating: zero, count: texts.count)
+    return texts.map { Self.embedSync($0) }
+  }
+
+  /// Compute a normalized embedding synchronously. Internal helper; safe to
+  /// call from any thread because NLEmbedding inference is thread-safe and
+  /// the model is a let-bound static.
+  private static func embedSync(_ text: String) -> [Float] {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      return [Float](repeating: 0, count: embeddingDimension)
+    }
+
+    // Prefer the sentence model.
+    if let sentence = models.sentence,
+       let vec = sentence.vector(for: trimmed) {
+      return normalizeAndPad(vec, target: embeddingDimension)
+    }
+
+    // Fall back to averaging word embeddings.
+    if let word = models.word {
+      var sum = [Double](repeating: 0, count: word.dimension)
+      var count = 0
+      // Tokenize with NLTokenizer for proper word boundaries.
+      let tokenizer = NLTokenizer(unit: .word)
+      tokenizer.string = trimmed
+      tokenizer.enumerateTokens(in: trimmed.startIndex..<trimmed.endIndex) { range, _ in
+        let token = String(trimmed[range]).lowercased()
+        if let v = word.vector(for: token) {
+          for i in 0..<min(v.count, sum.count) { sum[i] += v[i] }
+          count += 1
+        }
+        return true
+      }
+      if count > 0 {
+        let avg = sum.map { $0 / Double(count) }
+        return normalizeAndPad(avg, target: embeddingDimension)
+      }
+    }
+
+    return [Float](repeating: 0, count: embeddingDimension)
+  }
+
+  /// L2-normalize a Double vector and project it to `target` dimension
+  /// (truncate if longer, zero-pad if shorter). Returns Float for storage.
+  private static func normalizeAndPad(_ vec: [Double], target: Int) -> [Float] {
+    var floats = [Float](repeating: 0, count: target)
+    let n = min(vec.count, target)
+    for i in 0..<n { floats[i] = Float(vec[i]) }
+
+    // L2 normalize
+    var norm: Float = 0
+    vDSP_svesq(floats, 1, &norm, vDSP_Length(target))
+    norm = sqrt(norm)
+    guard norm > 0 else { return floats }
+    var divisor = norm
+    var result = [Float](repeating: 0, count: target)
+    vDSP_vsdiv(floats, 1, &divisor, &result, 1, vDSP_Length(target))
+    return result
   }
 
   // MARK: - In-Memory Index
@@ -216,7 +291,9 @@ actor EmbeddingService {
     }
   }
 
-  /// Convert Data (BLOB) back to [Float] (expects 3072-dim Gemini embeddings)
+  /// Convert Data (BLOB) back to [Float]. Returns nil when the BLOB does not
+  /// match `embeddingDimension` — this filters out stale rows (e.g. legacy
+  /// 3072-dim Gemini zero placeholders) at search time without a migration.
   func dataToFloats(_ data: Data) -> [Float]? {
     let floatSize = MemoryLayout<Float>.size
     let floatCount = data.count / floatSize
