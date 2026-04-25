@@ -2430,6 +2430,24 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 }
             }
 
+            // Retrieve relevant local context (transcripts, visual activity, memories,
+            // action items) and append to this turn's system prompt.
+            // LocalRAGService is nonisolated-safe to call from here; it has its own actor.
+            let ragContext = await LocalRAGService.shared.buildContext(for: trimmedText)
+            if !ragContext.isEmpty {
+                systemPrompt += """
+
+
+<local_context>
+The following is retrieved from the user's local data (conversations, screen activity, \
+memories, and tasks). It is authoritative and up-to-date. Reference it when relevant. \
+Do NOT claim you have no access to the user's data — you do, and this is it.
+
+\(ragContext)
+</local_context>
+"""
+            }
+
             // Build OpenAI-style message history for LocalLLMClient.
             // System prompt goes first, then all prior non-streaming turns, then the
             // new user message (already appended to messages[] above).

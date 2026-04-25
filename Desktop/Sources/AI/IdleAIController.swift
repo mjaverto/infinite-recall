@@ -1,4 +1,5 @@
-// Infinite Recall fork: idle-unload for both local AI sidecars.
+// Infinite Recall fork: idle-unload for both local AI sidecars and the
+// on-device pyannote diarizer.
 //
 // IdleAIController watches both system input idle (via Quartz CGEventSource)
 // and time-since-last-AI-call. When both exceed `idleTimeoutMinutes` AND the
@@ -9,13 +10,18 @@
 // callers before each HTTP issue.
 //
 // The mlx-lm.server holds ~7-9 GB resident; mlx-vlm.server holds ~6-8 GB.
-// On a 36 GB machine reclaiming both when the user steps away is worth the
-// ~30s cold-start cost the user has explicitly accepted.
+// The pyannote CoreML diarizer holds ~80-120 MB.
+// On a 36 GB machine reclaiming all of them when the user steps away is worth
+// the cold-start cost the user has explicitly accepted.
 //
 // INVARIANT: `VisionLLMClient.isReachable()` must NEVER call `recordAICall()`.
 // It is used as the polling probe inside `VLMLifecycleManager.ensureServerRunning()`
 // and would pin the VLM server alive indefinitely if instrumented. Same lesson
 // as Sprint BB for the text tier (`LocalLLMClient.isReachable()`).
+//
+// INVARIANT: No polling probe (e.g. reachability checks) should ever call
+// `recordAICall()`. Doing so pins the respective server alive indefinitely,
+// defeating idle eviction.
 
 import AppKit
 import Combine
@@ -55,6 +61,10 @@ final class IdleAIController: ObservableObject {
   /// True iff we (this controller) stopped the vision LLM server because of idle.
   /// Mirrors `serverStoppedByIdle` for the VLM tier.
   @Published private(set) var vlmStoppedByIdle: Bool = false
+
+  /// True iff we unloaded the pyannote diarizer because of idle (no audio for
+  /// 60 s). PyannoteLifecycleManager.loadIfNeeded() reloads on next appendAudio.
+  @Published private(set) var pyannoteUnloadedByIdle: Bool = false
 
   /// Briefly true while we're issuing a restart/stop, for UI status.
   @Published private(set) var isTransitioning: Bool = false
@@ -163,6 +173,20 @@ final class IdleAIController: ObservableObject {
         log("IdleAIController: vision LLM server stopped (idle).")
       } else {
         log("IdleAIController: stopServer() (vision) returned false — leaving state alone.")
+      }
+    }
+
+    // ── Pyannote diarizer tier ────────────────────────────────────────────────
+    // Trigger: 60 s no audio (system idle threshold covers this). Unload the
+    // CoreML models (~80-120 MB) so memory is reclaimed while idle. The next
+    // SpeakerDiarizationService.start() call will trigger a reload via
+    // PyannoteLifecycleManager.loadIfNeeded().
+    if #available(macOS 13, *) {
+      if PyannoteLifecycleManager.shared.speakerKit != nil {
+        log("IdleAIController: idle thresholds met — unloading pyannote diarizer")
+        await PyannoteLifecycleManager.shared.unload()
+        pyannoteUnloadedByIdle = true
+        log("IdleAIController: pyannote diarizer unloaded (idle).")
       }
     }
   }

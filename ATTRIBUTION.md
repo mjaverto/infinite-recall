@@ -47,18 +47,40 @@ Infinite Recall is a **local-first** rework. Major changes from Omi:
 
 ## On-device speaker diarization
 
-The `Desktop/Sources/Diarization/` module ships a lightweight, fully on-device
-speaker diarization pipeline. v1 uses a deterministic MFCC-based embedding
-(no model files, no downloads) computed via Apple's Accelerate framework.
+The `Desktop/Sources/Diarization/` module ships a fully on-device speaker
+diarization pipeline with two backends selectable via the `diarizationEngine`
+UserDefaults key (default `"mfcc"`).
+
+### MFCC backend (v1, default)
 
 - **Approach**: 26-dim L2-normalized MFCC mean+std embedding per speech turn,
   cosine-matched to per-person centroids (threshold 0.65) stored in GRDB.
 - **VAD**: simple energy-based with hangover; intentionally kept minimal so
   failures here can't block the always-on capture pipeline.
-- **No external model is downloaded**. A neural embedding (pyannote-audio
-  segmentation + WeSpeaker, ported to Core ML or ONNX) can drop into the same
-  `MFCCExtractor.embed(samples:)` interface later — see TODOs in
-  `SpeakerDiarizationService.swift`.
+- **No external model is downloaded.**
 - **License**: Original code, MIT-licensed under this project.
+
+### Pyannote backend (v2, behind feature flag)
+
+The `"pyannote"` engine uses **Argmax SpeakerKit** — a CoreML port of the
+pyannote-audio v3/v4 diarization pipeline bundled with WhisperKit.
+
+#### Argmax SpeakerKit
+
+- **Source**: https://github.com/argmaxinc/WhisperKit (`Sources/SpeakerKit/`)
+- **Model weights**: https://huggingface.co/argmaxinc/speakerkit-coreml
+- **License**: MIT (© 2024 Argmax, Inc.)
+- **Components**: pyannote-v3 SpeakerSegmenter, pyannote-v3 SpeakerEmbedder,
+  pyannote-v4 PldaProjector, VBxClustering (pure Swift)
+- **Download**: ~80–120 MB CoreML models fetched on first use from HF
+
+#### pyannote-audio (community-1 model weights)
+
+The CoreML weights in `argmaxinc/speakerkit-coreml` are Argmax's conversion of
+the pyannote-community-1 checkpoint, which is itself MIT-licensed.
+
+- **Source**: https://github.com/pyannote/pyannote-audio
+- **License**: MIT (© pyannote contributors)
+- **Community model**: pyannote/speaker-diarization-3.1 community checkpoint
 
 The architectural blueprint is in `~/.claude/plans/stop-all-versions-of-humble-hennessy.md`.

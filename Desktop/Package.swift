@@ -49,6 +49,7 @@ let package = Package(
         .product(name: "MarkdownUI", package: "swift-markdown-ui"),
         .product(name: "onnxruntime", package: "onnxruntime-swift-package-manager"),
         .product(name: "WhisperKit", package: "WhisperKit"),
+        .product(name: "SpeakerKit", package: "WhisperKit"),
       ],
       path: "Sources",
       resources: [
