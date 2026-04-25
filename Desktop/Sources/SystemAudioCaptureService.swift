@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AppKit
 import CoreAudio
 
 /// Service for capturing system audio using Core Audio Taps (macOS 14.4+)
@@ -52,6 +53,7 @@ class SystemAudioCaptureService: @unchecked Sendable {
     private var isCapturing = false
     private var onAudioChunk: AudioChunkHandler?
     private var onAudioLevel: AudioLevelHandler?
+    private var excludedBundleIDs: [String] = []
 
     /// Target sample rate for DeepGram
     private let targetSampleRate: Double = 16000
@@ -94,7 +96,14 @@ class SystemAudioCaptureService: @unchecked Sendable {
     /// - Parameters:
     ///   - onAudioChunk: Callback receiving 16-bit PCM audio data chunks at 16kHz mono
     ///   - onAudioLevel: Optional callback receiving normalized audio level (0.0 - 1.0)
-    func startCapture(onAudioChunk: @escaping AudioChunkHandler, onAudioLevel: AudioLevelHandler? = nil) async throws {
+    ///   - excludedBundleIDs: Bundle IDs whose currently-running processes should be
+    ///     excluded from the global tap. Resolved to PIDs via NSWorkspace at start time;
+    ///     apps launched after capture starts are NOT excluded until a restart.
+    func startCapture(
+        onAudioChunk: @escaping AudioChunkHandler,
+        onAudioLevel: AudioLevelHandler? = nil,
+        excludedBundleIDs: [String] = []
+    ) async throws {
         guard !isCapturing else {
             log("SystemAudioCapture: Already capturing")
             return
@@ -102,6 +111,7 @@ class SystemAudioCaptureService: @unchecked Sendable {
 
         self.onAudioChunk = onAudioChunk
         self.onAudioLevel = onAudioLevel
+        self.excludedBundleIDs = excludedBundleIDs
 
         // All CoreAudio HAL calls (CreateTap, CreateAggregateDevice, AudioDeviceStart) are
         // synchronous IPC to coreaudiod via mach_msg. After wake from sleep the daemon can
@@ -123,10 +133,31 @@ class SystemAudioCaptureService: @unchecked Sendable {
         }
     }
 
+    /// Resolves bundle IDs to PIDs of currently running processes. Multiple
+    /// instances (helpers, agents) of the same bundle ID all get excluded.
+    private func resolveExcludedPIDs(from bundleIDs: [String]) -> [AudioObjectID] {
+        guard !bundleIDs.isEmpty else { return [] }
+        let wanted = Set(bundleIDs)
+        return NSWorkspace.shared.runningApplications
+            .filter { app in
+                guard let id = app.bundleIdentifier else { return false }
+                return wanted.contains(id)
+            }
+            .map { AudioObjectID($0.processIdentifier) }
+    }
+
     /// Performs all blocking CoreAudio HAL setup. Must be called on audioQueue, not the main thread.
     private func startCaptureOnQueue() throws {
-        // 1. Create tap description for all system audio
-        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        // 1. Create tap description for all system audio, excluding any user-selected apps.
+        // Bundle IDs are resolved to PIDs against currently-running apps. Apps launched
+        // after this point will NOT be excluded until capture restarts — that's a known
+        // limitation (avoiding the complexity of observing didLaunchApplication and
+        // re-creating the tap mid-session).
+        let excludedPIDs: [AudioObjectID] = resolveExcludedPIDs(from: excludedBundleIDs)
+        if !excludedPIDs.isEmpty {
+            log("SystemAudioCapture: Excluding \(excludedPIDs.count) PID(s) from tap: \(excludedBundleIDs)")
+        }
+        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: excludedPIDs)
         tapDescription.uuid = tapUUID
         tapDescription.name = "OMI System Audio Tap"
         tapDescription.muteBehavior = .unmuted  // Don't mute playback

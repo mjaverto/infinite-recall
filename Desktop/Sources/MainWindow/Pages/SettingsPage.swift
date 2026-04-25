@@ -738,6 +738,11 @@ struct SettingsContentView: View {
         }
       }
 
+      // Excluded apps for system audio capture
+      settingsCard(settingId: "general.audioexclusion") {
+        ExcludedAudioAppsCard()
+      }
+
       // Notifications toggle
       settingsCard(settingId: "general.notifications") {
         VStack(spacing: 12) {
@@ -8620,6 +8625,135 @@ struct RunningAppChip: View {
     .onHover { hovering in
       isHovered = hovering
     }
+  }
+}
+
+// MARK: - Excluded Audio Apps Card
+
+/// Lets the user exclude specific apps from system audio capture so their
+/// playback (music, podcasts, video) isn't transcribed. Bundle IDs persist
+/// in `AudioExclusionStore`; resolution to PIDs happens in
+/// `SystemAudioCaptureService` at start time. Restart Audio Recording
+/// to apply changes.
+struct ExcludedAudioAppsCard: View {
+  @State private var excludedBundleIDs: [String] = AudioExclusionStore.currentBundleIDs()
+  @State private var refreshTick = 0
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(spacing: 16) {
+        Image(systemName: "speaker.slash.fill")
+          .scaledFont(size: 16)
+          .foregroundColor(OmiColors.purplePrimary)
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text("Excluded Apps (audio)")
+            .scaledFont(size: 16, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+
+          Text(
+            excludedBundleIDs.isEmpty
+              ? "Skip transcribing system audio from selected apps."
+              : "\(excludedBundleIDs.count) app\(excludedBundleIDs.count == 1 ? "" : "s") excluded. Restart Audio Recording to apply."
+          )
+          .scaledFont(size: 13)
+          .foregroundColor(OmiColors.textTertiary)
+        }
+
+        Spacer()
+
+        Button {
+          presentAddAppPanel()
+        } label: {
+          Label("Add app…", systemImage: "plus")
+            .scaledFont(size: 13)
+        }
+        .buttonStyle(.bordered)
+      }
+
+      if !excludedBundleIDs.isEmpty {
+        Divider()
+        VStack(spacing: 4) {
+          ForEach(excludedBundleIDs, id: \.self) { bundleID in
+            HStack(spacing: 10) {
+              if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
+                  .resizable()
+                  .frame(width: 20, height: 20)
+              } else {
+                Image(systemName: "app.dashed")
+                  .scaledFont(size: 16)
+                  .frame(width: 20, height: 20)
+                  .foregroundColor(OmiColors.textTertiary)
+              }
+
+              VStack(alignment: .leading, spacing: 0) {
+                Text(displayName(for: bundleID))
+                  .scaledFont(size: 13, weight: .medium)
+                  .foregroundColor(OmiColors.textPrimary)
+                Text(bundleID)
+                  .scaledFont(size: 11)
+                  .foregroundColor(OmiColors.textTertiary)
+              }
+
+              Spacer()
+
+              Button {
+                AudioExclusionStore.remove(bundleID)
+                excludedBundleIDs = AudioExclusionStore.currentBundleIDs()
+              } label: {
+                Image(systemName: "xmark.circle.fill")
+                  .scaledFont(size: 16)
+                  .foregroundColor(OmiColors.textTertiary)
+              }
+              .buttonStyle(.plain)
+              .help("Remove from exclusion list")
+            }
+            .padding(.vertical, 4)
+          }
+        }
+      }
+    }
+    .id(refreshTick)
+    .onReceive(NotificationCenter.default.publisher(for: AudioExclusionStore.didChange)) { _ in
+      excludedBundleIDs = AudioExclusionStore.currentBundleIDs()
+      refreshTick &+= 1
+    }
+  }
+
+  private func displayName(for bundleID: String) -> String {
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+       let bundle = Bundle(url: url),
+       let name = bundle.infoDictionary?["CFBundleName"] as? String,
+       !name.isEmpty
+    {
+      return name
+    }
+    if let app = NSWorkspace.shared.runningApplications
+      .first(where: { $0.bundleIdentifier == bundleID }),
+      let name = app.localizedName, !name.isEmpty
+    {
+      return name
+    }
+    return bundleID
+  }
+
+  private func presentAddAppPanel() {
+    let panel = NSOpenPanel()
+    panel.allowedContentTypes = [.application]
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    panel.directoryURL = URL(fileURLWithPath: "/Applications")
+    panel.message = "Choose an app whose system audio should NOT be transcribed."
+    panel.prompt = "Exclude"
+
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    guard let bundle = Bundle(url: url), let id = bundle.bundleIdentifier else {
+      NSSound.beep()
+      return
+    }
+    AudioExclusionStore.add(id)
+    excludedBundleIDs = AudioExclusionStore.currentBundleIDs()
   }
 }
 

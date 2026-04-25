@@ -1471,13 +1471,15 @@ class AppState: ObservableObject {
       if #available(macOS 14.4, *) {
         if let systemService = systemAudioCaptureService as? SystemAudioCaptureService {
           do {
+            let excluded = AudioExclusionStore.currentBundleIDs()
             try await systemService.startCapture(
               onAudioChunk: { [weak self] audioData in
                 self?.audioMixer?.setSystemAudio(audioData)
               },
               onAudioLevel: { level in
                 AudioLevelMonitor.shared.updateSystemLevel(level)
-              }
+              },
+              excludedBundleIDs: excluded
             )
             log("Transcription: System audio capture started (→ mixer, mono sum)")
           } catch {
