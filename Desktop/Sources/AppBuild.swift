@@ -161,6 +161,11 @@ enum AppBuild {
       return fallback
     }
 
+    // Infinite Recall fork: appcast URL nilled, no Sparkle update check.
+    guard let appcastURL = desktopAppcastURL else {
+      return fallback
+    }
+
     let configuration = URLSessionConfiguration.ephemeral
     configuration.timeoutIntervalForRequest = timeout
     configuration.timeoutIntervalForResource = timeout
@@ -169,7 +174,7 @@ enum AppBuild {
     let semaphore = DispatchSemaphore(value: 0)
     var appcastXML: String?
 
-    let task = session.dataTask(with: desktopAppcastURL) { data, _, _ in
+    let task = session.dataTask(with: appcastURL) { data, _, _ in
       defer { semaphore.signal() }
       guard let data, let xml = String(data: data, encoding: .utf8) else { return }
       appcastXML = xml
