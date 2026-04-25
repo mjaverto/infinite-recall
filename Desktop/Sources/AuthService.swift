@@ -236,6 +236,23 @@ class AuthService {
         }
     }
 
+    // MARK: - Anonymous Local Mode (Infinite Recall fork)
+
+    /// Force the auth state to "signed in as anonymous local user" without
+    /// touching Firebase. Called unconditionally at app start by OmiApp so
+    /// the app boots straight to the main UI. Safe to call repeatedly.
+    @MainActor
+    func signInAnonymously() {
+        let anonymousUserId = "anonymous"
+        self.isSignedIn = true
+        AuthState.shared.userEmail = nil
+        AuthState.shared.isRestoringAuth = false
+        // Persist user id so RewindDatabase / APIClient pick the right per-user path.
+        UserDefaults.standard.set(anonymousUserId, forKey: kAuthUserId)
+        saveAuthState(isSignedIn: true, email: nil, userId: anonymousUserId)
+        log("Anonymous local-only mode active")
+    }
+
     // MARK: - Sign in with Apple (Native with Web OAuth Fallback)
 
     @MainActor

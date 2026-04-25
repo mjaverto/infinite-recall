@@ -349,6 +349,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       AuthService.shared.configure()
     }
 
+    // Infinite Recall fork: force anonymous local-only mode on every launch.
+    // This unconditionally bypasses the Apple/Google/Firebase sign-in gate so
+    // the app boots straight into the main UI. Auto-completes onboarding too,
+    // so screen-recording / mic / accessibility permissions are requested on
+    // first use rather than gated behind an onboarding wizard.
+    AuthService.shared.signInAnonymously()
+    UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+
     // Initialize analytics (MixPanel + PostHog)
     AnalyticsManager.shared.initialize()
     AnalyticsManager.shared.detectAndReportCrash()
