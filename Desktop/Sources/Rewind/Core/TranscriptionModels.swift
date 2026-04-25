@@ -459,7 +459,10 @@ extension TranscriptionSessionRecord {
     /// Convert local record back to ServerConversation for UI display
     /// Requires segments to be passed in (fetched separately)
     func toServerConversation(segments: [TranscriptionSegmentRecord]) -> ServerConversation? {
-        guard let backendId = backendId else { return nil }
+        // Infinite Recall fork: synthesize a stable local ID when no backendId
+        // exists. Without this, every local-only session was dropped by the
+        // compactMap caller and the Conversations list rendered empty.
+        let backendId = self.backendId ?? "local-\(self.id ?? 0)"
 
         let decoder = JSONDecoder()
 
