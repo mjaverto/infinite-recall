@@ -7,11 +7,30 @@ import SwiftUI
 
 struct LocalAIInstallSheet: View {
 
+  /// Which sidecar this sheet is installing. Drives both the install kick-off
+  /// and the header copy. Defaults to `.mlx` to preserve the historical call
+  /// sites that pre-date the vision tier.
+  enum Kind {
+    /// Text tier — mlx-lm.server on 127.0.0.1:8080.
+    case mlx
+    /// Vision tier — mlx-vlm.server on 127.0.0.1:8081.
+    case vlm
+    /// Local Rust REST API daemon — `infinite-recall-api`.
+    case api
+  }
+
   @Environment(\.dismiss) private var dismiss
   @StateObject private var installer = LocalAIInstaller.shared
   @State private var showLogs: Bool = false
 
-  /// If true, kicks off the API server install flow. Default is the MLX flow.
+  /// Which sidecar to install. See `Kind`.
+  var kind: Kind = .mlx
+
+  /// Optional override of the model id (only honored for `.mlx` and `.vlm`).
+  var modelId: String? = nil
+
+  /// Legacy back-compat shim: callers that pass `installAPIInstead: true` still
+  /// work and are mapped to `kind = .api`.
   var installAPIInstead: Bool = false
 
   var body: some View {
@@ -48,10 +67,22 @@ struct LocalAIInstallSheet: View {
       // Kick off the install once the sheet appears, but only if we're not
       // already running (e.g. the sheet got re-presented after being closed).
       if !installer.isRunning && installer.currentStep != .done {
+        // Honor legacy installAPIInstead first, then fall through to `kind`.
         if installAPIInstead {
           await installer.startAPIInstall()
-        } else {
-          await installer.startMLXInstall()
+          return
+        }
+        switch kind {
+        case .mlx:
+          if let id = modelId {
+            await installer.startMLXInstall(modelId: id)
+          } else {
+            await installer.startMLXInstall()
+          }
+        case .vlm:
+          await installer.startVLMInstall(modelId: modelId)
+        case .api:
+          await installer.startAPIInstall()
         }
       }
     }

@@ -124,6 +124,17 @@ final class LocalAIInstaller: ObservableObject {
       modelId: nil)
   }
 
+  /// Vision-tier (mlx-vlm) installer. Same flow as the MLX path but extracts
+  /// the VLM scripts and reports state into `VLMLifecycleManager` instead of
+  /// the text-tier lifecycle. Pass an explicit `modelId` to override the
+  /// shell script's hardcoded default; nil means "use the script default".
+  func startVLMInstall(modelId: String? = nil) async {
+    await start(
+      extractor: { try BundledScripts.extractVLMScripts() },
+      kind: .vlm,
+      modelId: modelId)
+  }
+
   /// Terminate the running install. Sends SIGTERM, then SIGKILL after 2s if
   /// the process is still alive.
   func cancel() {
@@ -140,12 +151,20 @@ final class LocalAIInstaller: ObservableObject {
 
   // MARK: - Implementation
 
-  private enum Kind { case mlx, api }
+  private enum Kind { case mlx, api, vlm }
 
   /// Catalog model id to install when `kind == .mlx`. nil means "use the
   /// shell script's hardcoded default" (preserves the original single-model
   /// install path).
   private var pendingMLXModelId: String? = nil
+
+  /// Catalog model id to install when `kind == .vlm`. Mirrors `pendingMLXModelId`
+  /// but for the vision tier. nil means use the VLM script's default.
+  private var pendingVLMModelId: String? = nil
+
+  /// Tracks which kind we're currently running so refresh + env-setup can branch
+  /// without inspecting the extractor closure.
+  private var pendingKind: Kind = .mlx
 
   private func start(
     extractor: () throws -> URL,
@@ -155,7 +174,9 @@ final class LocalAIInstaller: ObservableObject {
     guard !isRunning else { return }
     resetState()
     isRunning = true
+    pendingKind = kind
     pendingMLXModelId = (kind == .mlx) ? modelId : nil
+    pendingVLMModelId = (kind == .vlm) ? modelId : nil
 
     let scriptURL: URL
     do {
@@ -169,8 +190,22 @@ final class LocalAIInstaller: ObservableObject {
 
     // Pre-skip steps that are already done so the UI reflects reality. For
     // a per-model install we look at THAT model's cache, not the default.
-    let lifecycle = MLXLifecycleManager.shared
     if kind == .mlx {
+      let lifecycle = MLXLifecycleManager.shared
+      let modelInstalled: Bool = {
+        if let id = modelId {
+          return lifecycle.isModelInstalled(modelId: id)
+        }
+        return lifecycle.modelPresent
+      }()
+      if modelInstalled {
+        completedSteps.insert(.downloadingModel)
+      }
+      if lifecycle.agentInstalled {
+        completedSteps.insert(.installingLaunchAgent)
+      }
+    } else if kind == .vlm {
+      let lifecycle = VLMLifecycleManager.shared
       let modelInstalled: Bool = {
         if let id = modelId {
           return lifecycle.isModelInstalled(modelId: id)
@@ -215,6 +250,13 @@ final class LocalAIInstaller: ObservableObject {
     // bakes the value into the launchd plist's `--model` argument.
     if let modelId = pendingMLXModelId, kind == .mlx {
       env["INFINITE_RECALL_MLX_MODEL"] = modelId
+    }
+    // Vision-tier override. The VLM shell script reads
+    // INFINITE_RECALL_VLM_MODEL for both the cache-presence check and the
+    // Python snapshot_download call, and bakes the value into the launchd
+    // plist's `--model` argument.
+    if let modelId = pendingVLMModelId, kind == .vlm {
+      env["INFINITE_RECALL_VLM_MODEL"] = modelId
     }
     p.environment = env
 
@@ -301,10 +343,14 @@ final class LocalAIInstaller: ObservableObject {
   }
 
   private func lifecycleRefresh() {
-    Task {
-      await MLXLifecycleManager.shared.refresh()
+    switch pendingKind {
+    case .vlm:
+      Task { await VLMLifecycleManager.shared.refresh() }
+      VLMLifecycleManager.shared.refreshSync()
+    case .mlx, .api:
+      Task { await MLXLifecycleManager.shared.refresh() }
+      MLXLifecycleManager.shared.refreshSync()
     }
-    MLXLifecycleManager.shared.refreshSync()
   }
 
   // MARK: - Stream parsing
