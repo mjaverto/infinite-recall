@@ -771,8 +771,10 @@ actor TranscriptionStorage {
         let db = try await ensureInitialized()
 
         return try await db.read { database in
+            // Infinite Recall fork: dropped `backendSynced == true` filter —
+            // all sessions are local; there's no backend to sync against,
+            // so the original filter wiped the entire conversation list.
             var query = TranscriptionSessionRecord
-                .filter(Column("backendSynced") == true)
                 .filter(Column("deleted") == false)
                 .filter(Column("discarded") == false)
 
@@ -803,8 +805,10 @@ actor TranscriptionStorage {
         let db = try await ensureInitialized()
 
         return try await db.read { database in
+            // Infinite Recall fork: dropped `backendSynced == true` filter —
+            // all sessions are local; there's no backend to sync against,
+            // so the original filter wiped the entire conversation list.
             var query = TranscriptionSessionRecord
-                .filter(Column("backendSynced") == true)
                 .filter(Column("deleted") == false)
                 .filter(Column("discarded") == false)
 
