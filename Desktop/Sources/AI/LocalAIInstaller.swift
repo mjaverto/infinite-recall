@@ -99,11 +99,29 @@ final class LocalAIInstaller: ObservableObject {
   // MARK: - Public API
 
   func startMLXInstall() async {
-    await start(extractor: { try BundledScripts.extractMLXScripts() }, kind: .mlx)
+    await start(
+      extractor: { try BundledScripts.extractMLXScripts() },
+      kind: .mlx,
+      modelId: nil)
+  }
+
+  /// Variant that installs a specific catalog model (rather than the default
+  /// hardcoded in the shell script). The script honors the
+  /// `INFINITE_RECALL_MLX_MODEL` env var both for the cache-presence check
+  /// and the embedded Python download, and writes the launchd plist with
+  /// the matching `--model` argument.
+  func startMLXInstall(modelId: String) async {
+    await start(
+      extractor: { try BundledScripts.extractMLXScripts() },
+      kind: .mlx,
+      modelId: modelId)
   }
 
   func startAPIInstall() async {
-    await start(extractor: { try BundledScripts.extractAPIScripts() }, kind: .api)
+    await start(
+      extractor: { try BundledScripts.extractAPIScripts() },
+      kind: .api,
+      modelId: nil)
   }
 
   /// Terminate the running install. Sends SIGTERM, then SIGKILL after 2s if
@@ -124,10 +142,20 @@ final class LocalAIInstaller: ObservableObject {
 
   private enum Kind { case mlx, api }
 
-  private func start(extractor: () throws -> URL, kind: Kind) async {
+  /// Catalog model id to install when `kind == .mlx`. nil means "use the
+  /// shell script's hardcoded default" (preserves the original single-model
+  /// install path).
+  private var pendingMLXModelId: String? = nil
+
+  private func start(
+    extractor: () throws -> URL,
+    kind: Kind,
+    modelId: String?
+  ) async {
     guard !isRunning else { return }
     resetState()
     isRunning = true
+    pendingMLXModelId = (kind == .mlx) ? modelId : nil
 
     let scriptURL: URL
     do {
@@ -139,10 +167,17 @@ final class LocalAIInstaller: ObservableObject {
       return
     }
 
-    // Pre-skip steps that are already done so the UI reflects reality.
+    // Pre-skip steps that are already done so the UI reflects reality. For
+    // a per-model install we look at THAT model's cache, not the default.
     let lifecycle = MLXLifecycleManager.shared
     if kind == .mlx {
-      if lifecycle.modelPresent {
+      let modelInstalled: Bool = {
+        if let id = modelId {
+          return lifecycle.isModelInstalled(modelId: id)
+        }
+        return lifecycle.modelPresent
+      }()
+      if modelInstalled {
         completedSteps.insert(.downloadingModel)
       }
       if lifecycle.agentInstalled {
@@ -174,6 +209,13 @@ final class LocalAIInstaller: ObservableObject {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     let extraPath = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin"
     env["PATH"] = (env["PATH"].map { "\(extraPath):\($0)" }) ?? extraPath
+    // If the caller picked a non-default catalog model, hand it to the
+    // script via env. The script honors INFINITE_RECALL_MLX_MODEL for both
+    // the cache-presence check and the Python snapshot_download call, and
+    // bakes the value into the launchd plist's `--model` argument.
+    if let modelId = pendingMLXModelId, kind == .mlx {
+      env["INFINITE_RECALL_MLX_MODEL"] = modelId
+    }
     p.environment = env
 
     let outPipe = Pipe()

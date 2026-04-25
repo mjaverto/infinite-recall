@@ -42,10 +42,28 @@ final class MLXLifecycleManager: ObservableObject {
   /// Path to the on-disk huggingface snapshot for the default model.
   /// Matches the canonical layout used by `huggingface_hub.snapshot_download`.
   static var defaultModelCacheURL: URL {
+    modelCacheURL(for: defaultModelID)
+  }
+
+  /// Hugging Face cache path for an arbitrary model id (the standard
+  /// `~/.cache/huggingface/hub/models--<owner>--<repo>` layout).
+  static func modelCacheURL(for modelId: String) -> URL {
     let home = FileManager.default.homeDirectoryForCurrentUser
-    let slug = defaultModelID.replacingOccurrences(of: "/", with: "--")
+    let slug = modelId.replacingOccurrences(of: "/", with: "--")
     return home
       .appendingPathComponent(".cache/huggingface/hub/models--\(slug)")
+  }
+
+  /// `@AppStorage("activeLocalModelID")` key. Defined here so all readers
+  /// agree on the spelling — the SwiftUI `@AppStorage` wrapper in views
+  /// uses the literal directly.
+  static let activeModelDefaultsKey = "activeLocalModelID"
+
+  /// The id the user has selected, falling back to `defaultModelID`. Reads
+  /// straight from `UserDefaults` so non-view code (e.g. the installer) can
+  /// pick it up without owning a SwiftUI binding.
+  static var activeModelID: String {
+    UserDefaults.standard.string(forKey: activeModelDefaultsKey) ?? defaultModelID
   }
 
   // MARK: - Published state
@@ -111,6 +129,174 @@ final class MLXLifecycleManager: ObservableObject {
     pollTask?.cancel()
     pollTask = nil
   }
+
+  // MARK: - Per-model install state
+
+  /// True if the Hugging Face cache for `modelId` exists locally. We check
+  /// for the directory's existence — same shallow check `modelPresent` uses
+  /// for the default model. Doesn't validate that the snapshot is complete
+  /// or unbroken; HF's `snapshot_download` does that lazily on launch.
+  func isModelInstalled(modelId: String) -> Bool {
+    FileManager.default.fileExists(
+      atPath: Self.modelCacheURL(for: modelId).path)
+  }
+
+  // MARK: - Plist regeneration for active model
+
+  /// Rewrites the launchd plist at `installedPlistURL` so its `--model`
+  /// argument matches `Self.activeModelID`. Mirrors what
+  /// `scripts/setup-mlx-server.sh` does on first install — substituting
+  /// `__USER_HOME__`, `__UV_BIN__`, `__MODEL__`, `__HOST__`, `__PORT__` —
+  /// but driven entirely from Swift so we don't have to re-run the shell
+  /// installer just to switch models.
+  ///
+  /// Caller is responsible for `launchctl unload` + `launchctl load` (and
+  /// for stopping the server first if it's running).
+  ///
+  /// Returns `true` on success. On failure sets `lastError` and returns
+  /// `false`. No-op (returns false) if the agent isn't installed yet.
+  @discardableResult
+  func regeneratePlistForActiveModel() -> Bool {
+    guard agentInstalled else {
+      lastError = "launchd agent not installed — install the local model first."
+      return false
+    }
+
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    guard let uvBin = Self.locateUVBinary() else {
+      lastError =
+        "Could not find `uv` on PATH. Re-run the local model installer."
+      return false
+    }
+
+    let model = Self.activeModelID
+    let host = "127.0.0.1"
+    let port = "8080"
+
+    let rendered = Self.plistTemplate
+      .replacingOccurrences(of: "__USER_HOME__", with: home)
+      .replacingOccurrences(of: "__UV_BIN__", with: uvBin)
+      .replacingOccurrences(of: "__MODEL__", with: model)
+      .replacingOccurrences(of: "__HOST__", with: host)
+      .replacingOccurrences(of: "__PORT__", with: port)
+
+    let dest = Self.installedPlistURL
+    do {
+      try rendered.data(using: .utf8)?
+        .write(to: dest, options: .atomic)
+    } catch {
+      lastError = "Failed to write \(dest.path): \(error.localizedDescription)"
+      return false
+    }
+    return true
+  }
+
+  /// Re-applies the plist (unload + load) so launchd picks up the rewritten
+  /// `ProgramArguments`. Does NOT start the server — caller follows up with
+  /// `startServer()` if desired.
+  @discardableResult
+  func reloadAgent() async -> Bool {
+    guard agentInstalled else { return false }
+    _ = Self.runShell(
+      "/bin/launchctl",
+      arguments: ["unload", Self.installedPlistURL.path])
+    let load = Self.runShell(
+      "/bin/launchctl",
+      arguments: ["load", Self.installedPlistURL.path])
+    if let err = load.stderr, !err.isEmpty {
+      lastError = err
+    }
+    return load.exitCode == 0
+  }
+
+  /// Probe likely locations for `uv`. Mirrors the order
+  /// `scripts/setup-mlx-server.sh` uses (`command -v uv`, then the homebrew
+  /// + ~/.local/bin fallbacks via PATH manipulation). We don't shell out
+  /// here because Swift can stat the candidates directly.
+  private static func locateUVBinary() -> String? {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let candidates = [
+      "\(home)/.local/bin/uv",
+      "/opt/homebrew/bin/uv",
+      "/usr/local/bin/uv",
+      "/usr/bin/uv",
+    ]
+    let fm = FileManager.default
+    for path in candidates where fm.isExecutableFile(atPath: path) {
+      return path
+    }
+
+    // Last-ditch: ask the shell. This runs `which`, not `uv`, so it's safe.
+    let result = runShell("/usr/bin/which", arguments: ["uv"])
+    if result.exitCode == 0,
+       let out = result.stdout?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !out.isEmpty
+    {
+      return out
+    }
+    return nil
+  }
+
+  /// Inline copy of `scripts/com.infiniterecall.mlx.plist`. Kept in-source
+  /// so we can rewrite the plist without depending on the bundled-script
+  /// extraction having run. Must stay byte-identical to the template stored
+  /// in `BundledScripts.mlxLaunchdPlist` (sync contract — see that file).
+  private static let plistTemplate: String = ##"""
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Infinite Recall — launchd agent template for mlx-lm.server.
+  Placeholders are replaced by scripts/setup-mlx-server.sh:
+    __USER_HOME__  -> $HOME
+    __UV_BIN__     -> absolute path to `uv`
+    __MODEL__      -> Hugging Face model id
+    __HOST__       -> bind host (default 127.0.0.1)
+    __PORT__       -> bind port (default 8080)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.infiniterecall.mlx</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_BIN__</string>
+    <string>tool</string>
+    <string>run</string>
+    <string>--from</string>
+    <string>mlx-lm</string>
+    <string>mlx_lm.server</string>
+    <string>--model</string>
+    <string>__MODEL__</string>
+    <string>--host</string>
+    <string>__HOST__</string>
+    <string>--port</string>
+    <string>__PORT__</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>__USER_HOME__/Library/Logs/InfiniteRecall/mlx.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__USER_HOME__/Library/Logs/InfiniteRecall/mlx.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+"""##
 
   // MARK: - launchctl commands
 

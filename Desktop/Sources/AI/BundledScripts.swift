@@ -112,7 +112,9 @@ LABEL="com.infiniterecall.mlx"
 # Default LLM. Smaller-by-default for new installs (was Qwen2.5-32B-Instruct-4bit).
 # Verified on huggingface.co: Apache 2.0, ~4.3 GB on disk, 32k context, same
 # Qwen2.5 chat template as the previous 32B default.
-DEFAULT_MODEL="mlx-community/Qwen2.5-7B-Instruct-4bit"
+# Overridable by the in-app installer when the user picks a non-default
+# option from the Local Model picker, via INFINITE_RECALL_MLX_MODEL env var.
+DEFAULT_MODEL="${INFINITE_RECALL_MLX_MODEL:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
 HOST="127.0.0.1"
 PORT="8080"
 
