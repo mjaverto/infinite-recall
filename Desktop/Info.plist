@@ -55,8 +55,10 @@
         </dict>
     </array>
     <!-- Sparkle Auto-Update Configuration -->
+    <!-- Infinite Recall fork: SUFeedURL stripped. Sparkle is runtime-disabled
+         (UpdaterViewModel uses startingUpdater: false); no auto-update feed. -->
     <key>SUFeedURL</key>
-    <string>https://api.omi.me/v2/desktop/appcast.xml</string>
+    <string></string>
     <key>SUPublicEDKey</key>
     <string>vWleho4gIOl932wM4v9Gz+FTCt90+vUVdPHsRReFX40=</string>
     <key>SUEnableAutomaticChecks</key>

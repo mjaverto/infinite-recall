@@ -1,9 +1,8 @@
 import Foundation
-import PostHog
 import FirebaseAuth
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
-// SDK imports are kept so the rest of the codebase compiles.
+// PostHog SPM dep removed; `import PostHog` dropped along with it.
 
 /// Singleton manager for PostHog analytics with Session Replay
 /// Complements MixpanelManager - both track the same events

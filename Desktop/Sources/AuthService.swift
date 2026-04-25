@@ -233,9 +233,11 @@ class AuthService {
 
     @MainActor
     func signInWithApple() async throws {
-        // Use web OAuth directly — native Apple Sign In requires entitlements that
-        // don't work reliably across dev/release builds. Web OAuth works everywhere.
-        try await signIn(provider: "apple")
+        // Disabled for local-first fork: anonymous user only. No network egress.
+        NSLog("[auth] sign-in attempted in local-only mode — no-op (provider=apple)")
+        return
+        // Disabled for local-first fork:
+        // try await signIn(provider: "apple")
     }
 
     // MARK: - Native Apple Sign In (requires com.apple.developer.applesignin entitlement)
@@ -346,13 +348,23 @@ class AuthService {
 
     @MainActor
     func signInWithGoogle() async throws {
-        try await signIn(provider: "google")
+        // Disabled for local-first fork: anonymous user only. No network egress.
+        NSLog("[auth] sign-in attempted in local-only mode — no-op (provider=google)")
+        return
+        // Disabled for local-first fork:
+        // try await signIn(provider: "google")
     }
 
     // MARK: - Generic OAuth Sign In
 
     @MainActor
     private func signIn(provider: String) async throws {
+        // Disabled for local-first fork: anonymous user only. No OAuth flow,
+        // no browser launch, no Firebase REST calls. Returns silently so any
+        // residual caller gets a clean no-op.
+        NSLog("[auth] sign-in attempted in local-only mode — no-op (provider=%@)", provider)
+        return
+        // Disabled for local-first fork:
         // Guard against double sign-in (e.g., rapid button clicks before UI updates)
         guard !isLoading else {
             NSLog("OMI AUTH: Sign in already in progress, ignoring duplicate request")
@@ -820,6 +832,10 @@ class AuthService {
 
     /// Exchange custom token for ID token using Firebase REST API
     private func exchangeCustomTokenForIdToken(customToken: String) async throws -> FirebaseTokenResult {
+        // Disabled for local-first fork: never reach identitytoolkit.googleapis.com.
+        NSLog("[auth] sign-in attempted in local-only mode — no-op (exchangeCustomTokenForIdToken)")
+        throw AuthError.notSignedIn
+        // Disabled for local-first fork:
         guard let url = URL(string: "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=\(firebaseApiKey)") else {
             throw AuthError.invalidURL
         }
@@ -882,6 +898,10 @@ class AuthService {
 
     /// Refresh the ID token using the refresh token
     private func refreshIdToken() async throws -> String {
+        // Disabled for local-first fork: never reach securetoken.googleapis.com.
+        NSLog("[auth] sign-in attempted in local-only mode — no-op (refreshIdToken)")
+        throw AuthError.notSignedIn
+        // Disabled for local-first fork:
         guard let refreshToken = storedRefreshToken else {
             throw AuthError.notSignedIn
         }
@@ -1165,6 +1185,10 @@ class AuthService {
     /// Sign in with Firebase using an Apple identity token via REST API
     /// This bypasses the backend entirely - Firebase verifies the Apple JWT directly
     private func signInWithAppleIdentityToken(identityToken: String, nonce: String) async throws -> FirebaseTokenResult {
+        // Disabled for local-first fork: never reach identitytoolkit.googleapis.com.
+        NSLog("[auth] sign-in attempted in local-only mode — no-op (signInWithAppleIdentityToken)")
+        throw AuthError.notSignedIn
+        // Disabled for local-first fork:
         guard let url = URL(string: "https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=\(firebaseApiKey)") else {
             throw AuthError.invalidURL
         }

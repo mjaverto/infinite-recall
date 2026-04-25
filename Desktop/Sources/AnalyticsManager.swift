@@ -1,9 +1,8 @@
 import AppKit
 import Foundation
-import Mixpanel
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
-// SDK imports are kept so the rest of the codebase compiles.
+// Mixpanel SPM dep removed; `import Mixpanel` dropped along with it.
 
 /// Unified analytics manager that sends events to both Mixpanel and PostHog
 /// Use this instead of calling MixpanelManager and PostHogManager directly

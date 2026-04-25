@@ -244,41 +244,47 @@ class ChatLabViewModel: ObservableObject {
         }
     }
 
+    // Infinite Recall fork: ChatLabView no longer fetches from a remote backend.
     /// Fetch rated messages from the Omi backend, return (date, ups, downs) tuples
     private func fetchRatingsFromBackend() async -> [(String, Int, Int)] {
-        do {
-            let authHeader = try await AuthService.shared.getAuthHeader()
-
-            // Fetch messages with ratings from the last 60 days
-            let url = URL(string: "https://api.omi.me/v2/messages?limit=500")!
-            var request = URLRequest(url: url)
-            request.setValue(authHeader, forHTTPHeaderField: "Authorization")
-
-            let (data, _) = try await URLSession.shared.data(for: request)
-            let messages = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
-
-            // Group by date
-            var byDate: [String: (up: Int, down: Int)] = [:]
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd"
-
-            for msg in messages {
-                guard let rating = msg["rating"] as? Int, rating != 0 else { continue }
-                let createdAt = msg["created_at"] as? String ?? ""
-                let dateStr = String(createdAt.prefix(10))
-                guard !dateStr.isEmpty else { continue }
-
-                var entry = byDate[dateStr] ?? (up: 0, down: 0)
-                if rating > 0 { entry.up += 1 } else { entry.down += 1 }
-                byDate[dateStr] = entry
-            }
-
-            return byDate.map { ($0.key, $0.value.up, $0.value.down) }
-                .sorted { $0.0 < $1.0 }
-        } catch {
-            log("ChatLab: Failed to fetch ratings: \(error)")
-            return []
-        }
+        // Disabled for local-first fork: this previously POSTed to api.omi.me.
+        // Returning an empty result is safe — the caller renders an empty chart.
+        log("ChatLab: fetchRatingsFromBackend disabled in local-first fork")
+        return []
+        // Disabled for local-first fork:
+        // do {
+        //     let authHeader = try await AuthService.shared.getAuthHeader()
+        //
+        //     // Fetch messages with ratings from the last 60 days
+        //     let url = URL(string: "https://api.omi.me/v2/messages?limit=500")!
+        //     var request = URLRequest(url: url)
+        //     request.setValue(authHeader, forHTTPHeaderField: "Authorization")
+        //
+        //     let (data, _) = try await URLSession.shared.data(for: request)
+        //     let messages = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
+        //
+        //     // Group by date
+        //     var byDate: [String: (up: Int, down: Int)] = [:]
+        //     let dateFmt = DateFormatter()
+        //     dateFmt.dateFormat = "yyyy-MM-dd"
+        //
+        //     for msg in messages {
+        //         guard let rating = msg["rating"] as? Int, rating != 0 else { continue }
+        //         let createdAt = msg["created_at"] as? String ?? ""
+        //         let dateStr = String(createdAt.prefix(10))
+        //         guard !dateStr.isEmpty else { continue }
+        //
+        //         var entry = byDate[dateStr] ?? (up: 0, down: 0)
+        //         if rating > 0 { entry.up += 1 } else { entry.down += 1 }
+        //         byDate[dateStr] = entry
+        //     }
+        //
+        //     return byDate.map { ($0.key, $0.value.up, $0.value.down) }
+        //         .sorted { $0.0 < $1.0 }
+        // } catch {
+        //     log("ChatLab: Failed to fetch ratings: \(error)")
+        //     return []
+        // }
     }
 
     private func inferContextType(_ text: String) -> String {

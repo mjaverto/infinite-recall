@@ -1,9 +1,8 @@
 import Foundation
-import HeapSwiftCore
 import FirebaseAuth
 
 // Infinite Recall fork: telemetry disabled. All public methods are no-ops.
-// SDK imports are kept so the rest of the codebase compiles.
+// Heap SPM dep removed; `import HeapSwiftCore` dropped along with it.
 
 /// Singleton manager for Heap analytics — tracks signup/k-factor events only.
 /// Complements MixpanelManager and PostHogManager via AnalyticsManager dispatch.

@@ -1,3 +1,8 @@
+// Infinite Recall fork: this view is unreachable in the local-first build —
+// the auth gate in DesktopHomeView/RewindOnlyView short-circuits to anonymous.
+// Kept as a stub so dead-branch references still compile. If the gate ever
+// fires (it shouldn't), the user sees a clear "no accounts" message and the
+// buttons no-op locally without touching any network.
 import SwiftUI
 
 struct SignInView: View {
@@ -15,7 +20,6 @@ struct SignInView: View {
 
                 // Logo/Title
                 VStack(spacing: 16) {
-                    // Omi logo
                     if let logoURL = Bundle.resourceBundle.url(forResource: "herologo", withExtension: "png"),
                        let logoImage = NSImage(contentsOf: logoURL) {
                         Image(nsImage: logoImage)
@@ -28,30 +32,19 @@ struct SignInView: View {
                         .scaledFont(size: 48, weight: .bold)
                         .foregroundColor(OmiColors.textPrimary)
 
-                    Text("Sign in to continue")
+                    Text("This build does not use accounts.")
                         .font(.title3)
                         .foregroundColor(OmiColors.textTertiary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
                 }
 
                 Spacer()
 
-                // Sign in buttons
+                // Disabled for local-first fork — anonymous user only.
                 VStack(spacing: 12) {
-                    // Sign in with Apple
                     Button(action: {
-                        Task {
-                            do {
-                                try await AuthService.shared.signInWithApple()
-                            } catch is CancellationError {
-                                // swallow — user initiated
-                            } catch AuthError.cancelled {
-                                // swallow — user initiated
-                            } catch {
-                                let errorMsg = "Error: \(error.localizedDescription)"
-                                authState.error = errorMsg
-                                NSLog("OMI Sign in error: %@", errorMsg)
-                            }
-                        }
+                        // Disabled for local-first fork — anonymous user only.
                     }) {
                         HStack(spacing: 8) {
                             Image(systemName: "applelogo")
@@ -59,30 +52,17 @@ struct SignInView: View {
                             Text("Sign in with Apple")
                                 .scaledFont(size: 17, weight: .medium)
                         }
-                        .foregroundColor(.black)
+                        .foregroundColor(.black.opacity(0.4))
                         .frame(maxWidth: .infinity)
                         .frame(height: 50)
-                        .background(Color.white)
+                        .background(Color.white.opacity(0.5))
                         .cornerRadius(10)
                     }
                     .buttonStyle(.plain)
-                    .disabled(authState.isLoading)
+                    .disabled(true)
 
-                    // Sign in with Google
                     Button(action: {
-                        Task {
-                            do {
-                                try await AuthService.shared.signInWithGoogle()
-                            } catch is CancellationError {
-                                // swallow — user initiated
-                            } catch AuthError.cancelled {
-                                // swallow — user initiated
-                            } catch {
-                                let errorMsg = "Error: \(error.localizedDescription)"
-                                authState.error = errorMsg
-                                NSLog("OMI Sign in error: %@", errorMsg)
-                            }
-                        }
+                        // Disabled for local-first fork — anonymous user only.
                     }) {
                         HStack(spacing: 8) {
                             GoogleLogo()
@@ -90,10 +70,10 @@ struct SignInView: View {
                             Text("Sign in with Google")
                                 .scaledFont(size: 17, weight: .medium)
                         }
-                        .foregroundColor(.black)
+                        .foregroundColor(.black.opacity(0.4))
                         .frame(maxWidth: .infinity)
                         .frame(height: 50)
-                        .background(Color.white)
+                        .background(Color.white.opacity(0.5))
                         .cornerRadius(10)
                         .overlay(
                             RoundedRectangle(cornerRadius: 10)
@@ -101,36 +81,7 @@ struct SignInView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(authState.isLoading)
-
-                    // Loading overlay for both buttons
-                    if authState.isLoading {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: OmiColors.textPrimary))
-                            .padding(.top, 8)
-
-                        // Minimal escape hatch so a failed web sign-in (closed tab,
-                        // denied on Apple/Google, etc.) doesn't trap the user with
-                        // permanently disabled buttons waiting for a callback that
-                        // will never arrive.
-                        Button(action: {
-                            AuthService.shared.cancelSignIn()
-                        }) {
-                            Text("Cancel")
-                                .font(.caption)
-                                .foregroundColor(OmiColors.textTertiary)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.top, 4)
-                    }
-
-                    if let error = authState.error {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundColor(OmiColors.error)
-                            .multilineTextAlignment(.center)
-                            .padding(.top, 4)
-                    }
+                    .disabled(true)
                 }
                 .frame(width: 320)
 
