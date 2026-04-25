@@ -358,6 +358,13 @@ public class ProactiveAssistantsPlugin: NSObject {
         // Initialize services
         screenCaptureService = ScreenCaptureService()
 
+        // Infinite Recall fork: each proactive assistant is best-effort. They all
+        // depend on a cloud LLM (Gemini) which we've stripped; until local LLM
+        // (mlx-lm.server) lands, they'll throw .missingAPIKey on init. That MUST
+        // NOT fail the screen-capture pipeline — screen capture + OCR are fully
+        // local via the Vision framework and should run regardless of whether
+        // any assistant is available.
+
         do {
             focusAssistant = try FocusAssistant(
                 onAlert: { [weak self] message in
@@ -380,39 +387,41 @@ public class ProactiveAssistantsPlugin: NSObject {
                     }
                 }
             )
-
             if let focus = focusAssistant {
                 AssistantCoordinator.shared.register(focus)
             }
+        } catch {
+            log("ProactiveAssistantsPlugin: FocusAssistant init skipped — \(error.localizedDescription)")
+        }
 
+        do {
             taskAssistant = try TaskAssistant()
-
             if let task = taskAssistant {
                 AssistantCoordinator.shared.register(task)
             }
-
             Task { await TaskDeduplicationService.shared.start() }
             Task { await TaskPrioritizationService.shared.start() }
             Task { await TaskPromotionService.shared.start() }
+        } catch {
+            log("ProactiveAssistantsPlugin: TaskAssistant init skipped — \(error.localizedDescription)")
+        }
 
+        do {
             insightAssistant = try InsightAssistant()
-
             if let insight = insightAssistant {
                 AssistantCoordinator.shared.register(insight)
             }
+        } catch {
+            log("ProactiveAssistantsPlugin: InsightAssistant init skipped — \(error.localizedDescription)")
+        }
 
+        do {
             memoryAssistant = try MemoryAssistant()
-
             if let memory = memoryAssistant {
                 AssistantCoordinator.shared.register(memory)
             }
-
         } catch {
-            log("ProactiveAssistantsPlugin: Failed to initialize assistants: \(error.localizedDescription)")
-            logError("ProactiveAssistantsPlugin: Assistant initialization failed", error: error)
-            isStartingMonitoring = false
-            completion(false, error.localizedDescription)
-            return
+            log("ProactiveAssistantsPlugin: MemoryAssistant init skipped — \(error.localizedDescription)")
         }
 
         // Get initial app state
