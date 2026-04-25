@@ -1985,7 +1985,8 @@ class AppState: ObservableObject {
     } catch {
       logError("Conversations: API fetch failed", error: error)
       // Only set error if we don't have cached data
-      if conversations.isEmpty {
+      // Infinite Recall fork: local-only mode — return empty result instead of throwing
+      if conversations.isEmpty, !isLocalOnlyError(error) {
         conversationsError = error.localizedDescription
       } else {
         log("Conversations: Using cached data after API failure")

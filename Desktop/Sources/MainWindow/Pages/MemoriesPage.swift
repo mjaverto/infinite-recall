@@ -563,7 +563,8 @@ class MemoriesViewModel: ObservableObject {
       }
     } catch {
       // Only show error if we don't have cached data
-      if memories.isEmpty {
+      // Infinite Recall fork: local-only mode — return empty result instead of throwing
+      if memories.isEmpty, !isLocalOnlyError(error) {
         errorMessage = error.localizedDescription
       }
       logError("Failed to load memories from API", error: error)

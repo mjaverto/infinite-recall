@@ -1071,7 +1071,12 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         }
 
         sessions = []
-        sessionsLoadError = lastError?.localizedDescription ?? "Failed to load chats. Check your connection and try again."
+        // Infinite Recall fork: local-only mode — return empty result instead of throwing
+        if let err = lastError, isLocalOnlyError(err) {
+            sessionsLoadError = nil
+        } else {
+            sessionsLoadError = lastError?.localizedDescription ?? "Failed to load chats. Check your connection and try again."
+        }
     }
 
     /// Toggle the starred filter and reload sessions
@@ -2042,7 +2047,12 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         }
 
         messages = []
-        sessionsLoadError = lastError?.localizedDescription ?? "Failed to load messages. Check your connection and try again."
+        // Infinite Recall fork: local-only mode — return empty result instead of throwing
+        if let err = lastError, isLocalOnlyError(err) {
+            sessionsLoadError = nil
+        } else {
+            sessionsLoadError = lastError?.localizedDescription ?? "Failed to load messages. Check your connection and try again."
+        }
         isLoading = false
     }
 
