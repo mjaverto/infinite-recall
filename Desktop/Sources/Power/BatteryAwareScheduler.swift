@@ -72,6 +72,21 @@ public final class BatteryAwareScheduler: ObservableObject {
   /// Throwing leaves the item in place for retry on the next drain.
   public typealias Handler = @Sendable (PendingWork) async throws -> Void
 
+  // MARK: - Debounce configuration
+
+  /// How long (in seconds) a new power-source state must be stable before
+  /// `allowHeavyWork` is updated and a drain is triggered.
+  ///
+  /// Both directions are debounced:
+  /// - Battery → AC: drain fires 30 s AFTER the cable is plugged in.
+  /// - AC → battery: heavy work continues for 30 s after unplug, then ceases.
+  ///
+  /// INVARIANT: this debounces the *transition decision*, not the underlying
+  /// power state read. `IOPSCopyPowerSourcesInfo` (via `PowerStateMonitor`) still
+  /// reflects current truth at all times — only the SCHEDULER's `allowHeavyWork`
+  /// commitment lags behind by up to `acTransitionDebounceSeconds`.
+  public static let acTransitionDebounceSeconds: Double = 30.0
+
   // MARK: - Published surface
 
   @Published public private(set) var source: PowerSource = .ac
@@ -86,9 +101,11 @@ public final class BatteryAwareScheduler: ObservableObject {
   public var userOverride: Bool = false
 
   /// Single source of truth for "may I run a Whisper pass right now?".
+  /// This reflects the *committed* power state — it lags real hardware by
+  /// up to `acTransitionDebounceSeconds` on any transition after launch.
   public var allowHeavyWork: Bool {
     if userOverride { return true }
-    if source != .ac { return false }
+    if committedSource != .ac { return false }
     if isLowPowerMode { return false }
     if thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { return false }
     return true
@@ -122,6 +139,15 @@ public final class BatteryAwareScheduler: ObservableObject {
   private var countPollerTask: Task<Void, Never>?
   private var lastAllow: Bool = true
 
+  /// The power source that `allowHeavyWork` is evaluated against.
+  /// Updated only after a debounce window elapses — not on every raw signal.
+  private var committedSource: PowerSource = .ac
+
+  /// Pending task that, after the debounce window, commits a new power source
+  /// and optionally fires `drain()`. Cancelled whenever another transition
+  /// arrives before the window closes.
+  private var pendingTransitionTask: Task<Void, Never>?
+
   /// Worker tag embedded in `claimedBy` column so sweeper can identify orphans.
   private var workerTag: String { "PowerWorkBridge#\(ProcessInfo.processInfo.processIdentifier)" }
 
@@ -139,8 +165,10 @@ public final class BatteryAwareScheduler: ObservableObject {
     monitor.start()
 
     // Seed from current state so we don't briefly think we're on battery.
+    // No debounce on launch — commit the initial state immediately.
     let initial = monitor.currentSnapshot()
     self.source = initial.source
+    self.committedSource = initial.source
     self.isLowPowerMode = initial.isLowPowerMode
     self.thermalState = initial.thermalState
     self.lastAllow = self.allowHeavyWork
@@ -172,6 +200,8 @@ public final class BatteryAwareScheduler: ObservableObject {
     monitorTask = nil
     countPollerTask?.cancel()
     countPollerTask = nil
+    pendingTransitionTask?.cancel()
+    pendingTransitionTask = nil
   }
 
   // MARK: - Handler registration
@@ -260,16 +290,62 @@ public final class BatteryAwareScheduler: ObservableObject {
 
   // MARK: - Internal
 
-  /// Called whenever any input signal updates. If `allowHeavyWork` just
-  /// flipped false → true, kick off a drain. true → false is handled
-  /// implicitly by `drain()` re-checking at the top of every loop pass.
+  /// Called whenever any input signal updates. Debounces power-source
+  /// transitions by `acTransitionDebounceSeconds` before committing a new
+  /// `allowHeavyWork` value and (if the new value is true) triggering drain.
+  ///
+  /// Non-source signals (low-power mode, thermal state) update raw published
+  /// properties immediately but still flow through the same debounce window
+  /// because `allowHeavyWork` is evaluated against `committedSource`.
+  ///
+  /// If the source is unchanged since the last committed state, any pending
+  /// debounce task is cancelled and the transition is a no-op.
   private func handlePossibleTransition() {
-    let now = allowHeavyWork
-    let was = lastAllow
-    lastAllow = now
-    if !was && now {
-      Task { @MainActor in
+    let pendingSource = self.source  // raw value from latest snapshot
+
+    if pendingSource == committedSource {
+      // Source flipped back to what we already committed — cancel any pending
+      // transition and stay on the committed state without delay.
+      pendingTransitionTask?.cancel()
+      pendingTransitionTask = nil
+
+      // Still re-evaluate non-source signals (thermal / low-power).
+      let now = allowHeavyWork
+      let was = lastAllow
+      lastAllow = now
+      if !was && now {
+        Task { @MainActor in
+          await self.drain()
+        }
+      }
+      return
+    }
+
+    // New source differs from committed source — start (or restart) the
+    // debounce window. Cancel whatever was pending.
+    pendingTransitionTask?.cancel()
+
+    let debounce = Self.acTransitionDebounceSeconds
+    pendingTransitionTask = Task { @MainActor [weak self] in
+      // Wait for the debounce window.
+      try? await Task.sleep(nanoseconds: UInt64(debounce * 1_000_000_000))
+
+      // If we were cancelled during the sleep, do nothing.
+      guard !Task.isCancelled, let self else { return }
+
+      // Commit the new source.
+      self.committedSource = pendingSource
+      self.pendingTransitionTask = nil
+
+      let now = self.allowHeavyWork
+      let was = self.lastAllow
+      self.lastAllow = now
+      if !was && now {
         await self.drain()
+      } else {
+        // allowHeavyWork may have flipped false — update lastAllow so the
+        // next real transition is detected correctly.
+        self.lastAllow = now
       }
     }
   }
