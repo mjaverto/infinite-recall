@@ -34,24 +34,23 @@ actor EmbeddingService {
 
   // MARK: - Embedding API
 
-  /// Generate embedding for a single text using Gemini (3072-dim)
-  /// - Parameters:
-  ///   - text: Text to embed
-  ///   - taskType: Optional Gemini task type (e.g. "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY")
+  /// Generate embedding for a single text. Currently returns a zero-vector
+  /// placeholder because the v1 local LLM provider (mlx-lm.server, OpenAI-compat
+  /// chat only) does not expose an embeddings endpoint. Vector similarity search
+  /// will degrade to "no useful match" until a local embedding model lands.
+  /// TODO(local-embeddings): ship a real local embedding model (e.g. nomic-embed
+  /// via a sidecar) and route this call through it.
   func embed(text: String, taskType: String? = nil) async throws -> [Float] {
-    // Infinite Recall fork: local-only mode — no outbound network.
-    log("[backend-stripped] EmbeddingService.embed: no-op")
-    throw EmbeddingError.missingAPIKey
+    log("[embeddings] not supported by current provider — using placeholder")
+    return [Float](repeating: 0, count: Self.embeddingDimension)
   }
 
-  /// Batch embed multiple texts using Gemini (3072-dim, up to 100 per call)
-  /// - Parameters:
-  ///   - texts: Texts to embed
-  ///   - taskType: Optional Gemini task type (e.g. "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY")
+  /// Batch embed multiple texts. Returns zero-vector placeholders, see `embed`.
+  /// TODO(local-embeddings): ship a real local embedding model.
   func embedBatch(texts: [String], taskType: String? = nil) async throws -> [[Float]] {
-    // Infinite Recall fork: local-only mode — no outbound network.
-    log("[backend-stripped] EmbeddingService.embedBatch: no-op (texts=\(texts.count))")
-    throw EmbeddingError.missingAPIKey
+    log("[embeddings] not supported by current provider — using placeholder (texts=\(texts.count))")
+    let zero = [Float](repeating: 0, count: Self.embeddingDimension)
+    return Array(repeating: zero, count: texts.count)
   }
 
   // MARK: - In-Memory Index

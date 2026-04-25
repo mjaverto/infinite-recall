@@ -17,7 +17,6 @@ actor FocusAssistant: ProactiveAssistant {
 
     // MARK: - Properties
 
-    private let geminiClient: GeminiClient
     private let onAlert: (String) -> Void
     private let onStatusChange: ((FocusStatus) -> Void)?
     private let onRefocus: (() -> Void)?
@@ -76,7 +75,8 @@ actor FocusAssistant: ProactiveAssistant {
         onRefocus: (() -> Void)? = nil,
         onDistraction: (() -> Void)? = nil
     ) throws {
-        self.geminiClient = try GeminiClient(apiKey: apiKey)
+        // Infinite Recall fork: LLM client is resolved lazily per-call via
+        // AIProviderRegistry; constructor never fails on missing provider.
         self.onAlert = onAlert
         self.onStatusChange = onStatusChange
         self.onRefocus = onRefocus
@@ -401,31 +401,35 @@ actor FocusAssistant: ProactiveAssistant {
         if !historyText.isEmpty {
             promptParts.append(historyText)
         }
-        promptParts.append("Now analyze this new screenshot:")
+        // Local LLM is text-only — describe what's on screen via metadata
+        // rather than the JPEG bytes. TODO: re-enable image once a local
+        // vision model is available.
+        promptParts.append("Now classify the user's current focus state based on the active app, window title, and recent activity above.")
+        promptParts.append(Self.focusJSONSchemaInstruction)
         let prompt = promptParts.joined(separator: "\n\n")
 
         let currentSystemPrompt = await systemPrompt
 
-        let responseSchema = GeminiRequest.GenerationConfig.ResponseSchema(
-            type: "object",
-            properties: [
-                "status": .init(type: "string", enum: ["focused", "distracted"], description: "Whether the user is focused or distracted"),
-                "app_or_site": .init(type: "string", enum: nil, description: "The app or website visible"),
-                "description": .init(type: "string", enum: nil, description: "Brief description of what's on screen"),
-                "message": .init(type: "string", enum: nil, description: "Coaching message")
-            ],
-            required: ["status", "app_or_site", "description"]
-        )
-
-        let responseText = try await geminiClient.sendRequest(
-            prompt: prompt,
-            imageData: jpegData,
+        guard let responseText = await LLMBridge.generateJSON(
             systemPrompt: currentSystemPrompt,
-            responseSchema: responseSchema
-        )
+            userPrompt: prompt,
+            label: "Focus.analyzeScreenshotWithHistory"
+        ) else {
+            return nil
+        }
 
         return try JSONDecoder().decode(ScreenAnalysis.self, from: Data(responseText.utf8))
     }
+
+    /// JSON schema description appended to focus prompts so the local LLM
+    /// emits a parseable response without Gemini's structured-output mode.
+    private static let focusJSONSchemaInstruction = """
+    Return ONLY a JSON object with these fields:
+    - status (string): one of "focused" or "distracted"
+    - app_or_site (string): the app or website visible
+    - description (string): brief description of what's on screen
+    - message (string, optional): coaching message
+    """
 
     // MARK: - Analysis
 
@@ -694,30 +698,21 @@ actor FocusAssistant: ProactiveAssistant {
         if !historyText.isEmpty {
             promptParts.append(historyText)
         }
-        promptParts.append("Now analyze this new screenshot:")
+        // Local LLM is text-only — see analyzeScreenshotWithHistory for context.
+        promptParts.append("Now classify the user's current focus state based on the active app, window title, and recent activity above.")
+        promptParts.append(Self.focusJSONSchemaInstruction)
         let prompt = promptParts.joined(separator: "\n\n")
 
         // Get current system prompt from settings
         let currentSystemPrompt = await systemPrompt
 
-        // Build response schema
-        let responseSchema = GeminiRequest.GenerationConfig.ResponseSchema(
-            type: "object",
-            properties: [
-                "status": .init(type: "string", enum: ["focused", "distracted"], description: "Whether the user is focused or distracted"),
-                "app_or_site": .init(type: "string", enum: nil, description: "The app or website visible"),
-                "description": .init(type: "string", enum: nil, description: "Brief description of what's on screen"),
-                "message": .init(type: "string", enum: nil, description: "Coaching message")
-            ],
-            required: ["status", "app_or_site", "description"]
-        )
-
-        let responseText = try await geminiClient.sendRequest(
-            prompt: prompt,
-            imageData: jpegData,
+        guard let responseText = await LLMBridge.generateJSON(
             systemPrompt: currentSystemPrompt,
-            responseSchema: responseSchema
-        )
+            userPrompt: prompt,
+            label: "Focus.analyzeScreenshot"
+        ) else {
+            return nil
+        }
 
         return try JSONDecoder().decode(ScreenAnalysis.self, from: Data(responseText.utf8))
     }

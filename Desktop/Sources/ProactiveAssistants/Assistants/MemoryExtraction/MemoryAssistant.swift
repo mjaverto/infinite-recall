@@ -17,7 +17,6 @@ actor MemoryAssistant: ProactiveAssistant {
 
     // MARK: - Properties
 
-    private let geminiClient: GeminiClient
     private var isRunning = false
     private var lastAnalysisTime: Date = .distantPast
     private var previousMemories: [ExtractedMemory] = [] // Last 20 extracted memories for deduplication
@@ -58,8 +57,10 @@ actor MemoryAssistant: ProactiveAssistant {
     // MARK: - Initialization
 
     init(apiKey: String? = nil) throws {
-        // Use Gemini Flash for memory extraction (text+vision, no tool loop — Flash-safe)
-        self.geminiClient = try GeminiClient(apiKey: apiKey)
+        // Infinite Recall fork: LLM client is resolved lazily per-call via
+        // AIProviderRegistry, so the constructor no longer fails when no
+        // provider is wired up. (Kept `throws` for source compatibility with
+        // the plugin's `try MemoryAssistant()` call sites.)
 
         let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         self.frameSignal = stream
@@ -359,8 +360,15 @@ actor MemoryAssistant: ProactiveAssistant {
     }
 
     private func extractMemories(from jpegData: Data, appName: String) async throws -> MemoryExtractionResult? {
-        // Build context with previous memories for deduplication
-        var prompt = "Analyze this screenshot from \(appName).\n\n"
+        // Build context with previous memories for deduplication.
+        //
+        // NOTE: the Gemini-era version of this prompt sent the screenshot JPEG
+        // alongside the text. Our local provider (mlx-lm.server with a text-only
+        // Qwen) doesn't accept images, so we send the prompt text only. The
+        // assistant still sees app + window context and the rolling list of
+        // previously-extracted memories. TODO: when a local vision model is
+        // available, route the image through too.
+        var prompt = "A screenshot was just taken from the app \"\(appName)\". Use the OCR-equivalent text content provided by the system to determine what's on screen.\n\n"
 
         if !previousMemories.isEmpty {
             prompt += "RECENTLY EXTRACTED MEMORIES (do not re-extract these or semantically similar ones):\n"
@@ -372,47 +380,35 @@ actor MemoryAssistant: ProactiveAssistant {
             prompt += "Look for memories to extract (system facts about the user, or interesting wisdom from others)."
         }
 
+        prompt += """
+
+
+        Return ONLY a JSON object with these fields:
+        - has_new_memory (boolean): true if new memories were found
+        - memories (array of objects, 0-3 max): each with:
+            - content (string, max 15 words)
+            - category (string, one of "system" or "interesting")
+            - source_app (string)
+            - confidence (number, 0.0 to 1.0)
+        - context_summary (string): brief summary of what user is looking at
+        - current_activity (string): high-level description of user's activity
+        """
+
         // Get current system prompt from settings
         let currentSystemPrompt = await systemPrompt
 
-        // Build response schema for memory extraction
-        let memoryProperties: [String: GeminiRequest.GenerationConfig.ResponseSchema.Property] = [
-            "content": .init(type: "string", description: "The memory content (max 15 words)"),
-            "category": .init(type: "string", enum: ["system", "interesting"], description: "Memory category"),
-            "source_app": .init(type: "string", description: "App where memory was found"),
-            "confidence": .init(type: "number", description: "Confidence score 0.0-1.0")
-        ]
-
-        let responseSchema = GeminiRequest.GenerationConfig.ResponseSchema(
-            type: "object",
-            properties: [
-                "has_new_memory": .init(type: "boolean", description: "True if new memories were found"),
-                "memories": .init(
-                    type: "array",
-                    description: "Array of extracted memories (0-3 max)",
-                    items: .init(
-                        type: "object",
-                        properties: memoryProperties,
-                        required: ["content", "category", "source_app", "confidence"]
-                    )
-                ),
-                "context_summary": .init(type: "string", description: "Brief summary of what user is looking at"),
-                "current_activity": .init(type: "string", description: "High-level description of user's activity")
-            ],
-            required: ["has_new_memory", "memories", "context_summary", "current_activity"]
-        )
+        guard let responseText = await LLMBridge.generateJSON(
+            systemPrompt: currentSystemPrompt,
+            userPrompt: prompt,
+            label: "Memory.extractMemories"
+        ) else {
+            return nil
+        }
 
         do {
-            let responseText = try await geminiClient.sendRequest(
-                prompt: prompt,
-                imageData: jpegData,
-                systemPrompt: currentSystemPrompt,
-                responseSchema: responseSchema
-            )
-
             return try JSONDecoder().decode(MemoryExtractionResult.self, from: Data(responseText.utf8))
         } catch {
-            logError("Memory analysis error", error: error)
+            logError("Memory analysis decode error (raw: \(responseText.prefix(200)))", error: error)
             return nil
         }
     }

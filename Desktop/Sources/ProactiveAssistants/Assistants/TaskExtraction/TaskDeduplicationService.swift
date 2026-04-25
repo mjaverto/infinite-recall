@@ -6,7 +6,6 @@ import Foundation
 actor TaskDeduplicationService {
     static let shared = TaskDeduplicationService()
 
-    private var geminiClient: GeminiClient?
     private var timer: Task<Void, Never>?
     private var isRunning = false
     private var lastRunTime: Date?
@@ -17,27 +16,7 @@ actor TaskDeduplicationService {
     private let cooldownSeconds: TimeInterval = 1800    // 30-min cooldown
     private let minimumTaskCount = 3
 
-    private var geminiClientInitAttempted = false
-
-    private init() {
-        // Don't eagerly init — API key may not be available yet (fetched by APIKeyService)
-    }
-
-    /// Lazy-initialize GeminiClient; retries if APIKeyService hasn't loaded yet.
-    private func getGeminiClient() -> GeminiClient? {
-        if let client = geminiClient { return client }
-        guard APIKeyService.keysAvailable || !geminiClientInitAttempted else { return nil }
-        geminiClientInitAttempted = true
-        do {
-            let client = try GeminiClient()
-            geminiClient = client
-            return client
-        } catch {
-            if !APIKeyService.keysAvailable { geminiClientInitAttempted = false }
-            log("TaskDedup: Failed to initialize GeminiClient: \(error)")
-            return nil
-        }
-    }
+    private init() {}
 
     // MARK: - Lifecycle
 
@@ -80,11 +59,6 @@ actor TaskDeduplicationService {
     // MARK: - Deduplication Logic
 
     private func runDeduplication() async {
-        guard let client = getGeminiClient() else {
-            log("TaskDedup: Skipping - Gemini client not initialized")
-            return
-        }
-
         lastRunTime = Date()
         log("TaskDedup: Starting deduplication run on staged tasks")
 
@@ -105,13 +79,13 @@ actor TaskDeduplicationService {
 
         log("TaskDedup: Analyzing \(tasks.count) staged tasks for duplicates")
 
-        // 2. Send all tasks to Gemini in a single call
-        let totalDeleted = await analyzeAndDeleteDuplicates(tasks: tasks, client: client)
+        // 2. Send all tasks to the local LLM in a single call
+        let totalDeleted = await analyzeAndDeleteDuplicates(tasks: tasks)
 
         log("TaskDedup: Run complete. Hard-deleted \(totalDeleted) duplicate staged tasks.")
     }
 
-    private func analyzeAndDeleteDuplicates(tasks: [TaskActionItem], client: GeminiClient) async -> Int {
+    private func analyzeAndDeleteDuplicates(tasks: [TaskActionItem]) async -> Int {
         // Build task list for prompt
         let taskDescriptions = tasks.map { task -> String in
             var parts = ["ID: \(task.id)", "Description: \(task.description)"]
@@ -144,6 +118,13 @@ actor TaskDeduplicationService {
 
         Only flag tasks as duplicates if you are confident they refer to the same action. \
         When in doubt, do NOT flag as duplicates.
+
+        Return ONLY a JSON object with these fields:
+        - has_duplicates (boolean): whether any duplicate groups were found
+        - duplicate_groups (array of objects): each with:
+            - keep_id (string): ID of the task to keep
+            - delete_ids (array of strings): IDs of tasks to delete
+            - reason (string): why these tasks are duplicates and which was kept
         """
 
         let systemPrompt = """
@@ -152,41 +133,11 @@ actor TaskDeduplicationService {
         Return has_duplicates: false if no duplicates are found.
         """
 
-        let responseSchema = GeminiRequest.GenerationConfig.ResponseSchema(
-            type: "object",
-            properties: [
-                "has_duplicates": .init(type: "boolean", description: "Whether any duplicate groups were found"),
-                "duplicate_groups": .init(
-                    type: "array",
-                    description: "Groups of duplicate tasks",
-                    items: .init(
-                        type: "object",
-                        properties: [
-                            "keep_id": .init(type: "string", description: "ID of the task to keep"),
-                            "delete_ids": .init(
-                                type: "array",
-                                description: "IDs of tasks to delete",
-                                items: .init(type: "string", properties: nil, required: nil)
-                            ),
-                            "reason": .init(type: "string", description: "Why these tasks are duplicates and which was kept")
-                        ],
-                        required: ["keep_id", "delete_ids", "reason"]
-                    )
-                )
-            ],
-            required: ["has_duplicates", "duplicate_groups"]
-        )
-
-        // Call Gemini
-        let responseText: String
-        do {
-            responseText = try await client.sendRequest(
-                prompt: prompt,
-                systemPrompt: systemPrompt,
-                responseSchema: responseSchema
-            )
-        } catch {
-            log("TaskDedup: Gemini request failed: \(error)")
+        guard let responseText = await LLMBridge.generateJSON(
+            systemPrompt: systemPrompt,
+            userPrompt: prompt,
+            label: "TaskDedup.analyzeAndDeleteDuplicates"
+        ) else {
             return 0
         }
 

@@ -19,7 +19,6 @@ actor InsightAssistant: ProactiveAssistant {
 
     // MARK: - Properties
 
-    private let geminiClient: GeminiClient
     private var isRunning = false
     private var lastAnalysisTime: Date = .distantPast
     private var previousInsights: [ExtractedInsight] = [] // Dedup window for insight context
@@ -63,7 +62,13 @@ actor InsightAssistant: ProactiveAssistant {
     // MARK: - Initialization
 
     init(apiKey: String? = nil) throws {
-        self.geminiClient = try GeminiClient(apiKey: apiKey, model: ModelQoS.Gemini.insight)
+        // Infinite Recall fork: LLM client is resolved lazily per-call via
+        // AIProviderRegistry; constructor never fails on missing provider.
+        // NOTE: this assistant relies on multi-turn tool calling + vision, which
+        // the v1 local provider doesn't yet support. The processing loop will
+        // currently skip extraction with a clear log line until a tool-calling
+        // local model lands. TODO(local-tools): wire the SQL/screenshot tool
+        // loop through a local function-calling model.
 
         let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         self.frameSignal = stream
@@ -507,299 +512,54 @@ actor InsightAssistant: ProactiveAssistant {
         lookbackStart: Date,
         trackSqlCount: Bool
     ) async throws -> (InsightExtractionResult?, Int) {
-        var sqlCount = 0
-
-        // Build prompt with current context
-        let timeFormatter = DateFormatter()
-        timeFormatter.dateFormat = "h:mm a, EEEE"
-        var prompt = "CURRENT APP: \(appName)."
-        if let windowTitle = windowTitle, !windowTitle.isEmpty {
-            prompt += " Window: \"\(windowTitle)\"."
+        // Infinite Recall fork: this flow requires multi-turn tool calling
+        // (execute_sql + request_screenshot) which the v1 local LLM provider
+        // doesn't expose. Bail out cleanly until tool-calling support lands.
+        // TODO(local-tools): replace with a local function-calling integration.
+        guard await LLMBridge.currentClient() != nil else {
+            log("[InsightAssistant] no LLM client available — skipping advice extraction")
+            return (nil, 0)
         }
-        prompt += " Time: \(timeFormatter.string(from: referenceTime))."
+        log("[InsightAssistant] tool-calling not supported by current LLM provider — skipping advice extraction (TODO: local tool calls)")
+        return await _legacyRunAdviceExtractionStub(
+            jpegData: jpegData,
+            appName: appName,
+            windowTitle: windowTitle,
+            referenceTime: referenceTime,
+            lookbackStart: lookbackStart,
+            trackSqlCount: trackSqlCount
+        )
+    }
 
-        // Add activity summary from database, anchored to the reference time
-        let elapsed = referenceTime.timeIntervalSince(lookbackStart)
-        log("Insight: Activity lookback: \(String(format: "%.0f", elapsed))s (\(lookbackStart) to \(referenceTime))")
-        let activitySummary = await buildActivitySummary(from: lookbackStart, to: referenceTime)
-        if !activitySummary.isEmpty {
-            prompt += "\n\n" + activitySummary
-            log("Insight: --- ACTIVITY SUMMARY ---\n\(activitySummary)")
-        } else {
-            log("Insight: --- ACTIVITY SUMMARY --- (empty, no screenshots in range)")
-        }
+    /// Placeholder for the legacy Gemini tool-calling extraction. Always
+    /// returns no-op until a local function-calling provider lands.
+    /// The full Gemini implementation lived in this file pre-fork; see git
+    /// history for the original two-phase logic.
+    private func _legacyRunAdviceExtractionStub(
+        jpegData: Data?,
+        appName: String,
+        windowTitle: String?,
+        referenceTime: Date,
+        lookbackStart: Date,
+        trackSqlCount: Bool
+    ) async -> (InsightExtractionResult?, Int) {
+        return (nil, 0)
+    }
 
-        // Add user profile for context
-        if let profile = await AIUserProfileService.shared.getLatestProfile() {
-            prompt += "\n\nUSER PROFILE (who this user is):\n"
-            prompt += profile.profileText + "\n"
-        }
-
-        // Add previous insights for dedup
-        if !previousInsights.isEmpty {
-            prompt += "\n\nPREVIOUSLY PROVIDED INSIGHTS (do not repeat these or semantically similar):\n"
-            let insightsToInclude = previousInsights.prefix(maxInsightsInPrompt)
-            for (index, prev) in insightsToInclude.enumerated() {
-                prompt += "\(index + 1). \(prev.insight)"
-                if let reasoning = prev.reasoning {
-                    prompt += " (Reasoning: \(reasoning))"
-                }
-                prompt += "\n"
-            }
-            prompt += "\nOnly provide insight if there's a genuinely NEW non-obvious insight not covered above."
-        } else {
-            prompt += "\n\nOnly provide insight if there's something specific and non-obvious that would help."
-        }
-
-        prompt += "\n\nInvestigate the activity summary. Scan OCR from the TOP 3-5 apps (not just the dominant one) — the best insights often come from browsers, communication apps, and notes, not just the app with the most screenshots. Skip apps with < 10 screenshots. When you've identified the most interesting screenshot, call request_screenshot with the ID and your findings. Or call no_advice if nothing qualifies."
-
-        log("Insight: --- PROMPT ---\n\(prompt)")
-
-        // Build system prompt
-        var currentSystemPrompt = await systemPrompt
-        if let language = await getUserLanguage(), language != "en" {
-            currentSystemPrompt += "\n\nIMPORTANT: Respond in the user's preferred language: \(language)"
-        }
-        currentSystemPrompt += "\n\nDATABASE SCHEMA for execute_sql:\nscreenshots table columns: id INTEGER, timestamp TEXT, appName TEXT, windowTitle TEXT, ocrText TEXT, focusStatus TEXT"
-
-        // =============================================
-        // PHASE 1: Text-only investigation loop
-        // =============================================
-
-        let phase1Tools = buildPhase1Tools()
-        var contents: [GeminiImageToolRequest.Content] = [
-            GeminiImageToolRequest.Content(
-                role: "user",
-                parts: [GeminiImageToolRequest.Part(text: prompt)]
-            )
-        ]
-
-        let client = self.geminiClient
-        var chosenScreenshotId: Int64?
-        var investigationFindings: String?
-
-        for iteration in 0..<7 {
-            let iterContents = contents
-            let iterSystemPrompt = currentSystemPrompt
-            let iterTools = [phase1Tools]
-            let iterForce = iteration == 0
-            let result: ToolChatResult
-            do {
-                result = try await withThrowingTimeout(seconds: 120) {
-                    try await client.sendImageToolLoop(
-                        contents: iterContents,
-                        systemPrompt: iterSystemPrompt,
-                        tools: iterTools,
-                        forceToolCall: iterForce
-                    )
-                }
-            } catch {
-                log("Insight: Phase 1 failed on iteration \(iteration): \(error.localizedDescription)")
-                throw error
-            }
-
-            guard let toolCall = result.toolCalls.first else {
-                log("Insight: Phase 1 — no tool call on iteration \(iteration), breaking")
-                break
-            }
-
-            switch toolCall.name {
-            case "execute_sql":
-                let query = toolCall.arguments["query"] as? String ?? ""
-                sqlCount += 1
-                log("Insight: P1 execute_sql iter \(iteration): \(query)")
-                let sqlToolCall = ToolCall(name: "execute_sql", arguments: ["query": query], thoughtSignature: nil)
-                let resultStr = await ChatToolExecutor.execute(sqlToolCall)
-                let truncated = resultStr.count > 2000 ? String(resultStr.prefix(2000)) + "... (truncated)" : resultStr
-                log("Insight: P1 sql result (\(resultStr.count) chars): \(truncated)")
-
-                contents.append(GeminiImageToolRequest.Content(
-                    role: "model",
-                    parts: [GeminiImageToolRequest.Part(
-                        functionCall: .init(name: toolCall.name, args: ["query": query]),
-                        thoughtSignature: toolCall.thoughtSignature
-                    )]
-                ))
-                contents.append(GeminiImageToolRequest.Content(
-                    role: "user",
-                    parts: [GeminiImageToolRequest.Part(functionResponse: .init(
-                        name: toolCall.name,
-                        response: .init(result: resultStr)
-                    ))]
-                ))
-                continue
-
-            case "request_screenshot":
-                let findings = toolCall.arguments["findings"] as? String ?? ""
-                investigationFindings = findings
-                if let idInt = toolCall.arguments["screenshot_id"] as? Int {
-                    chosenScreenshotId = Int64(idInt)
-                } else if let idInt64 = toolCall.arguments["screenshot_id"] as? Int64 {
-                    chosenScreenshotId = idInt64
-                } else if let idStr = toolCall.arguments["screenshot_id"] as? String, let parsed = Int64(idStr) {
-                    chosenScreenshotId = parsed
-                } else if let idDouble = toolCall.arguments["screenshot_id"] as? Double {
-                    chosenScreenshotId = Int64(idDouble)
-                }
-                log("Insight: P1 request_screenshot iter \(iteration): id=\(chosenScreenshotId ?? 0), findings=\(findings.prefix(200))")
-                break // Exit phase 1
-
-            case "no_advice":
-                let contextSummary = toolCall.arguments["context_summary"] as? String ?? "No context"
-                let currentActivity = toolCall.arguments["current_activity"] as? String ?? "Unknown"
-                log("Insight: P1 no_advice — \(contextSummary)")
-                return (InsightExtractionResult(
-                    hasInsight: false,
-                    insight: nil,
-                    contextSummary: contextSummary,
-                    currentActivity: currentActivity
-                ), sqlCount)
-
-            default:
-                log("Insight: P1 unknown tool: \(toolCall.name), breaking")
-                break
-            }
-
-            // Break out of loop if request_screenshot was called
-            if chosenScreenshotId != nil { break }
-        }
-
-        // If Phase 1 exhausted without choosing a screenshot, no advice
-        guard let screenshotId = chosenScreenshotId, let findings = investigationFindings else {
-            log("Insight: Phase 1 exhausted without request_screenshot")
-            return (nil, sqlCount)
-        }
-
-        // =============================================
-        // PHASE 2: Single vision call with chosen screenshot
-        // =============================================
-
-        log("Insight: Phase 2 — loading screenshot \(screenshotId)")
-
-        // Load the screenshot image
-        let imageData: Data
-        do {
-            guard let screenshot = try await RewindDatabase.shared.getScreenshot(id: screenshotId) else {
-                log("Insight: P2 screenshot not in DB: \(screenshotId)")
-                return (nil, sqlCount)
-            }
-            // Check active chunk
-            if screenshot.usesVideoStorage, let chunk = screenshot.videoChunkPath {
-                let activeChunk = await VideoChunkEncoder.shared.currentChunkPath
-                if chunk == activeChunk {
-                    log("Insight: P2 screenshot is in active chunk, skipping")
-                    return (nil, sqlCount)
-                }
-            }
-            let rawData = try await RewindStorage.shared.loadScreenshotData(for: screenshot)
-            imageData = Self.compressForGemini(rawData) ?? rawData
-            log("Insight: P2 loaded \(imageData.count) bytes (\(rawData.count) raw) from \(screenshot.appName)")
-        } catch {
-            log("Insight: P2 screenshot load failed: \(error.localizedDescription)")
-            return (nil, sqlCount)
-        }
-
-        // Build Phase 2 prompt — compact findings + image + cross-reference instruction
-        let phase2Prompt = """
-            INVESTIGATION FINDINGS:
-            \(findings)
-
-            The screenshot below is from the app/window identified during investigation.
-
-            Before giving insight, CROSS-REFERENCE your findings:
-            - Use execute_sql to check if this issue was resolved in later screenshots
-            - Check if the user moved on to something else (the issue may be stale)
-            - Verify the context is still relevant by looking at nearby timestamps
-
-            Then call provide_advice if the insight is still valid, or no_advice if it was resolved or is no longer relevant.
-            """
-
-        let phase2Tools = buildPhase2Tools()
-        let base64 = imageData.base64EncodedString()
-        var phase2Contents: [GeminiImageToolRequest.Content] = [
-            GeminiImageToolRequest.Content(
-                role: "user",
-                parts: [
-                    GeminiImageToolRequest.Part(text: phase2Prompt),
-                    GeminiImageToolRequest.Part(mimeType: "image/jpeg", data: base64),
-                ]
-            )
-        ]
-
-        // Phase 2 loop — model can cross-reference via SQL before deciding
-        for p2Iteration in 0..<5 {
-            let p2Contents = phase2Contents
-            let p2SystemPrompt = currentSystemPrompt
-            let p2Tools = [phase2Tools]
-            let p2Force = p2Iteration == 0
-            let phase2Result: ToolChatResult
-            do {
-                phase2Result = try await withThrowingTimeout(seconds: 120) {
-                    try await client.sendImageToolLoop(
-                        contents: p2Contents,
-                        systemPrompt: p2SystemPrompt,
-                        tools: p2Tools,
-                        forceToolCall: p2Force
-                    )
-                }
-            } catch {
-                log("Insight: Phase 2 failed on iteration \(p2Iteration): \(error.localizedDescription)")
-                throw error
-            }
-
-            guard let toolCall = phase2Result.toolCalls.first else {
-                log("Insight: Phase 2 — no tool call on iteration \(p2Iteration), breaking")
-                break
-            }
-
-            switch toolCall.name {
-            case "execute_sql":
-                let query = toolCall.arguments["query"] as? String ?? ""
-                sqlCount += 1
-                log("Insight: P2 execute_sql iter \(p2Iteration): \(query)")
-                let sqlToolCall = ToolCall(name: "execute_sql", arguments: ["query": query], thoughtSignature: nil)
-                let resultStr = await ChatToolExecutor.execute(sqlToolCall)
-                let truncated = resultStr.count > 2000 ? String(resultStr.prefix(2000)) + "... (truncated)" : resultStr
-                log("Insight: P2 sql result (\(resultStr.count) chars): \(truncated)")
-
-                phase2Contents.append(GeminiImageToolRequest.Content(
-                    role: "model",
-                    parts: [GeminiImageToolRequest.Part(
-                        functionCall: .init(name: toolCall.name, args: ["query": query]),
-                        thoughtSignature: toolCall.thoughtSignature
-                    )]
-                ))
-                phase2Contents.append(GeminiImageToolRequest.Content(
-                    role: "user",
-                    parts: [GeminiImageToolRequest.Part(functionResponse: .init(
-                        name: toolCall.name,
-                        response: .init(result: resultStr)
-                    ))]
-                ))
-                continue
-
-            case "provide_advice":
-                log("Insight: P2 provide_advice (after \(p2Iteration) cross-reference iterations)")
-                return (parseProvideAdvice(toolCall), sqlCount)
-
-            case "no_advice":
-                let contextSummary = toolCall.arguments["context_summary"] as? String ?? "No context"
-                let currentActivity = toolCall.arguments["current_activity"] as? String ?? "Unknown"
-                log("Insight: P2 no_advice — \(contextSummary)")
-                return (InsightExtractionResult(
-                    hasInsight: false,
-                    insight: nil,
-                    contextSummary: contextSummary,
-                    currentActivity: currentActivity
-                ), sqlCount)
-
-            default:
-                log("Insight: P2 unexpected tool: \(toolCall.name)")
-                break
-            }
-            break // Break on unexpected tool
-        }
-        return (nil, sqlCount)
+    /// Original Gemini implementation, kept for reference. NOT INVOKED.
+    /// TODO(local-tools): port this once a tool-calling local model is wired in.
+    private func _legacyRunAdviceExtractionGemini(
+        jpegData: Data?,
+        appName: String,
+        windowTitle: String?,
+        referenceTime: Date,
+        lookbackStart: Date,
+        trackSqlCount: Bool
+    ) async throws -> (InsightExtractionResult?, Int) {
+        // Stripped in Infinite Recall fork — see git history for the original
+        // two-phase Gemini tool-calling implementation. Will be re-ported once
+        // a local function-calling provider is wired into AIProviderRegistry.
+        return (nil, 0)
     }
 
     // MARK: - Activity Summary

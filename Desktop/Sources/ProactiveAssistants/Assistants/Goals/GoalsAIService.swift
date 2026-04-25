@@ -1,11 +1,9 @@
 import Foundation
 
-/// Service for AI-powered goal features using direct Gemini calls
+/// Service for AI-powered goal features. Calls go through the
+/// AIProviderRegistry (currently the local mlx-lm.server provider).
 actor GoalsAIService {
   static let shared = GoalsAIService()
-
-  private var geminiClient: GeminiClient?
-  private var geminiClientInitAttempted = false
 
   struct NormalizedGoalInput {
     let title: String
@@ -14,52 +12,11 @@ actor GoalsAIService {
     let unit: String?
   }
 
-  private init() {
-    // Don't eagerly initialize GeminiClient here — the API key may not
-    // be available yet (fetched async by APIKeyService after app launch).
-    // Instead, lazy-initialize on first use via getGeminiClient().
-  }
-
-  /// Lazy-initialize the GeminiClient on first use so the API key
-  /// (set by APIKeyService.fetchKeys()) is available.
-  private func getGeminiClient() -> GeminiClient? {
-    if let client = geminiClient { return client }
-    // If APIKeyService hasn't loaded yet, don't set the "attempted" flag — allow retry later
-    guard APIKeyService.keysAvailable || !geminiClientInitAttempted else { return nil }
-    geminiClientInitAttempted = true
-    do {
-      let client = try GeminiClient()
-      geminiClient = client
-      return client
-    } catch {
-      // If keys aren't loaded yet, reset flag so we retry once they are
-      if !APIKeyService.keysAvailable {
-        geminiClientInitAttempted = false
-      }
-      log("GoalsAIService: Failed to initialize GeminiClient: \(error)")
-      return nil
-    }
-  }
-
-  /// Response schema for normalizing ad-hoc onboarding goal text.
-  private var onboardingGoalNormalizationSchema: GeminiRequest.GenerationConfig.ResponseSchema {
-    GeminiRequest.GenerationConfig.ResponseSchema(
-      type: "object",
-      properties: [
-        "title": .init(type: "string", description: "Concise goal title without filler words"),
-        "goal_type": .init(type: "string", enum: ["boolean", "scale", "numeric"]),
-        "target_value": .init(type: "number", description: "Numeric target value"),
-        "unit": .init(type: "string", description: "Optional unit like users, sales, hours"),
-      ],
-      required: ["title", "goal_type", "target_value"]
-    )
-  }
+  private init() {}
 
   /// Normalize free-form onboarding goal input into structured goal fields.
   /// Example: "My goal is 200k users" -> title: "200k users", goalType: .numeric, targetValue: 200000, unit: "users"
   func normalizeOnboardingGoalInput(_ rawInput: String) async -> NormalizedGoalInput? {
-    guard let client = getGeminiClient() else { return nil }
-
     struct Response: Codable {
       let title: String
       let goalType: String
@@ -83,16 +40,23 @@ actor GoalsAIService {
     - Keep title short and noun/action focused.
     - If a numeric target is explicit (e.g., 200k, 10M), use goal_type=numeric and expand value (200k -> 200000).
     - If no explicit number, use goal_type=boolean and target_value=1.
-    - Return JSON only.
+
+    Return ONLY a JSON object with these fields:
+    - title (string): concise goal title
+    - goal_type (string): one of "boolean", "scale", or "numeric"
+    - target_value (number): numeric target value
+    - unit (string, optional): unit like "users", "sales", "hours"
     """
 
-    do {
-      let responseText = try await client.sendRequest(
-        prompt: prompt,
-        systemPrompt: "You clean and structure user goal text for product onboarding.",
-        responseSchema: onboardingGoalNormalizationSchema
-      )
+    guard let responseText = await LLMBridge.generateJSON(
+      systemPrompt: "You clean and structure user goal text for product onboarding.",
+      userPrompt: prompt,
+      label: "GoalsAI.normalizeOnboardingGoalInput"
+    ) else {
+      return nil
+    }
 
+    do {
       guard let data = responseText.data(using: .utf8) else { return nil }
       let parsed = try JSONDecoder().decode(Response.self, from: data)
       guard let type = GoalType(rawValue: parsed.goalType) else { return nil }
@@ -106,36 +70,9 @@ actor GoalsAIService {
         unit: parsed.unit?.trimmingCharacters(in: .whitespacesAndNewlines)
       )
     } catch {
-      log("GoalsAI: normalizeOnboardingGoalInput failed: \(error.localizedDescription)")
+      log("GoalsAI: normalizeOnboardingGoalInput parse failed: \(error.localizedDescription)")
       return nil
     }
-  }
-
-  /// Response schema for goal generation
-  private var goalSuggestionSchema: GeminiRequest.GenerationConfig.ResponseSchema {
-    GeminiRequest.GenerationConfig.ResponseSchema(
-      type: "object",
-      properties: [
-        "suggested_title": .init(type: "string", description: "Brief, actionable goal title"),
-        "suggested_description": .init(
-          type: "string",
-          description:
-            "1-2 sentence description explaining why this goal matters and what success looks like"),
-        "suggested_type": .init(
-          type: "string", enum: ["boolean", "scale", "numeric"], description: "Type of goal"),
-        "suggested_target": .init(type: "number", description: "Target value for the goal"),
-        "suggested_min": .init(type: "number", description: "Minimum value"),
-        "suggested_max": .init(type: "number", description: "Maximum value"),
-        "reasoning": .init(type: "string", description: "Why this goal fits the user"),
-        "linked_task_ids": .init(
-          type: "array", description: "IDs of existing tasks relevant to this goal",
-          items: .init(type: "string", properties: nil, required: nil)),
-      ],
-      required: [
-        "suggested_title", "suggested_description", "suggested_type", "suggested_target",
-        "suggested_min", "suggested_max", "reasoning",
-      ]
-    )
   }
 
   // MARK: - Rich Context Fetching
@@ -240,10 +177,6 @@ actor GoalsAIService {
 
   /// Automatically generate and create a goal based on rich user context
   func generateGoal() async throws -> Goal {
-    guard let client = getGeminiClient() else {
-      throw GoalsAIError.clientNotInitialized
-    }
-
     let ctx = await fetchRichContext()
 
     // Check if there's enough context to generate a meaningful goal
@@ -276,13 +209,27 @@ actor GoalsAIService {
     )
     log("GoalsAI: Full prompt:\n\(prompt)")
 
-    // Call Gemini
-    let responseText = try await client.sendRequest(
-      prompt: prompt,
-      systemPrompt:
-        "You are a goal coach. Generate one meaningful, achievable goal based on the user's full context.",
-      responseSchema: goalSuggestionSchema
-    )
+    // Goal-suggestion schema described inline so the local LLM can emit it.
+    let schemaDescription = """
+
+    Return ONLY a JSON object with these fields:
+    - suggested_title (string): brief, actionable goal title
+    - suggested_description (string): 1-2 sentence description explaining why this goal matters
+    - suggested_type (string): one of "boolean", "scale", "numeric"
+    - suggested_target (number): target value
+    - suggested_min (number): minimum value
+    - suggested_max (number): maximum value
+    - reasoning (string): why this goal fits the user
+    - linked_task_ids (array of strings, optional): IDs of existing tasks relevant to this goal
+    """
+
+    guard let responseText = await LLMBridge.generateJSON(
+      systemPrompt: "You are a goal coach. Generate one meaningful, achievable goal based on the user's full context.",
+      userPrompt: prompt + schemaDescription,
+      label: "GoalsAI.generateGoal"
+    ) else {
+      throw GoalsAIError.clientNotInitialized
+    }
 
     guard let data = responseText.data(using: .utf8) else {
       throw GoalsAIError.invalidResponse
@@ -334,10 +281,6 @@ actor GoalsAIService {
 
   /// Get AI-generated actionable insight for achieving a goal
   func getGoalInsight(goal: Goal) async throws -> String {
-    guard let client = getGeminiClient() else {
-      throw GoalsAIError.clientNotInitialized
-    }
-
     // 1. Fetch context
     let memories = try await APIClient.shared.getMemories(limit: 15)
     let conversations = try await APIClient.shared.getConversations(
@@ -373,12 +316,14 @@ actor GoalsAIService {
       .replacingOccurrences(
         of: "{memory_context}", with: memoryContext.isEmpty ? "No facts available" : memoryContext)
 
-    // 3. Call Gemini (text response, no schema)
-    let response = try await client.sendTextRequest(
-      prompt: prompt,
-      systemPrompt:
-        "You are a strategic advisor. Give specific, actionable advice based on user context. Be concise."
-    )
+    // 3. Call local LLM (text response, no schema)
+    guard let response = await LLMBridge.generate(
+      systemPrompt: "You are a strategic advisor. Give specific, actionable advice based on user context. Be concise.",
+      userPrompt: prompt,
+      label: "GoalsAI.getGoalInsight"
+    ) else {
+      throw GoalsAIError.clientNotInitialized
+    }
 
     return
       response
@@ -422,40 +367,34 @@ actor GoalsAIService {
   func extractProgress(text: String, goal: Goal, updateIfFound: Bool = true) async throws
     -> ProgressExtraction?
   {
-    guard let client = getGeminiClient() else {
-      throw GoalsAIError.clientNotInitialized
-    }
-
     guard text.count >= 5 else {
       return nil
     }
 
     // Build prompt
-    let prompt = GoalPrompts.extractProgress
+    let basePrompt = GoalPrompts.extractProgress
       .replacingOccurrences(of: "{goal_title}", with: goal.title)
       .replacingOccurrences(of: "{goal_type}", with: goal.goalType.rawValue)
       .replacingOccurrences(of: "{current_value}", with: String(format: "%.0f", goal.currentValue))
       .replacingOccurrences(of: "{target_value}", with: String(format: "%.0f", goal.targetValue))
       .replacingOccurrences(of: "{text}", with: String(text.prefix(500)))
 
-    // Build response schema
-    let responseSchema = GeminiRequest.GenerationConfig.ResponseSchema(
-      type: "object",
-      properties: [
-        "found": .init(type: "boolean", description: "Whether progress was found"),
-        "value": .init(type: "number", description: "The extracted progress value"),
-        "reasoning": .init(type: "string", description: "Brief explanation"),
-      ],
-      required: ["found"]
-    )
+    let prompt = basePrompt + """
 
-    // Call Gemini
-    let responseText = try await client.sendRequest(
-      prompt: prompt,
-      systemPrompt:
-        "Extract goal progress from text. Only return found=true if confident about the specific goal.",
-      responseSchema: responseSchema
-    )
+
+    Return ONLY a JSON object with:
+    - found (boolean): whether progress was found in the text
+    - value (number, optional): the extracted progress value
+    - reasoning (string, optional): brief explanation
+    """
+
+    guard let responseText = await LLMBridge.generateJSON(
+      systemPrompt: "Extract goal progress from text. Only return found=true if confident about the specific goal.",
+      userPrompt: prompt,
+      label: "GoalsAI.extractProgress"
+    ) else {
+      return nil
+    }
 
     guard let data = responseText.data(using: .utf8) else {
       return nil

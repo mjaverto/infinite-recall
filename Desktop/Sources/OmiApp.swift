@@ -355,6 +355,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     AnalyticsManager.shared.appLaunched()
     AnalyticsManager.shared.trackDisplayInfo()
 
+    // Probe the local LLM (mlx-lm.server) and surface the result + active
+    // provider in the log. Best-effort: a missing/offline server only means
+    // assistants will gracefully no-op until the server is up.
+    Task {
+      let reachable = await LocalLLMClient.shared.isReachable()
+      let providerName = await MainActor.run { AIProviderRegistry.shared.current.displayName }
+      log("[ai] Local LLM reachable: \(reachable). Default provider: \(providerName)")
+    }
+
     // Local MLX server lifecycle: poll status (running/installed/model-present)
     // every 5s so the AI / Models settings panel can show fresh state.
     Task { @MainActor in

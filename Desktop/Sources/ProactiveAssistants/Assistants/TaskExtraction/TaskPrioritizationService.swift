@@ -7,7 +7,6 @@ import Foundation
 actor TaskPrioritizationService {
     static let shared = TaskPrioritizationService()
 
-    private var geminiClient: GeminiClient?
     private var timer: Task<Void, Never>?
     private var isRunning = false
     private(set) var isScoringInProgress = false
@@ -25,34 +24,15 @@ actor TaskPrioritizationService {
     private let checkIntervalSeconds: TimeInterval = 300    // Check every 5 minutes
     private let minimumTaskCount = 2
 
-    private var geminiClientInitAttempted = false
-
     private init() {
         // Restore persisted timestamps
         self.lastFullRunTime = UserDefaults.standard.object(forKey: Self.fullRunKey) as? Date
-        // Don't eagerly init GeminiClient — API key may not be available yet
 
         if let last = self.lastFullRunTime {
             let hoursAgo = Int(Date().timeIntervalSince(last) / 3600)
             log("TaskPrioritize: Last full rescore was \(hoursAgo)h ago")
         } else {
             log("TaskPrioritize: No previous full rescore recorded")
-        }
-    }
-
-    /// Lazy-initialize GeminiClient; retries if APIKeyService hasn't loaded yet.
-    private func getGeminiClient() -> GeminiClient? {
-        if let client = geminiClient { return client }
-        guard APIKeyService.keysAvailable || !geminiClientInitAttempted else { return nil }
-        geminiClientInitAttempted = true
-        do {
-            let client = try GeminiClient()
-            geminiClient = client
-            return client
-        } catch {
-            if !APIKeyService.keysAvailable { geminiClientInitAttempted = false }
-            log("TaskPrioritize: Failed to initialize GeminiClient: \(error)")
-            return nil
         }
     }
 
@@ -117,10 +97,6 @@ actor TaskPrioritizationService {
     private func runFullRescore() async {
         guard !isScoringInProgress else {
             log("TaskPrioritize: [FULL] Skipping — scoring already in progress")
-            return
-        }
-        guard let client = getGeminiClient() else {
-            log("TaskPrioritize: Skipping full rescore — Gemini client not initialized")
             return
         }
 
@@ -210,8 +186,11 @@ actor TaskPrioritizationService {
         \(contextSection)CURRENT TASK RANKING (1 = most important):
         \(taskLines)
 
-        Return ONLY the tasks that need re-ranking, with their new position numbers.
-        New positions should be relative to the current list size (1 to \(sortedTasks.count)).
+        Return ONLY a JSON object with these fields:
+        - reranked_tasks (array of objects): tasks that need to be moved, each with:
+            - task_id (string): the task ID
+            - new_position (integer): new rank position (1 = most important, max \(sortedTasks.count))
+        - reasoning (string): brief explanation of major ranking changes
         """
 
         let systemPrompt = """
@@ -221,37 +200,13 @@ actor TaskPrioritizationService {
         and vague tasks down and promoting urgent, goal-aligned tasks up.
         """
 
-        let responseSchema = GeminiRequest.GenerationConfig.ResponseSchema(
-            type: "object",
-            properties: [
-                "reranked_tasks": .init(
-                    type: "array",
-                    description: "Tasks that need to be moved, with new positions",
-                    items: .init(
-                        type: "object",
-                        properties: [
-                            "task_id": .init(type: "string", description: "The task ID"),
-                            "new_position": .init(type: "integer", description: "New rank position (1 = most important)")
-                        ],
-                        required: ["task_id", "new_position"]
-                    )
-                ),
-                "reasoning": .init(type: "string", description: "Brief explanation of major ranking changes")
-            ],
-            required: ["reranked_tasks", "reasoning"]
-        )
+        log("TaskPrioritize: [FULL] Sending \(sortedTasks.count) staged tasks to local LLM")
 
-        log("TaskPrioritize: [FULL] Sending \(sortedTasks.count) staged tasks to Gemini")
-
-        let responseText: String
-        do {
-            responseText = try await client.sendRequest(
-                prompt: prompt,
-                systemPrompt: systemPrompt,
-                responseSchema: responseSchema
-            )
-        } catch {
-            log("TaskPrioritize: [FULL] Gemini request failed: \(error)")
+        guard let responseText = await LLMBridge.generateJSON(
+            systemPrompt: systemPrompt,
+            userPrompt: prompt,
+            label: "TaskPrioritize.runFullRescore"
+        ) else {
             return
         }
 
