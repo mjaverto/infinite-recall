@@ -803,8 +803,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     self.schedulerStatusItem = schedulerItem
     startSchedulerStatusTimer()
 
-    menu.addItem(NSMenuItem.separator())
-
     // Safe Mode submenu — pauses BOTH audio + screen capture with one click.
     let safeModeItem = NSMenuItem(title: "Safe Mode", action: nil, keyEquivalent: "")
     safeModeItem.submenu = buildSafeModeSubmenu()
@@ -815,14 +813,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       title: "Open \(displayName)", action: #selector(openOmiFromMenu), keyEquivalent: "o")
     openItem.target = self
     menu.addItem(openItem)
-
-    // Check for Updates
-    let updatesItem = NSMenuItem(
-      title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
-    updatesItem.target = self
-    menu.addItem(updatesItem)
-
-    menu.addItem(NSMenuItem.separator())
 
     // Quit item
     let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
