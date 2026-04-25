@@ -213,45 +213,9 @@ actor MemoryExportService {
   }
 
   func exportToNotion(token: String, parentPageID: String) async throws -> MemoryExportResult {
-    let sanitizedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-    let sanitizedParentPageID = parentPageID.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !sanitizedToken.isEmpty, !sanitizedParentPageID.isEmpty else {
-      throw MemoryExportError.invalidNotionConfiguration
-    }
-
-    let memories = try await fetchMemories(limit: 250)
-    guard !memories.isEmpty else { throw MemoryExportError.noMemories }
-
-    let pageTitle = "Omi Memory Export \(Self.exportTitleFormatter.string(from: Date()))"
-    let pageID = try await createNotionPage(
-      token: sanitizedToken,
-      parentPageID: sanitizedParentPageID,
-      title: pageTitle
-    )
-    try await appendNotionBlocks(
-      token: sanitizedToken,
-      pageID: pageID,
-      memories: memories
-    )
-
-    defaults.set(sanitizedToken, forKey: MemoryExportDestination.notion.notionTokenKey)
-    defaults.set(sanitizedParentPageID, forKey: MemoryExportDestination.notion.notionParentPageKey)
-
-    let detail = "Exported to Notion"
-    persistStatus(
-      destination: .notion,
-      exportedCount: memories.count,
-      detailText: detail,
-      filePath: nil
-    )
-
-    return MemoryExportResult(
-      memoryCount: memories.count,
-      detailText: detail,
-      destinationURL: URL(string: "https://www.notion.so/"),
-      fileURL: nil,
-      clipboardText: nil
-    )
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] MemoryExportService.exportToNotion: no-op")
+    throw MemoryExportError.requestFailed("Notion export disabled in local-only mode.")
   }
 
   func exportToObsidian(vaultURL: URL) async throws -> MemoryExportResult {
@@ -409,51 +373,17 @@ actor MemoryExportService {
   private func createNotionPage(token: String, parentPageID: String, title: String) async throws
     -> String
   {
-    let url = notionBaseURL.appendingPathComponent("pages")
-    var request = notionRequest(url: url, token: token)
-    request.httpMethod = "POST"
-
-    let body: [String: Any] = [
-      "parent": ["page_id": parentPageID],
-      "properties": [
-        "title": [
-          "title": [
-            [
-              "type": "text",
-              "text": ["content": title],
-            ]
-          ]
-        ]
-      ],
-    ]
-
-    request.httpBody = try JSONSerialization.data(withJSONObject: body)
-    let (data, response) = try await URLSession.shared.data(for: request)
-    try validateNotionResponse(data: data, response: response)
-
-    guard
-      let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let pageID = json["id"] as? String
-    else {
-      throw MemoryExportError.invalidNotionResponse
-    }
-
-    return pageID
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] MemoryExportService.createNotionPage: no-op")
+    throw MemoryExportError.requestFailed("Notion export disabled in local-only mode.")
   }
 
   private func appendNotionBlocks(token: String, pageID: String, memories: [ServerMemory])
     async throws
   {
-    let url = notionBaseURL.appendingPathComponent("blocks/\(pageID)/children")
-    let chunks = notionChildren(memories: memories).chunked(into: 100)
-
-    for chunk in chunks where !chunk.isEmpty {
-      var request = notionRequest(url: url, token: token)
-      request.httpMethod = "PATCH"
-      request.httpBody = try JSONSerialization.data(withJSONObject: ["children": chunk])
-      let (data, response) = try await URLSession.shared.data(for: request)
-      try validateNotionResponse(data: data, response: response)
-    }
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] MemoryExportService.appendNotionBlocks: no-op")
+    throw MemoryExportError.requestFailed("Notion export disabled in local-only mode.")
   }
 
   private func notionRequest(url: URL, token: String) -> URLRequest {

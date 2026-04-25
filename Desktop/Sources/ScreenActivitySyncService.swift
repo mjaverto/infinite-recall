@@ -28,14 +28,9 @@ actor ScreenActivitySyncService {
 
     /// Start the sync loop. Call after auth is established and database is ready.
     func start() {
-        guard !isRunning else {
-            log("ScreenActivitySync: already running")
-            return
-        }
-        isRunning = true
-        loadCursor()
-        log("ScreenActivitySync: starting (lastSyncedId=\(lastSyncedId))")
-        syncLoop()
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] ScreenActivitySyncService.start: no-op")
+        return
     }
 
     /// Stop the sync loop.
@@ -149,43 +144,9 @@ actor ScreenActivitySyncService {
     // MARK: - HTTP push
 
     private func pushRows(_ rows: [[String: Any]]) async -> Bool {
-        let payload: [String: Any] = ["rows": rows]
-
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else {
-            log("ScreenActivitySync: JSON serialization error")
-            return false
-        }
-
-        do {
-            let headers = try await APIClient.shared.buildHeaders()
-            let baseURL = await APIClient.shared.rustBackendURL
-            guard let url = URL(string: baseURL + "v1/screen-activity/sync") else {
-                log("ScreenActivitySync: invalid URL")
-                return false
-            }
-
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.httpBody = jsonData
-            request.timeoutInterval = 60
-            for (key, value) in headers {
-                request.setValue(value, forHTTPHeaderField: key)
-            }
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else { return false }
-
-            if httpResponse.statusCode == 200 {
-                return true
-            } else {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                log("ScreenActivitySync: HTTP \(httpResponse.statusCode): \(body)")
-                return false
-            }
-        } catch {
-            log("ScreenActivitySync: network error — \(error.localizedDescription)")
-            return false
-        }
+        // Infinite Recall fork: local-only mode — no outbound network.
+        log("[backend-stripped] ScreenActivitySyncService.pushRows: no-op (rows=\(rows.count))")
+        return false
     }
 
     // MARK: - Database access

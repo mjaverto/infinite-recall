@@ -4,8 +4,9 @@ enum AppBuild {
   static let productionBundleIdentifier = "com.omi.computer-macos"
   private static let updateChannelDefaultsKey = "update_channel"
   private static let betaOverwriteMigrationKey = "didMigrateBetaOverwrite_v1"
-  private static let desktopAppcastURL = URL(
-    string: "https://api.omi.me/v2/desktop/appcast.xml?platform=macos")!
+  // Infinite Recall fork: Sparkle appcast URL stripped — was "https://api.omi.me/v2/desktop/appcast.xml?platform=macos".
+  // Set to nil so any caller that tries to fetch it short-circuits to fallback.
+  private static let desktopAppcastURL: URL? = nil
 
   static var bundleIdentifier: String {
     Bundle.main.bundleIdentifier ?? productionBundleIdentifier

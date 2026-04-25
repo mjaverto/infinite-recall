@@ -227,13 +227,11 @@ actor GeminiClient {
   }
 
   init(apiKey: String? = nil, model: String = ModelQoS.Gemini.proactive) throws {
-    // BREAKING CHANGE (issue #5861): apiKey parameter is ignored.
-    // All Gemini requests now route through the backend proxy which supplies
-    // the key server-side. Requires OMI_API_URL to be set (standard dev flow via run.sh).
-    guard !Self.proxyBaseURL.isEmpty else {
-      throw GeminiClientError.missingAPIKey
-    }
-    self.model = model
+    // Infinite Recall fork: local-only mode — Gemini proxy disabled.
+    // All Gemini requests previously routed through the backend proxy at OMI_API_URL.
+    // Refuse to construct a client so no caller can issue a remote request.
+    log("[backend-stripped] GeminiClient.init: no-op (refusing to build client)")
+    throw GeminiClientError.missingAPIKey
   }
 
   /// Get Firebase auth header for proxy requests

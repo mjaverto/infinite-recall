@@ -11,47 +11,15 @@ actor OnboardingWebResearchService {
   static let shared = OnboardingWebResearchService()
 
   func search(queries: [String], maxResultsPerQuery: Int = 3) async -> [OnboardingWebSearchResult] {
-    var allResults: [OnboardingWebSearchResult] = []
-    var seenURLs = Set<String>()
-
-    for query in queries where !query.isEmpty {
-      let results = await search(query: query, maxResults: maxResultsPerQuery)
-      for result in results where seenURLs.insert(result.url).inserted {
-        allResults.append(result)
-      }
-    }
-
-    return allResults
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] OnboardingWebResearchService.search(queries:): no-op (queries=\(queries.count))")
+    return []
   }
 
   private func search(query: String, maxResults: Int) async -> [OnboardingWebSearchResult] {
-    guard
-      let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-      let url = URL(string: "https://html.duckduckgo.com/html/?q=\(encodedQuery)")
-    else {
-      return []
-    }
-
-    var request = URLRequest(url: url)
-    request.setValue(
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-      forHTTPHeaderField: "User-Agent"
-    )
-    request.timeoutInterval = 20
-
-    do {
-      let (data, response) = try await URLSession.shared.data(for: request)
-      guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-        return []
-      }
-
-      let html = String(decoding: data, as: UTF8.self)
-      return parse(html: html, query: query, maxResults: maxResults)
-    } catch {
-      log(
-        "OnboardingWebResearchService: Search failed for '\(query)': \(error.localizedDescription)")
-      return []
-    }
+    // Infinite Recall fork: local-only mode — no outbound network.
+    log("[backend-stripped] OnboardingWebResearchService.search(query:): no-op (query=\(query))")
+    return []
   }
 
   private func parse(
