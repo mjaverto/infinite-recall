@@ -66,12 +66,13 @@ struct DesktopHomeView: View {
         .onAppear {
           log("DesktopHomeView: Showing auth loading splash")
         }
-      } else if !authState.isSignedIn {
-        // State 1: Not signed in - show sign in
+      } else if false {
+        // State 1: Not signed in - DISABLED for Infinite Recall fork.
+        // The app always launches as an anonymous local user (see
+        // AuthService.signInAnonymously() called from OmiApp), so the
+        // SignInView is unreachable. Branch left in place to minimize
+        // diff against upstream Omi.
         SignInView(authState: authState)
-          .onAppear {
-            log("DesktopHomeView: Showing SignInView (not signed in)")
-          }
       } else if !appState.hasCompletedOnboarding {
         // State 2: Signed in but onboarding not complete
         if shouldSkipOnboarding() {
