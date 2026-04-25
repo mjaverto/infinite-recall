@@ -18,6 +18,9 @@ class TaskAssistantSettings {
     // MARK: - Default Allowed Apps (Whitelist)
 
     /// Default apps allowed for task extraction. User can edit this list.
+    /// Bumped to v2 to add developer/terminal apps — Mike runs Claude Code in
+    /// Terminal a lot, and "ship X", "fix Y" pop up there constantly. The
+    /// migration below merges these into any existing saved set on first run.
     static let defaultAllowedApps: Set<String> = [
         "Telegram",
         "\u{200E}WhatsApp",  // WhatsApp uses a hidden LTR mark prefix
@@ -35,7 +38,22 @@ class TaskAssistantSettings {
         "Opera",
         "Notes",
         "Superhuman",
+        // Terminal + IDE apps — task-rich for developer workflows
+        "Terminal",
+        "iTerm2",
+        "Ghostty",
+        "Warp",
+        "Alacritty",
+        "Cursor",
+        "Visual Studio Code",
+        "Code",
+        "Xcode",
+        "Zed",
     ]
+
+    /// Bump when defaultAllowedApps grows so existing installs pick up new entries.
+    private static let allowedAppsDefaultsVersion = 2
+    private static let allowedAppsVersionKey = "taskAllowedAppsVersion"
 
     // MARK: - Browser Apps
 
@@ -346,8 +364,11 @@ class TaskAssistantSettings {
     }
 
     /// The full editable set of allowed apps. Initialized from defaults if user hasn't customized.
+    /// On first run after a defaults bump, merges any new built-in apps into the saved set so
+    /// existing installs aren't stuck with the old whitelist.
     var allowedApps: Set<String> {
         get {
+            migrateAllowedAppsIfNeeded()
             let rawValue = UserDefaults.standard.array(forKey: allowedAppsKey)
             if let saved = rawValue as? [String], !saved.isEmpty {
                 return Set(saved)
@@ -358,6 +379,18 @@ class TaskAssistantSettings {
             UserDefaults.standard.set(Array(newValue), forKey: allowedAppsKey)
             NotificationCenter.default.post(name: .assistantSettingsDidChange, object: nil)
         }
+    }
+
+    /// Idempotent: if the user's saved set is from an earlier defaults version,
+    /// union in the new built-ins and bump the version flag.
+    private func migrateAllowedAppsIfNeeded() {
+        let saved = UserDefaults.standard.integer(forKey: TaskAssistantSettings.allowedAppsVersionKey)
+        if saved >= TaskAssistantSettings.allowedAppsDefaultsVersion { return }
+        if let savedApps = UserDefaults.standard.array(forKey: allowedAppsKey) as? [String], !savedApps.isEmpty {
+            let merged = Set(savedApps).union(TaskAssistantSettings.defaultAllowedApps)
+            UserDefaults.standard.set(Array(merged), forKey: allowedAppsKey)
+        }
+        UserDefaults.standard.set(TaskAssistantSettings.allowedAppsDefaultsVersion, forKey: TaskAssistantSettings.allowedAppsVersionKey)
     }
 
     /// The full editable list of browser window keywords. Initialized from defaults if user hasn't customized.
