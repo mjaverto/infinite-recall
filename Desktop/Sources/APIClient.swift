@@ -94,7 +94,12 @@ actor APIClient {
   /// UserDefaults directly so this is safe to call from any actor context.
   fileprivate var isLocalOnlyMode: Bool {
     if testAuthHeader != nil { return false }
-    return !UserDefaults.standard.bool(forKey: "auth_isSignedIn")
+    // Infinite Recall fork: this app is always local-only. Earlier logic
+    // checked `auth_isSignedIn`, but the anonymous-sign-in bypass sets that
+    // to true, which made the short-circuit dead code. Hardcoding to true
+    // ensures every API call no-ops to a synthesized empty result instead
+    // of leaking out to api.omi.me.
+    return true
   }
 
   /// Best-effort synthesizer that produces an "empty" decoded value for type T.
@@ -115,6 +120,15 @@ actor APIClient {
   // MARK: - Request Building
 
   func buildHeaders(requireAuth: Bool = true) async throws -> [String: String] {
+    // Infinite Recall fork: short-circuit BEFORE building the request so
+    // that direct PATCH/DELETE callers (setConversationStarred,
+    // setConversationVisibility, updateConversationTitle,
+    // moveConversationToFolder, etc.) that bypass the central
+    // get/post/delete short-circuit also fail fast and never hit the network.
+    if requireAuth, isLocalOnlyMode {
+      throw APIError.localOnlyMode
+    }
+
     var headers: [String: String] = [
       "Content-Type": "application/json",
       "X-App-Platform": "macos",
@@ -126,8 +140,6 @@ actor APIClient {
         headers["Authorization"] = testHeader
       } else {
         let authService = await MainActor.run { AuthService.shared }
-        // Infinite Recall fork: local-only mode — skip Authorization header when
-        // no Firebase user is present rather than throwing notSignedIn.
         if let authHeader = try? await authService.getAuthHeader() {
           headers["Authorization"] = authHeader
         }
