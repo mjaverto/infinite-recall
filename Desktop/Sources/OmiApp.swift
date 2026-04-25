@@ -392,6 +392,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
       MLXLifecycleManager.shared.startPolling()
       // Same cadence for the local REST API (powers MCP integrations).
       MCPAPIService.shared.startPolling(interval: 5)
+      // Idle-unload watchdog: stops mlx-lm.server when system has been
+      // idle long enough, restarts on next AI call.
+      IdleAIController.shared.start()
     }
 
     // Tier gating: migrate old boolean key to new 6-tier system
@@ -1382,6 +1385,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     Task { @MainActor in
       MLXLifecycleManager.shared.stopPolling()
       MCPAPIService.shared.stopPolling()
+      IdleAIController.shared.stop()
     }
 
     // Remove window observers

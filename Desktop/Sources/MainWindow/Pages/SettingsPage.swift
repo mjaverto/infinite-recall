@@ -301,6 +301,7 @@ struct SettingsContentView: View {
   @ObservedObject private var aiProviderRegistry = AIProviderRegistry.shared
   @ObservedObject private var mlxLifecycle = MLXLifecycleManager.shared
   @ObservedObject private var mcpAPI = MCPAPIService.shared
+  @ObservedObject private var idleController = IdleAIController.shared
 
   // In-app installer sheet (replaces the prior Terminal-launch flow).
   @State private var presentingInstallSheet: Bool = false
@@ -342,7 +343,6 @@ struct SettingsContentView: View {
     case troubleshooting = "Troubleshooting"
     case gmailReader = "Gmail Reader"
     case calendarSync = "Calendar Sync"
-    case developerKeys = "Developer API Keys"
 
     var icon: String {
       switch self {
@@ -359,7 +359,6 @@ struct SettingsContentView: View {
       case .troubleshooting: return "wrench.and.screwdriver"
       case .gmailReader: return "envelope.fill"
       case .calendarSync: return "calendar"
-      case .developerKeys: return "key"
       }
     }
   }
@@ -386,15 +385,6 @@ struct SettingsContentView: View {
 
   @State private var isDeletingAccount: Bool = false
   @State private var deleteAccountError: String?
-
-  // Developer API Key overrides — also double as BYOK free-plan credentials
-  // when all four (Gemini, Anthropic, OpenAI, Deepgram) are provided.
-  @AppStorage("dev_gemini_api_key") private var devGeminiKey: String = ""
-  @AppStorage("dev_anthropic_api_key") private var devAnthropicKey: String = ""
-  @AppStorage("dev_openai_api_key") private var devOpenAIKey: String = ""
-  @AppStorage("dev_deepgram_api_key") private var devDeepgramKey: String = ""
-  @State private var byokKeyStatuses: [BYOKProvider: BYOKValidator.Status] = [:]
-  @State private var byokActivationError: String?
 
   init(
     appState: AppState,
@@ -1968,6 +1958,11 @@ struct SettingsContentView: View {
           .buttonStyle(.bordered)
         }
 
+        Divider().overlay(OmiColors.backgroundQuaternary)
+
+        // Power Saving subsection — auto-unload local LLM when idle.
+        powerSavingSubsection
+
         // Footer
         // TODO: allow selecting alternative MLX models in a future sprint.
         Text(
@@ -1977,6 +1972,78 @@ struct SettingsContentView: View {
         .foregroundColor(OmiColors.textTertiary)
         .padding(.top, 4)
       }
+    }
+  }
+
+  // MARK: - Power Saving (idle-unload) subsection
+
+  /// Embedded inside the Local Model card. Lets the user toggle idle-unload
+  /// of `mlx-lm.server` and pick a timeout. Status line reflects the current
+  /// state of `IdleAIController`.
+  private var powerSavingSubsection: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack(spacing: 10) {
+        Image(systemName: "bolt.slash")
+          .scaledFont(size: 14)
+          .foregroundColor(OmiColors.purplePrimary)
+          .frame(width: 20)
+        Text("Power Saving")
+          .scaledFont(size: 14, weight: .medium)
+          .foregroundColor(OmiColors.textPrimary)
+        Spacer()
+      }
+
+      Toggle(
+        "Stop AI when idle",
+        isOn: Binding(
+          get: { idleController.isEnabled },
+          set: { idleController.isEnabled = $0 }
+        )
+      )
+      .toggleStyle(.switch)
+      .scaledFont(size: 13)
+
+      HStack(spacing: 8) {
+        Text("Idle timeout")
+          .scaledFont(size: 13)
+          .foregroundColor(OmiColors.textSecondary)
+        Picker(
+          "",
+          selection: Binding(
+            get: { idleController.idleTimeoutMinutes },
+            set: { idleController.idleTimeoutMinutes = $0 }
+          )
+        ) {
+          Text("5 minutes").tag(5)
+          Text("10 minutes").tag(10)
+          Text("15 minutes").tag(15)
+          Text("30 minutes").tag(30)
+          Text("60 minutes").tag(60)
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(maxWidth: 160)
+        .disabled(!idleController.isEnabled)
+        Spacer()
+      }
+
+      HStack(spacing: 6) {
+        Text("Status:")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textTertiary)
+        Text(idleController.statusText)
+          .scaledFont(size: 12)
+          .foregroundColor(
+            idleController.serverStoppedByIdle
+              ? OmiColors.warning : OmiColors.textSecondary)
+      }
+
+      Text(
+        "Frees the ~20 GB the LLM holds in RAM. Cold restart on the next AI request takes ~30s."
+      )
+      .scaledFont(size: 11)
+      .foregroundColor(OmiColors.textTertiary)
+      .fixedSize(horizontal: false, vertical: true)
     }
   }
 
@@ -5325,215 +5392,6 @@ struct SettingsContentView: View {
     return formatter
   }
 
-  // MARK: - Developer API Keys Subsection
-
-  private var developerKeysSubsection: some View {
-    VStack(spacing: 20) {
-      byokStatusBanner
-
-      developerKeyField(
-        provider: .openai,
-        title: "OpenAI API Key",
-        subtitle: "For GPT calls.",
-        settingId: "advanced.devkeys.openai",
-        value: $devOpenAIKey
-      )
-
-      developerKeyField(
-        provider: .anthropic,
-        title: "Anthropic API Key",
-        subtitle: "For chat (Claude).",
-        settingId: "advanced.devkeys.anthropic",
-        value: $devAnthropicKey
-      )
-
-      developerKeyField(
-        provider: .gemini,
-        title: "Gemini API Key",
-        subtitle: "For proactive AI (memory, tasks, insights, focus).",
-        settingId: "advanced.devkeys.gemini",
-        value: $devGeminiKey
-      )
-
-      developerKeyField(
-        provider: .deepgram,
-        title: "Deepgram API Key",
-        subtitle: "For live transcription.",
-        settingId: "advanced.devkeys.deepgram",
-        value: $devDeepgramKey
-      )
-
-      if let byokActivationError {
-        settingsCard(settingId: "advanced.devkeys.error") {
-          HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-              .foregroundColor(OmiColors.warning)
-            Text(byokActivationError)
-              .scaledFont(size: 12)
-              .foregroundColor(OmiColors.warning)
-          }
-        }
-      }
-
-      if hasAnyBYOKKey {
-        settingsCard(settingId: "advanced.devkeys.clear") {
-          HStack {
-            Spacer()
-            Button(action: clearAllBYOKKeys) {
-              Text("Clear All Custom Keys")
-                .scaledFont(size: 13, weight: .medium)
-                .foregroundColor(.red)
-            }
-            .buttonStyle(.plain)
-            Spacer()
-          }
-        }
-      }
-    }
-    .onChange(of: devOpenAIKey) { _, _ in refreshBYOKActivation() }
-    .onChange(of: devAnthropicKey) { _, _ in refreshBYOKActivation() }
-    .onChange(of: devGeminiKey) { _, _ in refreshBYOKActivation() }
-    .onChange(of: devDeepgramKey) { _, _ in refreshBYOKActivation() }
-  }
-
-  private var hasAnyBYOKKey: Bool {
-    !devOpenAIKey.isEmpty || !devAnthropicKey.isEmpty || !devGeminiKey.isEmpty
-      || !devDeepgramKey.isEmpty
-  }
-
-  private var hasAllBYOKKeys: Bool {
-    !devOpenAIKey.isEmpty && !devAnthropicKey.isEmpty && !devGeminiKey.isEmpty
-      && !devDeepgramKey.isEmpty
-  }
-
-  @ViewBuilder
-  private var byokStatusBanner: some View {
-    settingsCard(settingId: "advanced.devkeys.info") {
-      HStack(alignment: .top, spacing: 12) {
-        Image(systemName: hasAllBYOKKeys ? "checkmark.seal.fill" : "key.fill")
-          .foregroundColor(hasAllBYOKKeys ? OmiColors.success : OmiColors.textTertiary)
-        VStack(alignment: .leading, spacing: 4) {
-          Text(hasAllBYOKKeys ? "Free plan active" : "Use Infinite Recall free forever")
-            .scaledFont(size: 14, weight: .semibold)
-            .foregroundColor(OmiColors.textPrimary)
-          Text(
-            hasAllBYOKKeys
-              ? "You're paying your own providers. Omi skips the subscription charge. Keys stay on this Mac."
-              : "Provide all four keys (OpenAI, Anthropic, Gemini, Deepgram) to switch to the free plan. Keys stay on this Mac — we never store them on our servers."
-          )
-          .scaledFont(size: 12)
-          .foregroundColor(OmiColors.textTertiary)
-        }
-        Spacer()
-      }
-    }
-  }
-
-  private func clearAllBYOKKeys() {
-    devOpenAIKey = ""
-    devAnthropicKey = ""
-    devGeminiKey = ""
-    devDeepgramKey = ""
-    Task {
-      try? await APIClient.shared.deactivateBYOK()
-    }
-  }
-
-  private func refreshBYOKActivation() {
-    Task {
-      if APIKeyService.isByokActive {
-        // Validate before flipping the backend flag — otherwise we'd put the
-        // user on the free plan with dead keys and every chat would 401.
-        let snapshot = APIKeyService.byokSnapshot.reduce(into: [BYOKProvider: String]()) {
-          acc, entry in acc[entry.key] = entry.value.key
-        }
-        let results = await BYOKValidator.validateAll(snapshot)
-        let allOk = results.allSatisfy {
-          if case .ok = $0.value { return true }
-          return false
-        }
-        if allOk {
-          let fingerprints = APIKeyService.byokSnapshot.reduce(into: [String: String]()) {
-            acc, entry in acc[entry.key.rawValue] = entry.value.fingerprint
-          }
-          try? await APIClient.shared.activateBYOK(fingerprints: fingerprints)
-          await FloatingBarUsageLimiter.shared.fetchPlan()
-          await MainActor.run {
-            byokKeyStatuses = results
-            byokActivationError = nil
-          }
-        } else {
-          let failed = results.filter {
-            if case .ok = $0.value { return false }
-            return true
-          }
-          let names = failed.keys.map(\.displayName).sorted().joined(separator: ", ")
-          try? await APIClient.shared.deactivateBYOK()
-          await FloatingBarUsageLimiter.shared.fetchPlan()
-          await MainActor.run {
-            byokKeyStatuses = results
-            byokActivationError =
-              "Rejected by provider: \(names). Free plan stays off until all 4 keys authenticate."
-          }
-        }
-      } else {
-        try? await APIClient.shared.deactivateBYOK()
-        await FloatingBarUsageLimiter.shared.fetchPlan()
-        await MainActor.run {
-          byokKeyStatuses = [:]
-          byokActivationError = nil
-        }
-      }
-      await MainActor.run { loadSubscriptionInfo() }
-    }
-  }
-
-  private func developerKeyField(
-    provider: BYOKProvider? = nil,
-    title: String, subtitle: String, settingId: String, value: Binding<String>
-  ) -> some View {
-    settingsCard(settingId: settingId) {
-      VStack(alignment: .leading, spacing: 8) {
-        HStack {
-          Text(title)
-            .scaledFont(size: 14, weight: .medium)
-            .foregroundColor(OmiColors.textPrimary)
-          Spacer()
-          if let provider, let status = byokKeyStatuses[provider] {
-            byokStatusBadge(status)
-          }
-        }
-        Text(subtitle)
-          .scaledFont(size: 12)
-          .foregroundColor(OmiColors.textTertiary)
-        SecureField("Leave blank for default", text: value)
-          .textFieldStyle(.roundedBorder)
-          .scaledFont(size: 13)
-        if let provider, case .failed(let msg) = byokKeyStatuses[provider] ?? .notChecked {
-          Text(msg)
-            .scaledFont(size: 11)
-            .foregroundColor(OmiColors.warning)
-        }
-      }
-    }
-  }
-
-  @ViewBuilder
-  private func byokStatusBadge(_ status: BYOKValidator.Status) -> some View {
-    switch status {
-    case .notChecked:
-      EmptyView()
-    case .checking:
-      HStack(spacing: 4) {
-        ProgressView().controlSize(.mini)
-        Text("Checking…").scaledFont(size: 11).foregroundColor(OmiColors.textTertiary)
-      }
-    case .ok:
-      Text("Valid").scaledFont(size: 11, weight: .semibold).foregroundColor(OmiColors.success)
-    case .failed:
-      Text("Invalid").scaledFont(size: 11, weight: .semibold).foregroundColor(OmiColors.warning)
-    }
-  }
 
   private var floatingBarVoiceAnswersBinding: Binding<Bool> {
     Binding(
