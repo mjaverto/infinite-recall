@@ -306,6 +306,16 @@ struct SettingsContentView: View {
   // In-app installer sheet (replaces the prior Terminal-launch flow).
   @State private var presentingInstallSheet: Bool = false
 
+  // Local Model picker — tracks the user's currently selected model and
+  // whether the "Show all models" disclosure is expanded. Active model id
+  // is persisted via @AppStorage; the in-card selection (which radio is
+  // highlighted before they hit "Set as Active") is local.
+  @AppStorage("activeLocalModelID") private var activeLocalModelID: String =
+    MLXLifecycleManager.defaultModelID
+  @State private var localModelPickerExpanded: Bool = false
+  @State private var localModelPickerSelection: String? = nil
+  @State private var localModelSwitchInFlight: Bool = false
+
   // MCP API card — expandable response viewer + transient "copied" feedback.
   @State private var mcpAPIShowResponse: Bool = false
   @State private var mcpAPICopyFeedback: String? = nil
@@ -1869,109 +1879,308 @@ struct SettingsContentView: View {
           Spacer()
         }
 
-        // Status rows
-        VStack(alignment: .leading, spacing: 8) {
+        Text("Powers memory + action item extraction.")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+
+        // Active model summary line.
+        activeModelSummary
+
+        if let progress = mlxLifecycle.modelDownloadProgress {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Downloading model — \(Int(progress * 100))%")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.textTertiary)
+            ProgressView(value: progress)
+              .progressViewStyle(
+                LinearProgressViewStyle(tint: OmiColors.purplePrimary)
+              )
+          }
+        }
+
+        if let err = mlxLifecycle.lastError, !err.isEmpty {
+          Text(err)
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.warning)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+
+        // "Show all models" disclosure with the 4-row picker.
+        localModelPicker
+
+        Divider().overlay(OmiColors.backgroundQuaternary)
+
+        // Server + logs action row.
+        HStack(spacing: 8) {
           statusRow(
             ok: mlxLifecycle.serverRunning,
             okText: "Server: Running",
             failText: "Server: Stopped"
           )
-          statusRow(
-            ok: mlxLifecycle.agentInstalled,
-            okText: "launchd agent installed",
-            failText: "launchd agent: Not installed"
-          )
-          statusRow(
-            ok: mlxLifecycle.modelPresent,
-            okText: "Model present",
-            failText: "Model: Not downloaded"
-          )
+          .layoutPriority(1)
 
-          if let progress = mlxLifecycle.modelDownloadProgress {
-            VStack(alignment: .leading, spacing: 4) {
-              Text("Downloading model — \(Int(progress * 100))%")
-                .scaledFont(size: 11)
-                .foregroundColor(OmiColors.textTertiary)
-              ProgressView(value: progress)
-                .progressViewStyle(
-                  LinearProgressViewStyle(tint: OmiColors.purplePrimary)
-                )
-            }
-          }
-
-          if let err = mlxLifecycle.lastError, !err.isEmpty {
-            Text(err)
-              .scaledFont(size: 11)
-              .foregroundColor(OmiColors.warning)
-              .fixedSize(horizontal: false, vertical: true)
-          }
-        }
-
-        Divider().overlay(OmiColors.backgroundQuaternary)
-
-        // Install button (primary) — opens the native install sheet.
-        Button(action: { presentingInstallSheet = true }) {
-          HStack {
-            Image(systemName: "arrow.down.circle.fill")
-            Text(
-              mlxLifecycle.agentInstalled && mlxLifecycle.modelPresent
-                ? "Reinstall local model"
-                : "Install local model"
-            )
-            .scaledFont(size: 13, weight: .semibold)
-          }
-          .frame(maxWidth: .infinity)
-          .padding(.vertical, 4)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(OmiColors.purplePrimary)
-        .help("Installs uv, mlx-lm, and the ~18 GB Qwen 2.5-32B model in the background.")
-        .sheet(isPresented: $presentingInstallSheet) {
-          LocalAIInstallSheet()
-        }
-
-        // Secondary action row
-        HStack(spacing: 8) {
-          Button("Restart Server") {
+          Button("Restart") {
             Task {
               await mlxLifecycle.startServer()
               await mlxLifecycle.refresh()
             }
           }
           .buttonStyle(.bordered)
+          .controlSize(.small)
           .disabled(!mlxLifecycle.agentInstalled)
 
-          Button("Stop Server") {
+          Button("Stop") {
             Task {
               await mlxLifecycle.stopServer()
               await mlxLifecycle.refresh()
             }
           }
           .buttonStyle(.bordered)
+          .controlSize(.small)
           .disabled(!mlxLifecycle.agentInstalled || !mlxLifecycle.serverRunning)
-
-          Spacer()
 
           Button("Open Logs") {
             openLogsFolder()
           }
           .buttonStyle(.bordered)
+          .controlSize(.small)
         }
 
         Divider().overlay(OmiColors.backgroundQuaternary)
 
         // Power Saving subsection — auto-unload local LLM when idle.
         powerSavingSubsection
-
-        // Footer
-        // TODO: allow selecting alternative MLX models in a future sprint.
-        Text(
-          "Default model: mlx-community/Qwen2.5-32B-Instruct-4bit (~18 GB)"
-        )
-        .scaledFont(size: 11)
-        .foregroundColor(OmiColors.textTertiary)
-        .padding(.top, 4)
       }
+      .sheet(isPresented: $presentingInstallSheet) {
+        LocalAIInstallSheet()
+      }
+    }
+  }
+
+  // MARK: Active model summary (top of card)
+
+  private var activeModelSummary: some View {
+    let active = LocalModelCatalog.option(forId: activeLocalModelID)
+      ?? LocalModelCatalog.recommended
+    let installed = mlxLifecycle.isModelInstalled(modelId: active.id)
+    return HStack(spacing: 8) {
+      Text("Active:")
+        .scaledFont(size: 12)
+        .foregroundColor(OmiColors.textTertiary)
+      Text(active.displayName)
+        .scaledFont(size: 12, weight: .semibold)
+        .foregroundColor(OmiColors.textPrimary)
+      if installed {
+        Image(systemName: "checkmark.circle.fill")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.success)
+        Text("Installed (\(formatGB(active.approxDiskGB)))")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+      } else {
+        Image(systemName: "exclamationmark.circle")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.warning)
+        Text("Not installed")
+          .scaledFont(size: 12)
+          .foregroundColor(OmiColors.textSecondary)
+      }
+      Spacer()
+    }
+  }
+
+  // MARK: Local Model picker (radio-row list)
+
+  /// Disclosure that flips between a one-line "Show all models" affordance
+  /// and a 4-row radio-style picker. Each row carries install state and an
+  /// inline Install button when the model isn't on disk yet. A "Set as
+  /// Active" button appears under the rows whenever the user has selected
+  /// something other than the currently active model.
+  @ViewBuilder
+  private var localModelPicker: some View {
+    DisclosureGroup(
+      isExpanded: $localModelPickerExpanded,
+      content: {
+        VStack(alignment: .leading, spacing: 10) {
+          ForEach(LocalModelCatalog.all) { option in
+            localModelRow(option)
+          }
+
+          if let pendingId = localModelPickerSelection,
+             pendingId != activeLocalModelID,
+             mlxLifecycle.isModelInstalled(modelId: pendingId)
+          {
+            HStack {
+              Spacer()
+              Button(action: { setActiveModel(pendingId) }) {
+                if localModelSwitchInFlight {
+                  ProgressView()
+                    .controlSize(.small)
+                    .padding(.horizontal, 6)
+                } else {
+                  Text("Set as Active")
+                    .scaledFont(size: 12, weight: .semibold)
+                }
+              }
+              .buttonStyle(.borderedProminent)
+              .tint(OmiColors.purplePrimary)
+              .controlSize(.small)
+              .disabled(localModelSwitchInFlight)
+            }
+            .padding(.top, 4)
+          }
+        }
+        .padding(.top, 8)
+      },
+      label: {
+        Text(localModelPickerExpanded ? "Hide models" : "Show all models")
+          .scaledFont(size: 12, weight: .medium)
+          .foregroundColor(OmiColors.purplePrimary)
+      }
+    )
+    .onAppear {
+      if localModelPickerSelection == nil {
+        localModelPickerSelection = activeLocalModelID
+      }
+    }
+  }
+
+  /// One radio-style row for a `LocalModelOption`. Tap the row to "select"
+  /// (highlight) it; that doesn't activate the model — the user must press
+  /// "Set as Active" to commit the switch. Non-installed rows expose an
+  /// inline Install button that drops them into `LocalAIInstallSheet`.
+  @ViewBuilder
+  private func localModelRow(_ option: LocalModelOption) -> some View {
+    let isActive = option.id == activeLocalModelID
+    let isSelected = (localModelPickerSelection ?? activeLocalModelID) == option.id
+    let installed = mlxLifecycle.isModelInstalled(modelId: option.id)
+
+    HStack(alignment: .top, spacing: 10) {
+      Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+        .scaledFont(size: 14)
+        .foregroundColor(
+          isSelected ? OmiColors.purplePrimary : OmiColors.textTertiary
+        )
+        .padding(.top, 1)
+
+      VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 8) {
+          Text(option.displayName)
+            .scaledFont(size: 13, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+          Text(option.badge)
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textSecondary)
+          if isActive {
+            Image(systemName: "checkmark")
+              .scaledFont(size: 11, weight: .semibold)
+              .foregroundColor(OmiColors.success)
+          }
+          Spacer()
+        }
+
+        Text(localModelMetadataLine(option))
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.textTertiary)
+
+        HStack(spacing: 8) {
+          if installed {
+            HStack(spacing: 4) {
+              Image(systemName: "checkmark.circle.fill")
+                .scaledFont(size: 10)
+                .foregroundColor(OmiColors.success)
+              Text("Installed")
+                .scaledFont(size: 11)
+                .foregroundColor(OmiColors.textSecondary)
+            }
+            if isActive {
+              Text("· Currently active")
+                .scaledFont(size: 11)
+                .foregroundColor(OmiColors.textTertiary)
+            }
+          } else {
+            Text("Not installed")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.textTertiary)
+
+            Button("Install") {
+              installLocalModel(option.id)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+          }
+          Spacer()
+        }
+      }
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      localModelPickerSelection = option.id
+    }
+  }
+
+  // MARK: Local Model picker — helpers
+
+  private func localModelMetadataLine(_ option: LocalModelOption) -> String {
+    let ram = formatGB(option.approxRamGB) + " RAM"
+    let disk = formatGB(option.approxDiskGB) + " disk"
+    return "~\(ram) · \(disk) · \(option.license)"
+  }
+
+  private func formatGB(_ value: Double) -> String {
+    // Show 1 decimal for sub-10 GB, integer for ≥10 GB (matches the design).
+    if value >= 10 {
+      return "\(Int(value.rounded())) GB"
+    }
+    let s = String(format: "%.1f", value)
+    return "\(s) GB"
+  }
+
+  /// Triggered by an inline row Install button. Routes through the existing
+  /// install sheet so the user gets the same step list + progress bar UX.
+  private func installLocalModel(_ modelId: String) {
+    Task {
+      // Fire-and-forget: the sheet itself awaits LocalAIInstaller via
+      // `.task`. We just need to seed the picker selection and present.
+      localModelPickerSelection = modelId
+      presentingInstallSheet = true
+      await LocalAIInstaller.shared.startMLXInstall(modelId: modelId)
+    }
+  }
+
+  /// Switch the active model. Stops the server, rewrites the launchd plist
+  /// to point at the new model, reloads the agent, and starts it back up.
+  /// All on the main actor since we mutate `@AppStorage` + `@Published`
+  /// state via `MLXLifecycleManager`.
+  private func setActiveModel(_ modelId: String) {
+    guard !localModelSwitchInFlight else { return }
+    localModelSwitchInFlight = true
+    Task {
+      defer { localModelSwitchInFlight = false }
+
+      let lifecycle = MLXLifecycleManager.shared
+
+      // 1. Stop the running server (if any) so launchctl can rewrite the
+      //    plist cleanly.
+      if lifecycle.serverRunning {
+        await lifecycle.stopServer()
+      }
+
+      // 2. Persist the new id BEFORE plist regeneration — `regeneratePlist`
+      //    reads from UserDefaults via `MLXLifecycleManager.activeModelID`.
+      activeLocalModelID = modelId
+
+      // 3. Rewrite the launchd plist with the new --model arg.
+      _ = lifecycle.regeneratePlistForActiveModel()
+
+      // 4. unload + load to apply.
+      _ = await lifecycle.reloadAgent()
+
+      // 5. Start the server back up.
+      _ = await lifecycle.startServer()
+
+      // 6. Re-poll so the UI reflects the new state.
+      await lifecycle.refresh()
     }
   }
 

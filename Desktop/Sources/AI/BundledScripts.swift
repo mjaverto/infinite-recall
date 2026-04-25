@@ -101,7 +101,10 @@ enum BundledScripts {
 set -euo pipefail
 
 LABEL="com.infiniterecall.mlx"
-DEFAULT_MODEL="mlx-community/Qwen2.5-32B-Instruct-4bit"
+# The model id can be overridden by the in-app installer when the user
+# picks a non-default option from the Local Model picker. Falls back to the
+# 32B Qwen build if the env var isn't set.
+DEFAULT_MODEL="${INFINITE_RECALL_MLX_MODEL:-mlx-community/Qwen2.5-32B-Instruct-4bit}"
 HOST="127.0.0.1"
 PORT="8080"
 
