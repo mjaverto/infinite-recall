@@ -1055,7 +1055,7 @@ public class ProactiveAssistantsPlugin: NSObject {
             let assistantId = (notification.userInfo?["assistantId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
 
             let resolvedTitle = title?.isEmpty == false ? title! : "Insight"
-            let resolvedMessage = message?.isEmpty == false ? message! : "Test notification from Omi"
+            let resolvedMessage = message?.isEmpty == false ? message! : "Test notification from Infinite Recall"
             let resolvedAssistantId = assistantId?.isEmpty == false ? assistantId! : "insight"
 
             let context = FloatingBarNotificationContext(
@@ -1271,7 +1271,7 @@ public class ProactiveAssistantsPlugin: NSObject {
             // Send user notification
             NotificationService.shared.sendNotification(
                 title: "Screen Recording Permission Required",
-                message: "omi needs screen recording permission to continue monitoring. Please re-enable it in System Settings.",
+                message: "Infinite Recall needs screen recording permission to continue monitoring. Please re-enable it in System Settings.",
                 deliverSystemBanner: true
             )
         }

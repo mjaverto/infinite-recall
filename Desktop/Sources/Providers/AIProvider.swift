@@ -23,7 +23,7 @@ struct AIProvider: Identifiable {
 
   static let piMono = AIProvider(
     id: "piMono",
-    displayName: "Omi AI",
+    displayName: "Infinite Recall AI",
     tagline: "Built-in AI assistant (built with pi.dev)",
     attributionURL: nil,
     sfSymbol: "",

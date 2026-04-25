@@ -57,7 +57,7 @@ struct OnboardingTasksStepView: View {
                         .font(.system(size: 24, weight: .bold))
                         .foregroundColor(OmiColors.textPrimary)
 
-                    Text("omi listens to your conversations and automatically\ncreates tasks, action items, and follow-ups for you.")
+                    Text("Infinite Recall listens to your conversations and automatically\ncreates tasks, action items, and follow-ups for you.")
                         .font(.system(size: 14))
                         .foregroundColor(OmiColors.textSecondary)
                         .multilineTextAlignment(.center)

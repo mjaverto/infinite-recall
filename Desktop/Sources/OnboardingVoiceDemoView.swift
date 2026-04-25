@@ -89,7 +89,7 @@ struct OnboardingVoiceDemoView: View {
                     .padding(.top, 4)
                     .transition(.opacity)
                 } else if !showContinue {
-                    Text(waitingForResponse ? "Waiting for omi to respond..." : "Listening... release when done")
+                    Text(waitingForResponse ? "Waiting for Infinite Recall to respond..." : "Listening... release when done")
                         .font(.system(size: 13))
                         .foregroundColor(OmiColors.textTertiary)
                         .padding(.top, 4)

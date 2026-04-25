@@ -129,7 +129,7 @@ struct AIResponseView: View {
                     .scaledFont(size: 14)
                     .foregroundColor(.secondary)
             } else {
-                Text("omi says")
+                Text("Infinite Recall says")
                     .scaledFont(size: 14)
                     .foregroundColor(.secondary)
             }

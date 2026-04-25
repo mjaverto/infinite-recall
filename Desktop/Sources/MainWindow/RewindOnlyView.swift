@@ -47,7 +47,7 @@ struct RewindOnlyView: View {
             // Force dark appearance on the window
             DispatchQueue.main.async {
                 for window in NSApp.windows {
-                    if window.title.contains("Rewind") || window.title.lowercased().hasPrefix("omi") {
+                    if window.title.contains("Rewind") || window.title.lowercased().hasPrefix("infinite recall") {
                         window.appearance = NSAppearance(named: .darkAqua)
                     }
                 }

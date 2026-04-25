@@ -19,7 +19,7 @@ struct OnboardingExportsStepView: View {
       totalSteps: totalSteps,
       eyebrow: "",
       title: "Put your memories where you work.",
-      description: "Connect the tools where you want Omi context to live.",
+      description: "Connect the tools where you want Infinite Recall context to live.",
       rightPaneFooterText: summaryText,
       showsSkip: true,
       onSkip: onSkip,
@@ -169,7 +169,7 @@ private struct OnboardingInlineExportPanel: View {
 
       case .chatgpt, .claude, .gemini:
         inlineInfoCard(
-          "Omi copies the prompt and memory pack together, saves a Markdown backup, and opens \(destination.title)."
+          "Infinite Recall copies the prompt and memory pack together, saves a Markdown backup, and opens \(destination.title)."
         )
       }
 

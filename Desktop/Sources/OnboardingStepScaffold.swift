@@ -198,7 +198,7 @@ struct OnboardingLogoMark: View {
           .scaledToFit()
           .frame(width: 52, height: 18)
       } else {
-        Text("omi")
+        Text("Infinite Recall")
           .font(.system(size: 18, weight: .semibold))
           .foregroundColor(.white)
       }
@@ -207,7 +207,7 @@ struct OnboardingLogoMark: View {
     .onLongPressGesture(minimumDuration: 1) {
       onForceComplete?()
     }
-    .accessibilityLabel("omi")
+    .accessibilityLabel("Infinite Recall")
   }
 
   private func onboardingLogoImage() -> NSImage? {
@@ -301,7 +301,7 @@ private struct OnboardingSecondBrainPane: View {
     case .graph:
       if graphViewModel.isEmpty {
         VStack(spacing: 14) {
-          Text("Your graph appears once Omi has something real to map.")
+          Text("Your graph appears once Infinite Recall has something real to map.")
             .font(.system(size: 15, weight: .medium))
             .foregroundColor(OmiColors.textTertiary)
             .multilineTextAlignment(.center)

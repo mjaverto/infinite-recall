@@ -41,13 +41,13 @@ struct OnboardingFloatingBarDemoView: View {
             VStack(spacing: 28) {
                 VStack(spacing: 12) {
                     if !barActivated {
-                        Text("Omi sees your screen and gives you hyper-personalized responses")
+                        Text("Infinite Recall sees your screen and gives you hyper-personalized responses")
                             .font(.system(size: 20, weight: .bold))
                             .foregroundColor(OmiColors.textPrimary)
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: 560)
 
-                        Text("Press this shortcut to open Ask Omi.")
+                        Text("Press this shortcut to open Ask Infinite Recall.")
                             .font(.system(size: 18, weight: .medium))
                             .foregroundColor(OmiColors.textSecondary)
                             .multilineTextAlignment(.center)
@@ -74,7 +74,7 @@ struct OnboardingFloatingBarDemoView: View {
                             }
                         }
 
-                        Text("Ask Omi opens at the top of your screen.")
+                        Text("Ask Infinite Recall opens at the top of your screen.")
                             .font(.system(size: 13))
                             .foregroundColor(OmiColors.textTertiary)
                     }

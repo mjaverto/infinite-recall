@@ -351,7 +351,7 @@ struct MemoryExportDestinationSheet: View {
         .foregroundColor(OmiColors.textSecondary)
         .scaledFont(size: 12, weight: .medium)
 
-        Text("Omi writes a refreshed `Omi/Memories.md` file inside the selected vault.")
+        Text("Infinite Recall writes a refreshed `InfiniteRecall/Memories.md` file inside the selected vault.")
           .scaledFont(size: 12)
           .foregroundColor(OmiColors.textTertiary)
       }
@@ -359,7 +359,7 @@ struct MemoryExportDestinationSheet: View {
     case .chatgpt, .claude, .gemini:
       VStack(alignment: .leading, spacing: 12) {
         Text(
-          "Omi will generate a Markdown memory pack, copy the prompt and export together, reveal the file in Finder, and open \(destination.title)."
+          "Infinite Recall will generate a Markdown memory pack, copy the prompt and export together, reveal the file in Finder, and open \(destination.title)."
         )
         .scaledFont(size: 13)
         .foregroundColor(OmiColors.textSecondary)

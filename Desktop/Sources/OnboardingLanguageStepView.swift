@@ -17,7 +17,7 @@ struct OnboardingLanguageStepView: View {
       totalSteps: totalSteps,
       eyebrow: "Language",
       title: "Pick your language.",
-      description: "Omi will use it for prompts and transcripts.",
+      description: "Infinite Recall will use it for prompts and transcripts.",
       onForceComplete: onForceComplete
     ) {
       VStack(alignment: .leading, spacing: 18) {
