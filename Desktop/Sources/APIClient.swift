@@ -5204,7 +5204,7 @@ extension APIClient {
   /// Body shape (frozen interface I1):
   ///     { "depths": { "<kind.rawValue>": { "queued": N, "failed": M }, … } }
   ///
-  /// Returns when the daemon answers 204. Throws `APIError.invalidResponse`
+  /// Returns when the daemon answers 204. Throws `APIError.daemonNotConfigured`
   /// when `IR_API_URL` is unset (caller should treat that as "daemon not up").
   func reportQueueDepth(_ depths: [PendingWork.Kind: (queued: Int, failed: Int)]) async throws {
     let base = try rustBackendURL
