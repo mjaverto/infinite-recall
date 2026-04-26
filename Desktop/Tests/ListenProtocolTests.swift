@@ -1,11 +1,30 @@
 import XCTest
 @testable import Omi_Computer
 
-/// Tests for the Python backend WebSocket protocol parsing.
-/// Exercises TranscriptionService.parseBackendResponse() end-to-end with real callback dispatch.
+/// Tests for `TranscriptionService` — the on-device WhisperKit transcription engine.
+///
+/// HISTORY: This file originally exercised the Python backend WebSocket protocol
+/// (`parseBackendResponse(_:)`, `handleDisconnection()`, `cleanupAndReconnect()`,
+/// `reconnectAttempts`, `maxReconnectAttempts`). The Infinite Recall fork removed
+/// that entire cloud path — see the commented-out "Legacy cloud WebSocket path"
+/// block at the bottom of `TranscriptionService.swift`. Tests that asserted on
+/// behaviors which no longer exist in the codebase are documented as DROPPED
+/// below (intent preserved as comments so the original test signal is traceable).
+///
+/// What IS still tested here:
+///   1. `BackendSegment` JSON decoding — the struct is preserved verbatim for
+///      AppState compatibility, so its `Decodable` contract is still load-bearing.
+///   2. `start(...)` / `stop()` lifecycle — fires `onConnected`/`onDisconnected`
+///      callbacks and toggles `isConnected`.
+///   3. `int16PCMToFloat32` audio conversion math.
+///   4. `sendAudio(_:)` is a no-op when not connected (guard branch).
 final class ListenProtocolTests: XCTestCase {
 
     // MARK: - BackendSegment Decoding
+    //
+    // These tests are unchanged from the original file. The `BackendSegment`
+    // shape is preserved so AppState's `handleBackendSegments` still compiles
+    // and the on-device WhisperKit pipeline produces identical payloads.
 
     func testDecodeSegmentWithAllFields() throws {
         let json = """
@@ -66,417 +85,156 @@ final class ListenProtocolTests: XCTestCase {
         XCTAssertTrue(segments.isEmpty)
     }
 
-    // MARK: - parseBackendResponse: Callback Dispatch
+    func testDecodeSegmentWithTranslations() throws {
+        // BackendTranslation is also preserved — exercise its decoding too.
+        let json = """
+        [{"id":"s1","text":"hola","speaker":"SPEAKER_00","speaker_id":0,"is_user":true,"person_id":null,"start":0.0,"end":1.0,"translations":[{"lang":"en","text":"hello"}]}]
+        """
+        let data = json.data(using: .utf8)!
+        let segments = try JSONDecoder().decode([TranscriptionService.BackendSegment].self, from: data)
 
-    /// Helper: create a TranscriptionService and wire its callbacks for testing.
-    /// Uses forBatchOnly init to avoid needing Firebase auth.
-    private func makeServiceWithCallbacks(
-        onSegments: @escaping ([TranscriptionService.BackendSegment]) -> Void,
-        onEvent: @escaping (TranscriptionService.ListenEvent) -> Void
-    ) -> TranscriptionService? {
-        // Use batch init to skip auth/URL requirements, then set callbacks manually
-        guard let service = try? TranscriptionService(language: "en", forBatchOnly: true) else {
-            // Batch init — create with streaming init fallback if needed
-            return try? TranscriptionService(language: "en")
-        }
-        service.start(
-            onSegments: onSegments,
-            onEvent: onEvent,
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-        return service
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(segments[0].translations?.count, 1)
+        XCTAssertEqual(segments[0].translations?[0].lang, "en")
+        XCTAssertEqual(segments[0].translations?[0].text, "hello")
     }
 
-    func testParserDispatchesSegmentCallback() throws {
-        var receivedSegments: [TranscriptionService.BackendSegment] = []
+    // MARK: - Lifecycle: start() / stop()
+    //
+    // The cloud WebSocket connect/disconnect lifecycle is gone. The current
+    // contract is simpler: `start()` fires `onConnected` immediately (so the
+    // mic capture pipeline can begin even before WhisperKit finishes loading
+    // its ~140 MB model), and `stop()` fires `onDisconnected` and clears state.
+    // We test that synchronous contract here without exercising WhisperKit
+    // model loading (which would attempt a network download).
+
+    func testStartFiresOnConnectedAndSetsIsConnected() throws {
+        let connected = expectation(description: "onConnected fires")
         let service = try TranscriptionService(language: "en")
         service.start(
-            onSegments: { receivedSegments = $0 },
+            onSegments: { _ in },
             onEvent: { _ in },
             onError: nil,
-            onConnected: nil,
+            onConnected: { connected.fulfill() },
             onDisconnected: nil
         )
-
-        let json = """
-        [{"id":"s1","text":"hello","speaker":"SPEAKER_00","speaker_id":0,"is_user":true,"person_id":null,"start":0.0,"end":1.5}]
-        """
-        service.parseBackendResponse(json)
-
-        XCTAssertEqual(receivedSegments.count, 1)
-        XCTAssertEqual(receivedSegments[0].id, "s1")
-        XCTAssertEqual(receivedSegments[0].text, "hello")
-        XCTAssertTrue(receivedSegments[0].is_user)
+        // `start` flips isConnected synchronously before dispatching the callback.
+        XCTAssertTrue(service.isConnected)
+        wait(for: [connected], timeout: 2.0)
+        // Cancel the background model-load task so we don't hold a network handle.
+        service.stop()
     }
 
-    func testParserDispatchesEventCallback() throws {
-        var receivedEvent: TranscriptionService.ListenEvent?
+    func testStopFiresOnDisconnectedAndClearsIsConnected() throws {
+        let connected = expectation(description: "onConnected fires")
+        let disconnected = expectation(description: "onDisconnected fires")
         let service = try TranscriptionService(language: "en")
         service.start(
             onSegments: { _ in },
-            onEvent: { receivedEvent = $0 },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        let json = """
-        {"type":"memory_created","memory":{"id":"conv-abc"}}
-        """
-        service.parseBackendResponse(json)
-
-        XCTAssertEqual(receivedEvent?.type, "memory_created")
-        let memory = receivedEvent?.raw["memory"] as? [String: Any]
-        XCTAssertEqual(memory?["id"] as? String, "conv-abc")
-    }
-
-    func testParserIgnoresPingHeartbeat() throws {
-        var segmentsCalled = false
-        var eventCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in segmentsCalled = true },
-            onEvent: { _ in eventCalled = true },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        service.parseBackendResponse("ping")
-        service.parseBackendResponse("  ping  \n")
-
-        XCTAssertFalse(segmentsCalled, "ping should not trigger segments callback")
-        XCTAssertFalse(eventCalled, "ping should not trigger event callback")
-    }
-
-    func testParserIgnoresEmptySegmentArray() throws {
-        var segmentsCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in segmentsCalled = true },
             onEvent: { _ in },
             onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
+            onConnected: { connected.fulfill() },
+            onDisconnected: { disconnected.fulfill() }
         )
+        wait(for: [connected], timeout: 2.0)
+        XCTAssertTrue(service.isConnected)
 
-        service.parseBackendResponse("[]")
-
-        XCTAssertFalse(segmentsCalled, "empty array should not trigger segments callback")
-    }
-
-    func testParserHandlesInvalidJsonGracefully() throws {
-        var segmentsCalled = false
-        var eventCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in segmentsCalled = true },
-            onEvent: { _ in eventCalled = true },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        service.parseBackendResponse("not json at all")
-        service.parseBackendResponse("{invalid json")
-        service.parseBackendResponse("")
-
-        XCTAssertFalse(segmentsCalled)
-        XCTAssertFalse(eventCalled)
-    }
-
-    func testParserDispatchesSegmentsDeletedEvent() throws {
-        var receivedEvent: TranscriptionService.ListenEvent?
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { receivedEvent = $0 },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        let json = """
-        {"type":"segments_deleted","segment_ids":["s1","s2"]}
-        """
-        service.parseBackendResponse(json)
-
-        XCTAssertEqual(receivedEvent?.type, "segments_deleted")
-        let ids = receivedEvent?.raw["segment_ids"] as? [String]
-        XCTAssertEqual(ids, ["s1", "s2"])
-    }
-
-    func testParserDispatchesSpeakerLabelEvent() throws {
-        var receivedEvent: TranscriptionService.ListenEvent?
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { receivedEvent = $0 },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        let json = """
-        {"type":"speaker_label_suggestion","speaker_id":1,"person_id":"p1","person_name":"Alice"}
-        """
-        service.parseBackendResponse(json)
-
-        XCTAssertEqual(receivedEvent?.type, "speaker_label_suggestion")
-        XCTAssertEqual(receivedEvent?.raw["speaker_id"] as? Int, 1)
-        XCTAssertEqual(receivedEvent?.raw["person_name"] as? String, "Alice")
-    }
-
-    func testParserIgnoresObjectWithoutType() throws {
-        var eventCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { _ in eventCalled = true },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        // JSON object without "type" field should be silently ignored
-        service.parseBackendResponse("""
-        {"data":"something","value":42}
-        """)
-
-        XCTAssertFalse(eventCalled, "object without type should not trigger event callback")
-    }
-
-    // MARK: - Parser Boundary Tests
-
-    func testParserHandlesArrayOfInvalidSegments() throws {
-        // Valid JSON array but objects don't match BackendSegment schema
-        var segmentsCalled = false
-        var eventCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in segmentsCalled = true },
-            onEvent: { _ in eventCalled = true },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        // Array of objects missing required fields (text, is_user, start, end)
-        service.parseBackendResponse("""
-        [{"foo":"bar","baz":123}]
-        """)
-
-        XCTAssertFalse(segmentsCalled, "array with non-decodable objects should not trigger segments")
-        XCTAssertFalse(eventCalled)
-    }
-
-    func testParserHandlesEventWithMissingNestedFields() throws {
-        // Event with type but missing expected nested fields (memory.id)
-        var receivedEvent: TranscriptionService.ListenEvent?
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { receivedEvent = $0 },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        // memory_created without memory object
-        service.parseBackendResponse("""
-        {"type":"memory_created"}
-        """)
-
-        XCTAssertEqual(receivedEvent?.type, "memory_created")
-        XCTAssertNil(receivedEvent?.raw["memory"], "missing memory field should be nil, not crash")
-    }
-
-    func testParserHandlesSegmentsDeletedWithMissingIds() throws {
-        var receivedEvent: TranscriptionService.ListenEvent?
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { receivedEvent = $0 },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        // segments_deleted without segment_ids
-        service.parseBackendResponse("""
-        {"type":"segments_deleted"}
-        """)
-
-        XCTAssertEqual(receivedEvent?.type, "segments_deleted")
-        XCTAssertNil(receivedEvent?.raw["segment_ids"])
-    }
-
-    func testParserHandlesJsonNumber() throws {
-        // Plain number is valid JSON but not array or object
-        var segmentsCalled = false
-        var eventCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in segmentsCalled = true },
-            onEvent: { _ in eventCalled = true },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        service.parseBackendResponse("42")
-        service.parseBackendResponse("\"just a string\"")
-
-        XCTAssertFalse(segmentsCalled)
-        XCTAssertFalse(eventCalled)
-    }
-
-    func testParserHandlesUnknownEventType() throws {
-        var receivedEvent: TranscriptionService.ListenEvent?
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { receivedEvent = $0 },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        // Unknown event type should still be dispatched
-        service.parseBackendResponse("""
-        {"type":"future_event_type","data":"something"}
-        """)
-
-        XCTAssertEqual(receivedEvent?.type, "future_event_type")
-        XCTAssertEqual(receivedEvent?.raw["data"] as? String, "something")
-    }
-
-    // MARK: - Reconnection State Machine
-
-    func testHandleDisconnectionRequiresConnected() throws {
-        let service = try TranscriptionService(language: "en")
-        // Not connected — handleDisconnection should be a no-op
-        service.isConnected = false
-        service.shouldReconnect = true
-        service.reconnectAttempts = 0
-
-        service.handleDisconnection()
-
-        // reconnectAttempts should NOT increment — guard blocked the call
-        XCTAssertEqual(service.reconnectAttempts, 0)
-    }
-
-    func testHandleDisconnectionIncrementsAttempts() throws {
-        let service = try TranscriptionService(language: "en")
-        service.isConnected = true
-        service.shouldReconnect = true
-        service.reconnectAttempts = 0
-
-        service.handleDisconnection()
+        service.stop()
 
         XCTAssertFalse(service.isConnected)
-        XCTAssertEqual(service.reconnectAttempts, 1)
+        wait(for: [disconnected], timeout: 2.0)
     }
 
-    func testCleanupAndReconnectWorksWhenNotConnected() throws {
+    func testConnectedAccessorMirrorsIsConnected() throws {
         let service = try TranscriptionService(language: "en")
-        // Pre-connect state — isConnected is false
+        XCTAssertFalse(service.connected)
+        service.isConnected = true
+        XCTAssertTrue(service.connected)
         service.isConnected = false
-        service.shouldReconnect = true
-        service.reconnectAttempts = 0
-
-        service.cleanupAndReconnect()
-
-        // Should increment attempts even though not connected
-        XCTAssertEqual(service.reconnectAttempts, 1)
+        XCTAssertFalse(service.connected)
     }
 
-    func testMaxReconnectAttemptsTriggersError() throws {
-        var receivedError: Error?
+    // MARK: - sendAudio guard
+
+    func testSendAudioIsNoOpWhenNotConnected() throws {
+        // When isConnected == false, sendAudio should silently drop samples.
+        // Hard to observe directly (pcmBuffer is private), so we just assert
+        // it doesn't crash. This was previously implicit in the cloud path
+        // (no WebSocket → no send); the WhisperKit path makes it explicit.
         let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { _ in },
-            onError: { receivedError = $0 },
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        // Set attempts to max
-        service.reconnectAttempts = service.maxReconnectAttempts
-        service.isConnected = true
-        service.shouldReconnect = true
-
-        service.handleDisconnection()
-
-        XCTAssertNotNil(receivedError, "should trigger error when max attempts reached")
-    }
-
-    func testCleanupAndReconnectMaxAttemptsTriggersError() throws {
-        var receivedError: Error?
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { _ in },
-            onError: { receivedError = $0 },
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        service.reconnectAttempts = service.maxReconnectAttempts
-        service.shouldReconnect = true
-
-        service.cleanupAndReconnect()
-
-        XCTAssertNotNil(receivedError, "should trigger error when max attempts reached (pre-connect)")
-    }
-
-    func testHandleDisconnectionCallsOnDisconnected() throws {
-        var disconnectedCalled = false
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { _ in },
-            onEvent: { _ in },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: { disconnectedCalled = true }
-        )
-
-        service.isConnected = true
-        service.shouldReconnect = false  // Don't attempt reconnect
-
-        service.handleDisconnection()
-
-        XCTAssertTrue(disconnectedCalled)
         XCTAssertFalse(service.isConnected)
+        // Fake 100ms of silence at 16 kHz, Int16 mono = 1600 samples = 3200 bytes.
+        let silence = Data(count: 3200)
+        service.sendAudio(silence)  // should not throw, should not crash
     }
 
-    // MARK: - Multi-Segment Dispatch
+    // MARK: - PCM conversion math
 
-    func testParserDispatchesMultipleSegments() throws {
-        var receivedSegments: [TranscriptionService.BackendSegment] = []
-        let service = try TranscriptionService(language: "en")
-        service.start(
-            onSegments: { receivedSegments = $0 },
-            onEvent: { _ in },
-            onError: nil,
-            onConnected: nil,
-            onDisconnected: nil
-        )
-
-        let json = """
-        [
-            {"id":"s1","text":"hello","speaker":"SPEAKER_00","speaker_id":0,"is_user":true,"person_id":null,"start":0.0,"end":1.0},
-            {"id":"s2","text":"world","speaker":"SPEAKER_01","speaker_id":1,"is_user":false,"person_id":"p2","start":1.0,"end":2.0}
-        ]
-        """
-        service.parseBackendResponse(json)
-
-        XCTAssertEqual(receivedSegments.count, 2)
-        XCTAssertEqual(receivedSegments[0].text, "hello")
-        XCTAssertEqual(receivedSegments[1].text, "world")
-        XCTAssertEqual(receivedSegments[1].person_id, "p2")
+    func testInt16PCMToFloat32EmptyData() {
+        let result = TranscriptionService.int16PCMToFloat32(Data())
+        XCTAssertTrue(result.isEmpty)
     }
+
+    func testInt16PCMToFloat32OddByteCountTruncates() {
+        // 3 bytes can only encode 1 Int16 sample (the trailing byte is dropped).
+        let result = TranscriptionService.int16PCMToFloat32(Data([0x00, 0x00, 0xFF]))
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0], 0.0)
+    }
+
+    func testInt16PCMToFloat32NormalizesToUnitRange() {
+        // Int16 0      → 0.0
+        // Int16 16384  → 0.5  (= 16384 / 32768)
+        // Int16 -16384 → -0.5
+        let samples: [Int16] = [0, 16384, -16384]
+        let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
+        let result = TranscriptionService.int16PCMToFloat32(data)
+
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(result[0], 0.0, accuracy: 1e-6)
+        XCTAssertEqual(result[1], 0.5, accuracy: 1e-6)
+        XCTAssertEqual(result[2], -0.5, accuracy: 1e-6)
+    }
+
+    // MARK: - DROPPED tests (behavior no longer exists in the codebase)
+    //
+    // The following tests were removed in this rewrite because the cloud
+    // WebSocket path they exercised is entirely gone (see the commented-out
+    // "Legacy cloud WebSocket path" block at the bottom of TranscriptionService.swift).
+    // They are listed here so the original test intent stays discoverable in
+    // git blame:
+    //
+    //   - testParserDispatchesSegmentCallback
+    //   - testParserDispatchesEventCallback
+    //   - testParserIgnoresPingHeartbeat
+    //   - testParserIgnoresEmptySegmentArray
+    //   - testParserHandlesInvalidJsonGracefully
+    //   - testParserDispatchesSegmentsDeletedEvent
+    //   - testParserDispatchesSpeakerLabelEvent
+    //   - testParserIgnoresObjectWithoutType
+    //   - testParserHandlesArrayOfInvalidSegments
+    //   - testParserHandlesEventWithMissingNestedFields
+    //   - testParserHandlesSegmentsDeletedWithMissingIds
+    //   - testParserHandlesJsonNumber
+    //   - testParserHandlesUnknownEventType
+    //   - testParserDispatchesMultipleSegments
+    //     → All exercised `parseBackendResponse(_:)`, which decoded a JSON
+    //       text frame off the WebSocket. There is no JSON-frame ingest in
+    //       the WhisperKit path; segments come straight from
+    //       `WhisperKit.transcribe(audioArray:)` and are emitted via the
+    //       private `emitSegments(from:)`. No public surface to assert on
+    //       without modifying source.
+    //
+    //   - testHandleDisconnectionRequiresConnected
+    //   - testHandleDisconnectionIncrementsAttempts
+    //   - testCleanupAndReconnectWorksWhenNotConnected
+    //   - testMaxReconnectAttemptsTriggersError
+    //   - testCleanupAndReconnectMaxAttemptsTriggersError
+    //   - testHandleDisconnectionCallsOnDisconnected
+    //     → All exercised `handleDisconnection()`, `cleanupAndReconnect()`,
+    //       `reconnectAttempts`, `maxReconnectAttempts`. There is no
+    //       reconnect state machine in the on-device pipeline — there's
+    //       nothing to reconnect to. `shouldReconnect` is preserved as a
+    //       no-op field for source compatibility but has no behavior to
+    //       assert on.
 }
