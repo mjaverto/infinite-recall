@@ -8310,7 +8310,11 @@ struct SettingsContentView: View {
     guard let expectedPriceId = pendingSubscriptionPriceId else { return }
     let checkoutSessionId = pendingCheckoutSessionId
     let pythonBaseURL = await APIClient.shared.baseURL
-    let rustBaseURL = await APIClient.shared.rustBackendURL
+    // `rustBackendURL` throws `APIError.daemonNotConfigured` when `IR_API_URL`
+    // is unset; this code path only feeds `isLocalURL(...)` (a display-time
+    // check), so falling back to "" is safe — `isLocalURL("")` returns false
+    // and the caller no-ops the local-test-subscription path.
+    let rustBaseURL = (try? await APIClient.shared.rustBackendURL) ?? ""
 
     if let checkoutSessionId, isLocalURL(pythonBaseURL) {
       guard

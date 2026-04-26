@@ -17,20 +17,29 @@ actor APIClient {
   // config/api-keys, Crisp, and local test subscription. All data CRUD,
   // chat AI, and title generation are on Python.
   // Set via IR_API_URL env var (in .env).
+  //
+  // Throws `APIError.daemonNotConfigured` when `IR_API_URL` is unset so a
+  // missing daemon configuration surfaces as a clear UI banner (via
+  // `ActivityMonitorService.lastError`) instead of cascading into a
+  // misleading HTTP 404 / "Invalid response from server". Display-only
+  // call sites (e.g. `SettingsPage`) that don't actually issue HTTP can
+  // use `try?` and fall back to "" — they just won't render a Rust URL.
   var rustBackendURL: String {
-    // First check getenv() for values set by setenv() in loadEnvironment()
-    if let cString = getenv("IR_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty
-    {
-      let normalized = url.hasSuffix("/") ? url : url + "/"
-      return normalized
+    get throws {
+      // First check getenv() for values set by setenv() in loadEnvironment()
+      if let cString = getenv("IR_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty
+      {
+        let normalized = url.hasSuffix("/") ? url : url + "/"
+        return normalized
+      }
+      // Fallback to ProcessInfo (launch-time snapshot)
+      if let envURL = ProcessInfo.processInfo.environment["IR_API_URL"], !envURL.isEmpty {
+        let normalized = envURL.hasSuffix("/") ? envURL : envURL + "/"
+        return normalized
+      }
+      NSLog("OMI API: IR_API_URL not set — Rust backend calls will fail")
+      throw APIError.daemonNotConfigured
     }
-    // Fallback to ProcessInfo (launch-time snapshot)
-    if let envURL = ProcessInfo.processInfo.environment["IR_API_URL"], !envURL.isEmpty {
-      let normalized = envURL.hasSuffix("/") ? envURL : envURL + "/"
-      return normalized
-    }
-    NSLog("OMI API: IR_API_URL not set — Rust backend calls will fail")
-    return ""
   }
 
   let session: URLSession
@@ -336,6 +345,10 @@ enum APIError: LocalizedError {
   // (e.g. wrapper structs with required fields). Stores should treat this as a
   // silent no-op, not an error to surface.
   case localOnlyMode
+  // Thrown by `APIClient.rustBackendURL` when `IR_API_URL` is unset. The
+  // Activity panel surfaces the localizedDescription so the user knows to
+  // re-run `scripts/run.sh` instead of seeing a misleading HTTP 404.
+  case daemonNotConfigured
 
   var errorDescription: String? {
     switch self {
@@ -349,6 +362,9 @@ enum APIError: LocalizedError {
       return "Failed to decode response: \(error.localizedDescription)"
     case .localOnlyMode:
       return "Local-only mode"
+    case .daemonNotConfigured:
+      return
+        "Infinite Recall daemon URL not configured (IR_API_URL is unset). Run scripts/run.sh to regenerate .env.app."
     }
   }
 }
@@ -4516,7 +4532,7 @@ extension APIClient {
 
   /// Provision a cloud agent VM for the current user (fire-and-forget)
   func provisionAgentVM() async throws -> AgentProvisionResponse {
-    return try await post("v2/agent/provision", customBaseURL: rustBackendURL)
+    return try await post("v2/agent/provision", customBaseURL: try rustBackendURL)
   }
 
   struct AgentStatusResponse: Decodable {
@@ -4531,7 +4547,7 @@ extension APIClient {
 
   /// Get current agent VM status
   func getAgentStatus() async throws -> AgentStatusResponse? {
-    return try await get("v2/agent/status", customBaseURL: rustBackendURL)
+    return try await get("v2/agent/status", customBaseURL: try rustBackendURL)
   }
 }
 
@@ -4772,7 +4788,7 @@ extension APIClient {
   }
 
   func fetchApiKeys() async throws -> ApiKeysResponse {
-    return try await get("v1/config/api-keys", customBaseURL: rustBackendURL)
+    return try await get("v1/config/api-keys", customBaseURL: try rustBackendURL)
   }
 
   // MARK: - TTS Proxy (issue #6622)
@@ -4810,7 +4826,7 @@ extension APIClient {
   /// Synthesize speech via the backend TTS proxy (ElevenLabs key stays server-side).
   /// Returns raw audio data (audio/mpeg).
   func synthesizeSpeech(request: TtsSynthesizeRequest) async throws -> Data {
-    let base = rustBackendURL
+    let base = try rustBackendURL
     let url = URL(string: base + "v1/tts/synthesize")!
     var urlRequest = URLRequest(url: url)
     urlRequest.httpMethod = "POST"
@@ -5068,8 +5084,11 @@ extension APIClient {
 
   /// GET /v1/activity/snapshot — full live activity snapshot for the UI.
   func getActivitySnapshot() async throws -> ActivitySnapshot {
-    let base = rustBackendURL
-    guard !base.isEmpty, let url = URL(string: base + "v1/activity/snapshot") else {
+    // `try rustBackendURL` throws `APIError.daemonNotConfigured` when
+    // `IR_API_URL` is unset so the UI can surface a clear configuration
+    // message instead of falling through to a generic HTTP 404.
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/snapshot") else {
       throw APIError.invalidResponse
     }
     var request = URLRequest(url: url)
@@ -5095,8 +5114,8 @@ extension APIClient {
   /// Issue #34: takes a typed `PauseTargetId` directly — no string coercion
   /// at the call site. `PauseRequest.init` throws if `minutes == 0`.
   func pauseActivity(target: PauseTargetId, minutes: UInt32) async throws -> Date {
-    let base = rustBackendURL
-    guard !base.isEmpty, let url = URL(string: base + "v1/activity/pause") else {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/pause") else {
       throw APIError.invalidResponse
     }
     let body = try PauseRequest(target: target, minutes: minutes)
@@ -5128,8 +5147,8 @@ extension APIClient {
   ///
   /// Issue #34: takes a typed `PauseTargetId` directly.
   func resumeActivity(target: PauseTargetId) async throws {
-    let base = rustBackendURL
-    guard !base.isEmpty, let url = URL(string: base + "v1/activity/resume") else {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/resume") else {
       throw APIError.invalidResponse
     }
     let body = ResumeRequest(target: target)
@@ -5154,11 +5173,50 @@ extension APIClient {
   /// Stream G's drain-loop wrapper to publish in-flight item labels into the
   /// snapshot. `inFlight = nil` clears the slot.
   func reportInFlight(kind: WorkKind, inFlight: InFlight?) async throws {
-    let base = rustBackendURL
-    guard !base.isEmpty, let url = URL(string: base + "v1/activity/_internal/inflight") else {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/_internal/inflight") else {
       throw APIError.invalidResponse
     }
     let body = InflightUpdate(kind: kind, inFlight: inFlight)
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.allHTTPHeaderFields = try activityHeaders()
+    request.httpBody = try Self.makeActivityEncoder().encode(body)
+    request.timeoutInterval = 5
+
+    let (_, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+  }
+
+  /// POST /v1/activity/_internal/queue-depth — Swift→Rust loopback, called by
+  /// `BatteryAwareScheduler`'s debounced delegate listener whenever
+  /// `PendingWorkStorage` mutates. Pushes per-kind `(queued, failed)` counts
+  /// into the daemon's snapshot so the Activity panel reflects depth without
+  /// polling SQLite from Rust. Mirrors `reportInFlight` byte-for-byte.
+  ///
+  /// Body shape (frozen interface I1):
+  ///     { "depths": { "<kind.rawValue>": { "queued": N, "failed": M }, … } }
+  ///
+  /// Returns when the daemon answers 204. Throws `APIError.daemonNotConfigured`
+  /// when `IR_API_URL` is unset (caller should treat that as "daemon not up").
+  func reportQueueDepth(_ depths: [PendingWork.Kind: (queued: Int, failed: Int)]) async throws {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/_internal/queue-depth") else {
+      throw APIError.invalidResponse
+    }
+
+    var encoded: [String: QueueDepthEntry] = [:]
+    for (kind, counts) in depths {
+      encoded[kind.rawValue] = QueueDepthEntry(queued: counts.queued, failed: counts.failed)
+    }
+    let body = QueueDepthUpdate(depths: encoded)
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -5183,8 +5241,8 @@ extension APIClient {
   /// state in its `BridgedProcessingGate` and surfaces it on the next
   /// `/v1/activity/snapshot` call.
   func reportGateState(_ gateState: GateState) async throws {
-    let base = rustBackendURL
-    guard !base.isEmpty, let url = URL(string: base + "v1/activity/_internal/gate-state") else {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/_internal/gate-state") else {
       throw APIError.invalidResponse
     }
 
@@ -5203,5 +5261,15 @@ extension APIClient {
       throw APIError.httpError(statusCode: http.statusCode)
     }
   }
+}
+
+/// Wire shape for `POST /v1/activity/_internal/queue-depth` (interface I1).
+private struct QueueDepthEntry: Codable {
+  let queued: Int
+  let failed: Int
+}
+
+private struct QueueDepthUpdate: Codable {
+  let depths: [String: QueueDepthEntry]
 }
 // === /activity:F ===

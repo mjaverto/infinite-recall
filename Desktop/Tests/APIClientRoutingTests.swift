@@ -113,29 +113,37 @@ final class APIClientRoutingTests: XCTestCase {
         XCTAssertEqual(url, "http://localhost:8080/")
     }
 
-    func testRustBackendURLReadsFromApiUrlEnvVar() async {
+    func testRustBackendURLReadsFromApiUrlEnvVar() async throws {
         setenv("IR_API_URL", "http://localhost:8787", 1)
         defer { unsetenv("IR_API_URL") }
         let client = APIClient()
-        let url = await client.rustBackendURL
+        let url = try await client.rustBackendURL
         XCTAssertEqual(url, "http://localhost:8787/")
     }
 
-    func testRustBackendURLReturnsEmptyWhenNotSet() async {
+    /// Was `testRustBackendURLReturnsEmptyWhenNotSet` — flipped to assert the
+    /// new throwing contract (see `APIError.daemonNotConfigured`).
+    func testRustBackendURLThrowsDaemonNotConfiguredWhenNotSet() async {
         unsetenv("IR_API_URL")
         let client = APIClient()
-        let url = await client.rustBackendURL
-        XCTAssertEqual(url, "")
+        do {
+            _ = try await client.rustBackendURL
+            XCTFail("Expected APIError.daemonNotConfigured to be thrown")
+        } catch APIError.daemonNotConfigured {
+            // Expected.
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
     }
 
-    func testBaseURLAndRustBackendURLAreIndependent() async {
+    func testBaseURLAndRustBackendURLAreIndependent() async throws {
         setenv("IR_PYTHON_API_URL", "http://python:8080", 1)
         setenv("IR_API_URL", "http://rust:8787", 1)
         defer { unsetenv("IR_PYTHON_API_URL"); unsetenv("IR_API_URL") }
 
         let client = APIClient()
         let base = await client.baseURL
-        let rust = await client.rustBackendURL
+        let rust = try await client.rustBackendURL
         XCTAssertEqual(base, "http://python:8080/")
         XCTAssertEqual(rust, "http://rust:8787/")
         XCTAssertNotEqual(base, rust)
@@ -501,6 +509,39 @@ final class APIClientRoutingTests: XCTestCase {
         assertRoutes(URLCapture.capturedRequests, host: "python-test", port: 9001,
                      pathContains: "v1/users/stats/chat-messages", method: "GET",
                      label: "getChatMessageCount")
+    }
+
+    // MARK: - APIError.daemonNotConfigured
+
+    /// Regression: when `IR_API_URL` is unset, `getActivitySnapshot` should
+    /// fail with the typed `APIError.daemonNotConfigured` instead of cascading
+    /// into `APIError.invalidResponse` (which renders to the user as a generic
+    /// "Invalid response from server" — or worse, an HTTP 404 once a
+    /// malformed URL escapes to the network layer).
+    func testGetActivitySnapshotThrowsDaemonNotConfiguredWhenIRApiUrlUnset() async {
+        // Override the setUp() seed: this single test needs the env var
+        // truly unset so the throwing-helper path is exercised.
+        unsetenv("IR_API_URL")
+        defer {
+            // Restore the routing-tests baseline so following tests still
+            // see the seeded value.
+            setenv("IR_API_URL", "http://rust-test:9002", 1)
+        }
+
+        let client = APIClient()
+        do {
+            _ = try await client.getActivitySnapshot()
+            XCTFail("Expected APIError.daemonNotConfigured to be thrown")
+        } catch APIError.daemonNotConfigured {
+            // Expected — also confirm the user-facing message is the one
+            // Lane 4 / the Activity panel will rely on.
+            XCTAssertEqual(
+                APIError.daemonNotConfigured.localizedDescription,
+                "Infinite Recall daemon URL not configured (IR_API_URL is unset). Run scripts/run.sh to regenerate .env.app."
+            )
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
     }
 }
 

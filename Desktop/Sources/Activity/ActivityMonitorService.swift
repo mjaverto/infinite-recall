@@ -217,6 +217,12 @@ public final class ActivityMonitorService: ObservableObject {
             let snap = try await APIClient.shared.getActivitySnapshot()
             self.snapshot = snap
             self.lastError = nil
+        } catch APIError.daemonNotConfigured {
+            // Distinct UI message: tells the user the daemon URL is unset
+            // (almost always means `scripts/run.sh` wasn't re-run after a
+            // checkout), instead of letting it fall through to a misleading
+            // generic "HTTP error: 404" string.
+            self.lastError = APIError.daemonNotConfigured.localizedDescription
         } catch {
             self.lastError = "snapshot failed: \(error.localizedDescription)"
         }

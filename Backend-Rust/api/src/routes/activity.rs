@@ -9,8 +9,12 @@
 //! impls are owned by Streams B/C/D and the idle-gate agent — the Phase 0
 //! contract (`activity/contract.md`) is the source of truth.
 
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::activity::traits::PauseStoreError;
@@ -32,6 +36,86 @@ const ALL_KINDS: [WorkKind; 5] = [
 ];
 
 const ALL_CAPTURES: [CaptureKind; 2] = [CaptureKind::Audio, CaptureKind::Screen];
+
+// ---------------------------------------------------------------------
+// Per-kind queue-depth state (Issue #41 — Lane 2)
+// ---------------------------------------------------------------------
+//
+// The Swift app owns the `pending_work` table; only it knows how many rows
+// are queued / failed for each `PendingWork.Kind`. Lane 4 pushes a frozen
+// snapshot of those counts via `POST /v1/activity/_internal/queue-depth`
+// (loopback-only, mirrors `_internal/inflight`). The snapshot handler reads
+// from this map when assembling each `KindRow`, defaulting to 0/0 so the
+// `/v1/activity/snapshot` shape stays valid before the first push.
+//
+// Frozen interface I1 (do NOT renegotiate):
+//
+//   { "depths": {
+//       "transcribe":         { "queued": 47, "failed": 0 },
+//       "ocr":                { "queued": 2,  "failed": 1 },
+//       "summarize":          { "queued": 0,  "failed": 0 },
+//       "extractMemory":      { "queued": 0,  "failed": 0 },
+//       "extractActionItems": { "queued": 0,  "failed": 0 }
+//   } }
+//
+// Keys are `PendingWork.Kind.rawValue` (camelCase, Swift-side), NOT the
+// snake_case wire form of `WorkKind`. We map between them in
+// `workkind_swift_raw_value` below.
+//
+// State is process-global rather than another `Arc<dyn …>` field on
+// `AppState` because (a) lane 2 is forbidden from editing `state.rs` and
+// (b) the data is purely a passive cache pushed in by Swift. Replace is
+// atomic: each POST swaps the entire map under a single write lock.
+
+/// One row of the queue-depth payload — `queued` and `failed` counts for a
+/// single `PendingWork.Kind`. Defaults to all-zeros for kinds Swift hasn't
+/// pushed yet.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueDepth {
+    pub queued: u32,
+    pub failed: u32,
+}
+
+/// Body for `POST /v1/activity/_internal/queue-depth`. Matches frozen
+/// interface I1; the entire `depths` map replaces the previous state.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueDepthUpdate {
+    pub depths: HashMap<String, QueueDepth>,
+}
+
+/// Process-global queue-depth state. `OnceLock` so the first reader/writer
+/// initializes the empty map; `RwLock` so the snapshot read path doesn't
+/// serialize against itself under load.
+fn queue_depths_state() -> &'static Arc<RwLock<HashMap<String, QueueDepth>>> {
+    static STATE: OnceLock<Arc<RwLock<HashMap<String, QueueDepth>>>> = OnceLock::new();
+    STATE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+/// Snapshot of the current queue-depth map. Cloned under a read lock so
+/// callers never see a torn write. Falls back to an empty map on lock
+/// poisoning (a poisoned write means an earlier writer panicked; the data
+/// itself is still readable, but defaulting to empty here is the safer
+/// path — the snapshot just degrades to 0/0).
+fn queue_depths_snapshot() -> HashMap<String, QueueDepth> {
+    match queue_depths_state().read() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Map a Rust `WorkKind` to the Swift `PendingWork.Kind.rawValue` string
+/// used as a key in the queue-depth payload. Frozen interface I1 — these
+/// strings are camelCase (Swift's default `RawRepresentable` derivation),
+/// NOT the snake_case `WorkKind::as_str()` wire form.
+fn workkind_swift_raw_value(k: WorkKind) -> &'static str {
+    match k {
+        WorkKind::Transcribe => "transcribe",
+        WorkKind::Ocr => "ocr",
+        WorkKind::Summarize => "summarize",
+        WorkKind::ExtractMemory => "extractMemory",
+        WorkKind::ExtractActionItems => "extractActionItems",
+    }
+}
 
 /// `GET /v1/activity/snapshot` — full live snapshot.
 pub async fn snapshot(
@@ -61,20 +145,29 @@ pub async fn snapshot(
         })?;
     let processing_gate = state.processing_gate.current();
 
+    // Per-kind queue depth + failure counters live in the Swift app's domain
+    // (PendingWork rows). Lane 4 pushes them via `_internal/queue-depth`; we
+    // read the latest atomic snapshot here and default to 0/0 for any kind
+    // Swift hasn't reported yet so the snapshot still works pre-first-push.
+    let depths_snap = queue_depths_snapshot();
+
     let kinds: Vec<KindRow> = ALL_KINDS
         .iter()
-        .map(|k| KindRow {
-            kind: *k,
-            in_flight: inflight_map.get(k).cloned(),
-            // Queue depth + failure counters live in the Swift app's domain
-            // (PendingWork rows). Until Stream G/F surface those into the
-            // Rust daemon, report 0/0 — the UI degrades gracefully.
-            queued: 0,
-            failed: 0,
-            last_done_at: None,
-            paused_until: state
-                .pause_store
-                .paused_until(&PauseTargetId::Kind(*k)),
+        .map(|k| {
+            let qd = depths_snap
+                .get(workkind_swift_raw_value(*k))
+                .copied()
+                .unwrap_or_default();
+            KindRow {
+                kind: *k,
+                in_flight: inflight_map.get(k).cloned(),
+                queued: qd.queued,
+                failed: qd.failed,
+                last_done_at: None,
+                paused_until: state
+                    .pause_store
+                    .paused_until(&PauseTargetId::Kind(*k)),
+            }
         })
         .collect();
 
@@ -188,6 +281,26 @@ pub async fn inflight(
     // the parse layer (returns 400/422), so no manual guard needed.
     state.inflight.update(body.kind, body.in_flight);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/activity/_internal/queue-depth` — Swift → Rust loopback for
+/// per-`PendingWork.Kind` queue / failure counts (Issue #41 — frozen
+/// interface I1).
+///
+/// Same loopback enforcement as `_internal/inflight`: the daemon binds to
+/// 127.0.0.1 only (see `lib.rs::run`), and the route still passes through
+/// the bearer-auth middleware. Replaces the entire depths map atomically;
+/// no deltas, no per-key partial updates.
+pub async fn internal_queue_depth(
+    State(_state): State<AppState>,
+    Json(body): Json<QueueDepthUpdate>,
+) -> StatusCode {
+    let mut g = match queue_depths_state().write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *g = body.depths;
+    StatusCode::NO_CONTENT
 }
 
 /// `POST /v1/activity/_internal/gate-state` — Swift → Rust loopback.
