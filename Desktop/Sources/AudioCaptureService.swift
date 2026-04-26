@@ -48,6 +48,14 @@ class AudioCaptureService: @unchecked Sendable {
     /// Used by the silent-mic fallback path to bind directly to the built-in mic.
     private let overrideDeviceID: AudioDeviceID?
 
+    // === activity:H ===
+    /// Mid-flight observer token: when the user pauses audio capture while
+    /// it is already running, we want to tear down the live mic instead of
+    /// only blocking the *next* startCapture() call. The observer is
+    /// registered on the first startCapture() and removed on stopCapture().
+    private var pauseObserver: NSObjectProtocol?
+    // === /activity:H ===
+
     /// Default initializer — opens the system default input device.
     init() {
         self.overrideDeviceID = nil
@@ -141,6 +149,24 @@ class AudioCaptureService: @unchecked Sendable {
             log("AudioCapture: Already capturing")
             return
         }
+
+        // === activity:H ===
+        // Block start while audio capture is paused via the Activity tab.
+        // The gate is MainActor-isolated; hop briefly to read it.
+        let pauseInfo: (paused: Bool, until: Date?) = await MainActor.run {
+            let gate = CapturePauseGate.shared
+            return (gate.isPaused(target: "capture", id: "audio"),
+                    gate.pausedUntil(target: "capture", id: "audio"))
+        }
+        if pauseInfo.paused {
+            log("AudioCapture: paused until \(String(describing: pauseInfo.until)) — skipping start")
+            return
+        }
+        // Register the mid-flight observer on first start. NotificationCenter
+        // de-dupes by token, but we still keep the token so stopCapture()
+        // can detach cleanly.
+        await MainActor.run { self.installPauseObserverIfNeeded() }
+        // === /activity:H ===
 
         self.onAudioChunk = onAudioChunk
         self.onAudioLevel = onAudioLevel
@@ -262,9 +288,44 @@ class AudioCaptureService: @unchecked Sendable {
         installPropertyListeners()
     }
 
+    // === activity:H ===
+    /// Install (idempotently) a NotificationCenter observer that tears
+    /// down a live capture session when the user pauses audio capture
+    /// from the Activity tab. Pause covers *next-claim* for deferred
+    /// work, but for live capture the user expects the mic to actually
+    /// stop — see UX scenario 3 in the plan ("recording will stop").
+    @MainActor
+    private func installPauseObserverIfNeeded() {
+        guard pauseObserver == nil else { return }
+        pauseObserver = NotificationCenter.default.addObserver(
+            forName: ActivityNotifications.pauseChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            // Re-check the gate; only stop if we're now paused.
+            let paused = CapturePauseGate.shared.isPaused(target: "capture", id: "audio")
+            if paused {
+                log("AudioCapture: pause notification received while capturing — stopping mic")
+                self.stopCapture()
+            }
+        }
+    }
+    // === /activity:H ===
+
     /// Stop capturing audio
     func stopCapture() {
         guard isCapturing else { return }
+
+        // === activity:H ===
+        // Detach the pause observer so a subsequent start() can re-install
+        // it cleanly, and so we don't leak observer closures across a
+        // start/stop cycle initiated for non-pause reasons.
+        if let token = pauseObserver {
+            NotificationCenter.default.removeObserver(token)
+            pauseObserver = nil
+        }
+        // === /activity:H ===
 
         removePropertyListeners()
 

@@ -683,6 +683,13 @@ final class ScreenCaptureService: Sendable {
 
   /// Async capture - main entry point
   func captureActiveWindowAsync() async -> Data? {
+    // === activity:H ===
+    if await Self.isScreenPaused() {
+      let until = await Self.screenPausedUntil()
+      log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+      return nil
+    }
+    // === /activity:H ===
     let (_, _, windowID) = await Self.getActiveWindowInfoAsync()
     guard let windowID else {
       log("No active window ID found")
@@ -820,6 +827,13 @@ final class ScreenCaptureService: Sendable {
   }
 
   func captureActiveWindowCGImage() async -> CGImage? {
+    // === activity:H ===
+    if await Self.isScreenPaused() {
+      let until = await Self.screenPausedUntil()
+      log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+      return nil
+    }
+    // === /activity:H ===
     let (_, _, windowID) = await Self.getActiveWindowInfoAsync()
     guard let windowID else {
       log("No active window ID found")
@@ -887,6 +901,20 @@ final class ScreenCaptureService: Sendable {
 
   /// Capture the active window and return as JPEG data (synchronous - legacy)
   func captureActiveWindow() -> Data? {
+    // === activity:H ===
+    // Synchronous entry point: cannot await the MainActor-bound gate.
+    // Use a non-blocking best-effort read via DispatchQueue.main.sync,
+    // skipping the gate if we're already on the main thread (to avoid
+    // deadlock) — the async paths above provide the primary enforcement.
+    if !Thread.isMainThread {
+      let paused = DispatchQueue.main.sync { CapturePauseGate.shared.isPaused(target: "capture", id: "screen") }
+      if paused {
+        let until = DispatchQueue.main.sync { CapturePauseGate.shared.pausedUntil(target: "capture", id: "screen") }
+        log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+        return nil
+      }
+    }
+    // === /activity:H ===
     guard let windowID = Self.getActiveWindowID() else {
       log("No active window ID found")
       return nil
@@ -985,4 +1013,21 @@ final class ScreenCaptureService: Sendable {
       properties: [.compressionFactor: jpegQuality]
     )
   }
+
+  // === activity:H ===
+  /// Bridge helper: read the Activity tab's pause gate (MainActor-isolated)
+  /// from a Sendable context. Used by the async capture entry points.
+  private static func isScreenPaused() async -> Bool {
+    return await MainActor.run {
+      CapturePauseGate.shared.isPaused(target: "capture", id: "screen")
+    }
+  }
+
+  /// Bridge helper for the resume timestamp. See `isScreenPaused`.
+  private static func screenPausedUntil() async -> Date? {
+    return await MainActor.run {
+      CapturePauseGate.shared.pausedUntil(target: "capture", id: "screen")
+    }
+  }
+  // === /activity:H ===
 }
