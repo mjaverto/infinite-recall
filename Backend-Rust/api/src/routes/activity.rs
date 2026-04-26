@@ -51,12 +51,31 @@ fn capture_id(c: CaptureKind) -> &'static str {
 }
 
 /// `GET /v1/activity/snapshot` — full live snapshot.
-pub async fn snapshot(State(state): State<AppState>) -> Json<ActivitySnapshot> {
+pub async fn snapshot(
+    State(state): State<AppState>,
+) -> Result<Json<ActivitySnapshot>, (StatusCode, String)> {
     // Pull each piece independently. Sampler + gate are expected to cache
     // their own work; pause_store is a cheap SQLite point-lookup; inflight
     // is an in-memory RwLock read.
     let inflight_map = state.inflight.snapshot();
-    let resources = state.resource_sampler.sample();
+
+    // Singleton-fixer S4: `SystemResourceSampler::sample()` blocks the
+    // calling thread for ~300ms on a cache miss (it `thread::sleep(250ms)`
+    // for the CPU-delta window plus ~5 sync subprocess forks for ioreg /
+    // sysctl / pmset). With the sampler's 2s cache TTL and the Swift
+    // poller hitting `/snapshot` at 1Hz, on the old `.sample()`-on-the-
+    // tokio-worker path every other tick stalled an entire runtime
+    // worker. Move the sample to a blocking pool so the async runtime
+    // stays free to serve the rest of the daemon.
+    let sampler = state.resource_sampler.clone();
+    let resources = tokio::task::spawn_blocking(move || sampler.sample())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("resource sampler join error: {e}"),
+            )
+        })?;
     let processing_gate = state.processing_gate.current();
 
     let kinds: Vec<KindRow> = ALL_KINDS
@@ -92,13 +111,13 @@ pub async fn snapshot(State(state): State<AppState>) -> Json<ActivitySnapshot> {
         })
         .collect();
 
-    Json(ActivitySnapshot {
+    Ok(Json(ActivitySnapshot {
         kinds,
         capture,
         resources,
         processing_gate,
         generated_at: Utc::now(),
-    })
+    }))
 }
 
 /// Resolve a `PauseRequest`/`ResumeRequest` `id` against its `target`. The

@@ -4966,10 +4966,19 @@ extension APIClient {
 extension APIClient {
 
   /// Build headers for a Rust-daemon call without `buildHeaders`'s
-  /// `localOnlyMode` short-circuit. Auth is best-effort: if no token is
-  /// available we still send the request (Rust daemon may be configured
-  /// without bearer auth in dev).
-  fileprivate func activityHeaders() async -> [String: String] {
+  /// `localOnlyMode` short-circuit.
+  ///
+  /// Singleton-fixer S1: read the bearer token from the daemon's local
+  /// file (`~/Library/Application Support/InfiniteRecall/api-token.txt`)
+  /// instead of `AuthService.getAuthHeader()`, which throws `notSignedIn`
+  /// in this Firebase-stripped fork. The previous `try?` swallowed that
+  /// throw, so every Activity tab call shipped without an `Authorization`
+  /// header and the daemon returned 401 every time.
+  ///
+  /// Throws `LocalDaemonToken.TokenError` if the daemon hasn't written
+  /// its token yet. The Activity service catches this and surfaces it via
+  /// `ActivityMonitorService.lastError` instead of silently 401-looping.
+  fileprivate func activityHeaders() throws -> [String: String] {
     var headers: [String: String] = [
       "Content-Type": "application/json",
       "X-App-Platform": "macos",
@@ -4977,10 +4986,8 @@ extension APIClient {
     if let testHeader = testAuthHeader {
       headers["Authorization"] = testHeader
     } else {
-      let authService = await MainActor.run { AuthService.shared }
-      if let authHeader = try? await authService.getAuthHeader() {
-        headers["Authorization"] = authHeader
-      }
+      let token = try LocalDaemonToken.read()
+      headers["Authorization"] = "Bearer \(token)"
     }
     return headers
   }
@@ -5029,7 +5036,7 @@ extension APIClient {
     }
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
-    request.allHTTPHeaderFields = await activityHeaders()
+    request.allHTTPHeaderFields = try activityHeaders()
     request.timeoutInterval = 5
 
     let (data, response) = try await session.data(for: request)
@@ -5059,7 +5066,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = await activityHeaders()
+    request.allHTTPHeaderFields = try activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(body)
     request.timeoutInterval = 5
 
@@ -5093,7 +5100,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = await activityHeaders()
+    request.allHTTPHeaderFields = try activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(body)
     request.timeoutInterval = 5
 
@@ -5119,7 +5126,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = await activityHeaders()
+    request.allHTTPHeaderFields = try activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(body)
     request.timeoutInterval = 5
 

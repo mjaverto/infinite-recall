@@ -311,11 +311,20 @@ public final class BatteryAwareScheduler: ObservableObject {
       let inflightLabel = WorkLabels.humanLabel(work)
       let inflightEntry = InFlight(label: inflightLabel, startedAt: Date())
       self.inFlight[work.kind] = inflightEntry
+      // Singleton-fixer S6: replace `try?` with logged catch + 60s
+      // rate-limit. The previous swallowing made S1's silent 401 loop
+      // invisible; surface failures via ActivityReportLogger so the next
+      // breakage is observable in `/private/tmp/omi-dev.log`.
       Task {
-        try? await APIClient.shared.reportInFlight(
-          kind: work.kind.rawValue,
-          inFlight: inflightEntry
-        )
+        do {
+          try await APIClient.shared.reportInFlight(
+            kind: work.kind.rawValue,
+            inFlight: inflightEntry
+          )
+        } catch {
+          await ActivityReportLogger.shared.log(
+            error: error, context: "reportInFlight(start:\(work.kind.rawValue))")
+        }
       }
       // === /activity:G ===
 
@@ -325,10 +334,15 @@ public final class BatteryAwareScheduler: ObservableObject {
         // === activity:G ===
         self.inFlight[work.kind] = nil
         Task {
-          try? await APIClient.shared.reportInFlight(
-            kind: work.kind.rawValue,
-            inFlight: nil
-          )
+          do {
+            try await APIClient.shared.reportInFlight(
+              kind: work.kind.rawValue,
+              inFlight: nil
+            )
+          } catch {
+            await ActivityReportLogger.shared.log(
+              error: error, context: "reportInFlight(done:\(work.kind.rawValue))")
+          }
         }
         // === /activity:G ===
       } catch {
@@ -336,10 +350,15 @@ public final class BatteryAwareScheduler: ObservableObject {
         // === activity:G ===
         self.inFlight[work.kind] = nil
         Task {
-          try? await APIClient.shared.reportInFlight(
-            kind: work.kind.rawValue,
-            inFlight: nil
-          )
+          do {
+            try await APIClient.shared.reportInFlight(
+              kind: work.kind.rawValue,
+              inFlight: nil
+            )
+          } catch {
+            await ActivityReportLogger.shared.log(
+              error: error, context: "reportInFlight(fail:\(work.kind.rawValue))")
+          }
         }
         // === /activity:G ===
         // Stop draining; next state transition or explicit drain() can retry.
