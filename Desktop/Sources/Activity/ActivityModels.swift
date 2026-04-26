@@ -45,6 +45,10 @@ public enum GateReason: String, Codable, Hashable {
     case locked
     case manualPause = "manual_pause"
     case none
+    /// `AlwaysAllowedGate` placeholder is in use — real `ProcessingGate`
+    /// not yet wired (issue #32). Consensus-fix C4: surface honestly in
+    /// the UI instead of pretending idle processing is running.
+    case stub
 }
 
 // MARK: - Inner shapes

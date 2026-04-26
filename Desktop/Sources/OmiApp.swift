@@ -383,6 +383,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // on battery and drains on AC.
     PowerWorkBridge.shared.start()
 
+    // === activity:C1 ===
+    // CapturePauseGate must run for the lifetime of the app: capture
+    // services consult it on every start/mid-flight, regardless of whether
+    // the Activity tab is visible. ActivityMonitorService is started on a
+    // per-tab basis from ActivityPage so polling pauses when hidden.
+    Task { @MainActor in
+      CapturePauseGate.shared.start()
+    }
+    // === /activity:C1 ===
+
     // Recover any pending/failed transcription sessions from previous runs
     Task {
       await TranscriptionRetryService.shared.recoverPendingTranscriptions()
@@ -1278,6 +1288,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Stop recurring task scheduler
     RecurringTaskScheduler.shared.stop()
+
+    // === activity:C1 ===
+    // Tear down the always-on capture pause gate alongside the rest of
+    // the app-level singletons.
+    Task { @MainActor in
+      CapturePauseGate.shared.stop()
+      ActivityMonitorService.shared.stop()
+    }
+    // === /activity:C1 ===
 
     // Mark clean shutdown so next launch skips expensive DB integrity check
     RewindDatabase.markCleanShutdown()

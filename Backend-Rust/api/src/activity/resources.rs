@@ -428,48 +428,105 @@ fn map_pmset_therm(stdout: &str) -> ThermalState {
 // Power (battery / low-power)
 // ---------------------------------------------------------------------------
 
+/// Consensus-fix C5 (interim): replacing `pmset` shellout with
+/// `IOPSCopyPowerSourcesInfo` is the long-term goal (issue #32 follow-up),
+/// but until that lands we ship a fail-closed parse: any unrecognised /
+/// localised pmset output reports `(on_battery: true, low_power: true)`,
+/// which makes the scheduler's `allowHeavyWork` conservatively block
+/// rather than letting Whisper run wide-open on a non-English Mac.
+///
+/// Each fallback emits a `tracing::warn!` so the conservative branch is
+/// observable in logs.
 fn sample_power() -> (bool, bool) {
     let on_battery = match Command::new("pmset").args(["-g", "batt"]).output() {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            parse_on_battery(&s)
+            match parse_on_battery_safe(&s) {
+                Some(v) => v,
+                None => {
+                    tracing::warn!(
+                        component = "activity.resources.power",
+                        "pmset -g batt output not recognised — failing closed (on_battery=true)"
+                    );
+                    true
+                }
+            }
         }
-        _ => false,
+        other => {
+            tracing::warn!(
+                component = "activity.resources.power",
+                status = ?other.as_ref().map(|o| o.status),
+                "pmset -g batt failed — failing closed (on_battery=true)"
+            );
+            true
+        }
     };
     let low_power = match Command::new("pmset").args(["-g"]).output() {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            parse_low_power(&s)
+            match parse_low_power_safe(&s) {
+                Some(v) => v,
+                None => {
+                    tracing::warn!(
+                        component = "activity.resources.power",
+                        "pmset -g output missing lowpowermode — failing closed (low_power=true)"
+                    );
+                    true
+                }
+            }
         }
-        _ => false,
+        other => {
+            tracing::warn!(
+                component = "activity.resources.power",
+                status = ?other.as_ref().map(|o| o.status),
+                "pmset -g failed — failing closed (low_power=true)"
+            );
+            true
+        }
     };
     (on_battery, low_power)
 }
 
-fn parse_on_battery(stdout: &str) -> bool {
-    // First line is e.g. `Now drawing from 'Battery Power'` or `'AC Power'`.
+/// Parse the first line of `pmset -g batt`. Returns `None` (→ fail-closed)
+/// when the English literals "Battery Power" / "AC Power" are absent
+/// (locale shifted, format change, etc.).
+fn parse_on_battery_safe(stdout: &str) -> Option<bool> {
     for line in stdout.lines() {
         if line.contains("Battery Power") {
-            return true;
+            return Some(true);
         }
         if line.contains("AC Power") {
-            return false;
+            return Some(false);
         }
     }
-    false
+    None
 }
 
-fn parse_low_power(stdout: &str) -> bool {
+/// Parse `pmset -g` for `lowpowermode N`. Returns `None` (→ fail-closed)
+/// when the key is absent.
+fn parse_low_power_safe(stdout: &str) -> Option<bool> {
     for line in stdout.lines() {
         let l = line.trim();
         if let Some(rest) = l.strip_prefix("lowpowermode") {
             let rest = rest.trim_start_matches([' ', '=']).trim();
             if let Ok(v) = rest.parse::<u32>() {
-                return v != 0;
+                return Some(v != 0);
             }
         }
     }
-    false
+    None
+}
+
+// Legacy non-safe wrappers retained for the unit tests asserting the
+// fail-closed default (None → true).
+#[cfg(test)]
+fn parse_on_battery(stdout: &str) -> bool {
+    parse_on_battery_safe(stdout).unwrap_or(true)
+}
+
+#[cfg(test)]
+fn parse_low_power(stdout: &str) -> bool {
+    parse_low_power_safe(stdout).unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,15 +633,34 @@ mod tests {
 
     #[test]
     fn parses_pmset_battery() {
-        assert!(parse_on_battery("Now drawing from 'Battery Power'\n -InternalBattery-0	75%"));
-        assert!(!parse_on_battery("Now drawing from 'AC Power'\n -InternalBattery-0	100%"));
+        // Recognised English literals → exact value.
+        assert_eq!(
+            parse_on_battery_safe("Now drawing from 'Battery Power'\n -InternalBattery-0	75%"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_on_battery_safe("Now drawing from 'AC Power'\n -InternalBattery-0	100%"),
+            Some(false)
+        );
+        // Unrecognised → None (caller fails closed).
+        assert_eq!(parse_on_battery_safe("Source: 'Réseau'"), None);
     }
 
     #[test]
     fn parses_low_power_mode() {
-        assert!(parse_low_power(" lowpowermode         1\n other line"));
-        assert!(!parse_low_power(" lowpowermode         0\n other line"));
-        assert!(!parse_low_power("nothing here"));
+        assert_eq!(parse_low_power_safe(" lowpowermode         1\n other line"), Some(true));
+        assert_eq!(parse_low_power_safe(" lowpowermode         0\n other line"), Some(false));
+        // Missing → None (caller fails closed).
+        assert_eq!(parse_low_power_safe("nothing here"), None);
+    }
+
+    /// Consensus-fix C5: when the parse fails, `sample_power` MUST report
+    /// `(true, true)` — failing closed prevents heavy ML from running on
+    /// battery just because pmset spoke a different language.
+    #[test]
+    fn unrecognised_pmset_output_fails_closed() {
+        assert!(parse_on_battery("nothing useful")); // legacy wrapper
+        assert!(parse_low_power("nothing useful")); // legacy wrapper
     }
 
     #[test]

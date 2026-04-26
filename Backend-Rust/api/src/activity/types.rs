@@ -62,6 +62,11 @@ pub enum GateReason {
     ManualPause,
     /// No gating reason; trivial baseline.
     None,
+    /// `AlwaysAllowedGate` placeholder is in use — the real `ProcessingGate`
+    /// owned by the idle-gate agent has not been wired yet (issue #32).
+    /// Consensus-fix C4: surface this so the UI doesn't gaslight users with
+    /// "Idle processing — running" when in reality no work drains.
+    Stub,
 }
 
 /// Single in-flight task currently executing for a given `WorkKind`.
