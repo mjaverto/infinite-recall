@@ -15,8 +15,8 @@ use serde_json::json;
 
 use crate::activity::traits::PauseStoreError;
 use crate::activity::types::{
-    ActivitySnapshot, CaptureKind, CaptureRow, InflightUpdate, KindRow, PauseRequest, PauseTarget,
-    ResumeRequest, WorkKind,
+    ActivitySnapshot, CaptureKind, CaptureRow, InflightUpdate, KindRow, PauseRequest,
+    PauseTargetId, ResumeRequest, WorkKind,
 };
 use crate::state::{AppState, PauseChange};
 
@@ -32,23 +32,6 @@ const ALL_KINDS: [WorkKind; 5] = [
 ];
 
 const ALL_CAPTURES: [CaptureKind; 2] = [CaptureKind::Audio, CaptureKind::Screen];
-
-fn kind_id(k: WorkKind) -> &'static str {
-    match k {
-        WorkKind::Transcribe => "transcribe",
-        WorkKind::Ocr => "ocr",
-        WorkKind::Summarize => "summarize",
-        WorkKind::ExtractMemory => "extract_memory",
-        WorkKind::ExtractActionItems => "extract_action_items",
-    }
-}
-
-fn capture_id(c: CaptureKind) -> &'static str {
-    match c {
-        CaptureKind::Audio => "audio",
-        CaptureKind::Screen => "screen",
-    }
-}
 
 /// `GET /v1/activity/snapshot` — full live snapshot.
 pub async fn snapshot(
@@ -89,7 +72,9 @@ pub async fn snapshot(
             queued: 0,
             failed: 0,
             last_done_at: None,
-            paused_until: state.pause_store.paused_until(PauseTarget::Kind, kind_id(*k)),
+            paused_until: state
+                .pause_store
+                .paused_until(&PauseTargetId::Kind(*k)),
         })
         .collect();
 
@@ -98,7 +83,7 @@ pub async fn snapshot(
         .map(|c| {
             let paused = state
                 .pause_store
-                .paused_until(PauseTarget::Capture, capture_id(*c));
+                .paused_until(&PauseTargetId::Capture(*c));
             CaptureRow {
                 kind: *c,
                 // We don't yet observe live capture state from the Rust daemon
@@ -120,27 +105,13 @@ pub async fn snapshot(
     }))
 }
 
-/// Resolve a `PauseRequest`/`ResumeRequest` `id` against its `target`. The
-/// id space is tiny and validated server-side so the Swift caller can't
-/// pause an unknown kind.
-fn validate_target_id(target: PauseTarget, id: &str) -> Result<(), StatusCode> {
-    match target {
-        PauseTarget::Kind => {
-            if ALL_KINDS.iter().any(|k| kind_id(*k) == id) {
-                Ok(())
-            } else {
-                Err(StatusCode::BAD_REQUEST)
-            }
-        }
-        PauseTarget::Capture => {
-            if ALL_CAPTURES.iter().any(|c| capture_id(*c) == id) {
-                Ok(())
-            } else {
-                Err(StatusCode::BAD_REQUEST)
-            }
-        }
-    }
-}
+// Issue #34: `validate_target_id` was deleted. The combination of
+// `PauseTargetId` (a sum type whose variants carry typed `WorkKind` /
+// `CaptureKind` payloads) and serde's `tag/content` deserialization
+// rejects any unknown `target` or `id` at the parse layer, returning
+// 400/422 to the caller automatically. The route handlers no longer
+// need a runtime guard — the type system enforces what this used to
+// check.
 
 /// Map `PauseStoreError` to a 5xx response with structured JSON detail
 /// (consensus-fix C3) so the Swift caller can show the real failure
@@ -156,25 +127,23 @@ fn pause_store_error_response(e: PauseStoreError) -> (StatusCode, Json<serde_jso
 }
 
 /// `POST /v1/activity/pause` — pause a kind or live capture for N minutes.
+///
+/// Issue #34: serde rejects `minutes: 0` (`NonZeroU32`) and unknown
+/// `target`/`id` combinations (typed `PauseTargetId` sum). No manual
+/// validation lives here anymore.
 pub async fn pause(
     State(state): State<AppState>,
     Json(body): Json<PauseRequest>,
 ) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    if body.minutes == 0 {
-        return Err(StatusCode::BAD_REQUEST.into_response());
-    }
-    validate_target_id(body.target, &body.id).map_err(|s| s.into_response())?;
-
     let resume_at = state
         .pause_store
-        .pause(body.target, &body.id, body.minutes)
+        .pause(&body.target, body.minutes)
         .map_err(|e| pause_store_error_response(e).into_response())?;
 
     // Best-effort fanout. No subscribers = ok; the Swift poller still
     // refreshes on its 1s tick.
     let _ = state.pause_tx.send(PauseChange {
         target: body.target,
-        id: body.id.clone(),
         paused_until: Some(resume_at),
     });
 
@@ -188,11 +157,9 @@ pub async fn resume(
     State(state): State<AppState>,
     Json(body): Json<ResumeRequest>,
 ) -> Result<StatusCode, axum::response::Response> {
-    validate_target_id(body.target, &body.id).map_err(|s| s.into_response())?;
-
     let was_paused = state
         .pause_store
-        .resume(body.target, &body.id)
+        .resume(&body.target)
         .map_err(|e| pause_store_error_response(e).into_response())?;
 
     // Only fan out a notification if a row was actually deleted — otherwise
@@ -200,7 +167,6 @@ pub async fn resume(
     if was_paused {
         let _ = state.pause_tx.send(PauseChange {
             target: body.target,
-            id: body.id.clone(),
             paused_until: None,
         });
     }
@@ -236,27 +202,106 @@ fn parse_work_kind(s: &str) -> Option<WorkKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
 
     #[test]
     fn parse_work_kind_round_trip() {
         for k in ALL_KINDS {
-            assert_eq!(parse_work_kind(kind_id(k)), Some(k));
+            assert_eq!(parse_work_kind(k.as_str()), Some(k));
         }
         assert_eq!(parse_work_kind("nope"), None);
     }
 
+    // --- Issue #34: wire-format round-trip for `PauseTargetId` ---
+    //
+    // The `validate_target_id` helper used to live here; it's gone now.
+    // These tests instead cover what replaced it — the typed sum +
+    // `serde(tag/content/flatten)` pattern that makes invalid combos
+    // unrepresentable at the deserialization layer.
+
     #[test]
-    fn validate_target_id_accepts_known() {
-        assert!(validate_target_id(PauseTarget::Kind, "ocr").is_ok());
-        assert!(validate_target_id(PauseTarget::Capture, "audio").is_ok());
-        assert!(validate_target_id(PauseTarget::Capture, "screen").is_ok());
+    fn pause_request_decodes_every_workkind() {
+        for k in ALL_KINDS {
+            let json = format!(
+                r#"{{"target":"kind","id":"{}","minutes":5}}"#,
+                k.as_str()
+            );
+            let req: PauseRequest =
+                serde_json::from_str(&json).expect("valid kind body must decode");
+            assert_eq!(req.target, PauseTargetId::Kind(k));
+            assert_eq!(req.minutes, NonZeroU32::new(5).unwrap());
+        }
     }
 
     #[test]
-    fn validate_target_id_rejects_unknown() {
-        assert!(validate_target_id(PauseTarget::Kind, "audio").is_err());
-        assert!(validate_target_id(PauseTarget::Capture, "ocr").is_err());
-        assert!(validate_target_id(PauseTarget::Kind, "").is_err());
+    fn pause_request_decodes_every_capturekind() {
+        for c in ALL_CAPTURES {
+            let json = format!(
+                r#"{{"target":"capture","id":"{}","minutes":5}}"#,
+                c.as_str()
+            );
+            let req: PauseRequest =
+                serde_json::from_str(&json).expect("valid capture body must decode");
+            assert_eq!(req.target, PauseTargetId::Capture(c));
+        }
     }
 
+    #[test]
+    fn pause_request_rejects_zero_minutes_via_serde() {
+        // NonZeroU32 makes `minutes: 0` unrepresentable — serde rejects.
+        let err = serde_json::from_str::<PauseRequest>(
+            r#"{"target":"kind","id":"ocr","minutes":0}"#,
+        );
+        assert!(err.is_err(), "minutes=0 must fail at the serde layer");
+    }
+
+    #[test]
+    fn pause_request_rejects_kind_with_capture_id() {
+        // `target=kind` + `id="audio"` is unrepresentable — `WorkKind`
+        // does not have an `audio` variant.
+        let err =
+            serde_json::from_str::<PauseRequest>(r#"{"target":"kind","id":"audio","minutes":5}"#);
+        assert!(err.is_err(), "kind+audio must fail at the serde layer");
+    }
+
+    #[test]
+    fn pause_request_rejects_capture_with_kind_id() {
+        let err = serde_json::from_str::<PauseRequest>(
+            r#"{"target":"capture","id":"ocr","minutes":5}"#,
+        );
+        assert!(err.is_err(), "capture+ocr must fail at the serde layer");
+    }
+
+    #[test]
+    fn pause_request_rejects_unknown_target() {
+        let err = serde_json::from_str::<PauseRequest>(
+            r#"{"target":"nope","id":"ocr","minutes":5}"#,
+        );
+        assert!(err.is_err(), "unknown target must fail at the serde layer");
+    }
+
+    #[test]
+    fn pause_request_serializes_to_flat_wire_shape() {
+        // Re-serializing must produce the legacy `{target, id, minutes}`
+        // shape so the wire format is unchanged.
+        let req = PauseRequest {
+            target: PauseTargetId::Kind(WorkKind::Ocr),
+            minutes: NonZeroU32::new(15).unwrap(),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        // Order is not guaranteed, but the keys + values must be present.
+        assert!(s.contains(r#""target":"kind""#), "got: {s}");
+        assert!(s.contains(r#""id":"ocr""#), "got: {s}");
+        assert!(s.contains(r#""minutes":15"#), "got: {s}");
+    }
+
+    #[test]
+    fn resume_request_round_trips_for_capture() {
+        let req: ResumeRequest =
+            serde_json::from_str(r#"{"target":"capture","id":"audio"}"#).unwrap();
+        assert_eq!(req.target, PauseTargetId::Capture(CaptureKind::Audio));
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains(r#""target":"capture""#), "got: {s}");
+        assert!(s.contains(r#""id":"audio""#), "got: {s}");
+    }
 }

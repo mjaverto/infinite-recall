@@ -95,23 +95,23 @@ public final class ActivityMonitorService: ObservableObject {
     /// Pause a `WorkKind` row for `minutes` minutes. Optimistically updates
     /// the local snapshot and posts `pauseChanged`.
     public func pauseKind(_ kind: WorkKind, minutes: Int) async {
-        await pause(target: .kind, id: kind.rawValue, minutes: minutes)
+        await pause(target: .kind(kind), minutes: minutes)
     }
 
     /// Pause a capture row (audio/screen) for `minutes` minutes. UI is
     /// expected to have already shown the confirm sheet for `audio`.
     public func pauseCapture(_ capture: CaptureKind, minutes: Int) async {
-        await pause(target: .capture, id: capture.rawValue, minutes: minutes)
+        await pause(target: .capture(capture), minutes: minutes)
     }
 
     /// Resume a previously paused row.
     /// Consensus-fix C3: only mutate local state after the backend write
     /// succeeds. Previously we wrote optimistically and the next snapshot
     /// poll silently reverted on backend failure.
-    public func resume(target: PauseTarget, id: String) async {
+    public func resume(target: PauseTargetId) async {
         do {
-            try await APIClient.shared.resumeActivity(target: target.rawValue, id: id)
-            applyOptimisticPause(target: target, id: id, until: nil)
+            try await APIClient.shared.resumeActivity(target: target)
+            applyOptimisticPause(target: target, until: nil)
             postPauseChanged()
             self.lastError = nil
             await fetchOnce()
@@ -131,14 +131,17 @@ public final class ActivityMonitorService: ObservableObject {
     /// Consensus-fix C3: write to local state ONLY after the round-trip
     /// returns success. On failure we set `lastError` and leave the
     /// snapshot untouched so the UI never silently rolls back.
-    private func pause(target: PauseTarget, id: String, minutes: Int) async {
+    private func pause(target: PauseTargetId, minutes: Int) async {
+        // Issue #34: clamp to a valid `UInt32 > 0` before the typed
+        // `PauseRequest.init` does the same — surfaces a clean error
+        // instead of throwing across the actor boundary.
+        let mins = UInt32(max(1, minutes))
         do {
             let until = try await APIClient.shared.pauseActivity(
-                target: target.rawValue,
-                id: id,
-                minutes: minutes
+                target: target,
+                minutes: mins
             )
-            applyOptimisticPause(target: target, id: id, until: until)
+            applyOptimisticPause(target: target, until: until)
             postPauseChanged()
             self.lastError = nil
             await fetchOnce()
@@ -215,14 +218,16 @@ public final class ActivityMonitorService: ObservableObject {
     }
 
     /// Mutate `snapshot` in place to set/clear `paused_until` on the affected
-    /// row. Caller passes `until = nil` to clear (resume). No-op if there is
-    /// no current snapshot or the id doesn't resolve to a known kind/capture.
-    private func applyOptimisticPause(target: PauseTarget, id: String, until: Date?) {
+    /// row. Caller passes `until = nil` to clear (resume).
+    ///
+    /// Issue #34: takes a typed `PauseTargetId` directly — no string→enum
+    /// reverse lookup, and the type system prevents callers from passing an
+    /// id that doesn't belong to its variant.
+    private func applyOptimisticPause(target: PauseTargetId, until: Date?) {
         guard let current = snapshot else { return }
 
         switch target {
-        case .kind:
-            guard let kind = WorkKind(rawValue: id) else { return }
+        case .kind(let kind):
             let updatedKinds = current.kinds.map { row -> KindRow in
                 guard row.kind == kind else { return row }
                 return KindRow(
@@ -242,8 +247,7 @@ public final class ActivityMonitorService: ObservableObject {
                 generatedAt: current.generatedAt
             )
 
-        case .capture:
-            guard let cap = CaptureKind(rawValue: id) else { return }
+        case .capture(let cap):
             let updatedCapture = current.capture.map { row -> CaptureRow in
                 guard row.kind == cap else { return row }
                 return CaptureRow(

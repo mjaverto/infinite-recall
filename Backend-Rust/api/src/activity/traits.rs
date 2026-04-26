@@ -7,10 +7,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 
-use super::types::{GateState, InFlight, PauseTarget, ResourceSample, WorkKind};
+use super::types::{GateState, InFlight, PauseTargetId, ResourceSample, WorkKind};
 
 /// Errors surfaced by `PauseStore` writes (consensus-fix C3).
 ///
@@ -59,25 +60,31 @@ impl From<r2d2::Error> for PauseStoreError {
 }
 
 /// Persistent absolute-time pause storage. Backed by SQLite (Stream B).
+///
+/// Issue #34: takes `&PauseTargetId` (typed sum) instead of the legacy
+/// `(PauseTarget, &str)` pair, so callers cannot construct illegal
+/// combinations like `Kind` + `"audio"`.
 pub trait PauseStore: Send + Sync {
-    /// Returns the wall-time at which the given target/id resumes,
+    /// Returns the wall-time at which the given target resumes,
     /// or `None` when not paused.
-    fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>>;
+    fn paused_until(&self, target: &PauseTargetId) -> Option<DateTime<Utc>>;
 
     /// Pause for `minutes` from now; returns the resolved resume time.
     /// Errors propagate so the route can surface a 5xx instead of silently
     /// returning a "successful" resume time on a failed write.
+    ///
+    /// `minutes: NonZeroU32` makes a zero-minute pause unrepresentable
+    /// at the type system, removing the need for a runtime guard.
     fn pause(
         &self,
-        target: PauseTarget,
-        id: &str,
-        minutes: u32,
+        target: &PauseTargetId,
+        minutes: NonZeroU32,
     ) -> Result<DateTime<Utc>, PauseStoreError>;
 
-    /// Clear any pause row for the given target/id. Returns `true` iff a
+    /// Clear any pause row for the given target. Returns `true` iff a
     /// row was actually deleted, so the route can decide whether to fan
     /// out a `pauseChanged` notification.
-    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError>;
+    fn resume(&self, target: &PauseTargetId) -> Result<bool, PauseStoreError>;
 }
 
 /// Tracks which `WorkKind` is currently mid-handler. Backed by an
