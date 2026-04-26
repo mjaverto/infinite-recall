@@ -95,6 +95,15 @@ public final class BatteryAwareScheduler: ObservableObject {
   @Published public private(set) var pendingWorkCount: Int = 0
   @Published public private(set) var isDraining: Bool = false
 
+  // === activity:G ===
+  /// Currently-running work item per kind, surfaced for the Activity UI.
+  /// Mirrors what we report to the Rust daemon via
+  /// `APIClient.shared.reportInFlight(...)` so SwiftUI views can bind to
+  /// instant local state without waiting on the snapshot poller.
+  /// Cleared (entry removed) when the handler returns or throws.
+  @Published public private(set) var inFlight: [PendingWork.Kind: InFlight] = [:]
+  // === /activity:G ===
+
   /// Power-user override. When `true`, `allowHeavyWork` is forced true
   /// regardless of battery / low-power-mode / thermal signals.
   @AppStorage("battery_override_allowHeavyWork")
@@ -277,16 +286,72 @@ public final class BatteryAwareScheduler: ObservableObject {
         continue
       }
 
+      // === activity:G ===
+      // 1. user-pause check (additive to idle/battery/thermal gating already
+      //    enforced above via `allowHeavyWork` in the `while` condition).
+      //    If the user has paused this kind from the Activity tab, stop
+      //    draining. We've already claimed this row; per the existing
+      //    "no handler for X, leaving claimed" pattern just above, we leave
+      //    it claimed and break — the sweeper reclaims after lease expiry,
+      //    and the next drain past the pause window will pick it up.
+      //
+      //    NOTE: Until Stream H lands the real CapturePauseGate, this always
+      //    returns false (no-op). The check is intentionally ADDITIVE to the
+      //    device-idle / battery / thermal gates — it does NOT replace them.
+      if CapturePauseGate.shared.isPaused(target: .kind, id: work.kind.rawValue) {
+        log("BatteryAwareScheduler: user-paused \(work.kind.rawValue), leaving claimed")
+        break
+      }
+
+      // 2. wrap handler with in-flight reporting so the Activity tab can show
+      //    the running task in real time. Local @Published mirror is updated
+      //    synchronously on @MainActor; the daemon report fires-and-forgets.
+      let inflightLabel = WorkLabels.humanLabel(work)
+      let inflightEntry = InFlight(label: inflightLabel, startedAt: Date())
+      self.inFlight[work.kind] = inflightEntry
+      Task {
+        try? await APIClient.shared.reportInFlight(
+          kind: work.kind.rawValue,
+          inFlight: inflightEntry
+        )
+      }
+      // === /activity:G ===
+
       do {
         try await handler(work)
         try? await PendingWorkStorage.shared.ack(storageId: storageId)
+        // === activity:G ===
+        self.inFlight[work.kind] = nil
+        Task {
+          try? await APIClient.shared.reportInFlight(
+            kind: work.kind.rawValue,
+            inFlight: nil
+          )
+        }
+        // === /activity:G ===
       } catch {
         try? await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
+        // === activity:G ===
+        self.inFlight[work.kind] = nil
+        Task {
+          try? await APIClient.shared.reportInFlight(
+            kind: work.kind.rawValue,
+            inFlight: nil
+          )
+        }
+        // === /activity:G ===
         // Stop draining; next state transition or explicit drain() can retry.
         break
       }
     }
   }
+
+  // === activity:G ===
+  // Phase-0 placeholder so this file compiles before Stream F lands the real
+  // `APIClient.reportInFlight(kind:inFlight:)`. When Stream F's PR adds the
+  // real method on `APIClient`, this entire bracketed extension MUST be
+  // deleted — having both will be a duplicate-symbol compile error.
+  // === /activity:G ===
 
   // MARK: - Internal
 
