@@ -295,10 +295,12 @@ public final class BatteryAwareScheduler: ObservableObject {
       //    it claimed and break — the sweeper reclaims after lease expiry,
       //    and the next drain past the pause window will pick it up.
       //
-      //    NOTE: Until Stream H lands the real CapturePauseGate, this always
-      //    returns false (no-op). The check is intentionally ADDITIVE to the
-      //    device-idle / battery / thermal gates — it does NOT replace them.
-      if CapturePauseGate.shared.isPaused(target: .kind, id: work.kind.rawValue) {
+      //    The check is intentionally ADDITIVE to the device-idle / battery /
+      //    thermal gates — it does NOT replace them.
+      let isUserPaused = await MainActor.run {
+        CapturePauseGate.shared.isPaused(target: "kind", id: work.kind.rawValue)
+      }
+      if isUserPaused {
         log("BatteryAwareScheduler: user-paused \(work.kind.rawValue), leaving claimed")
         break
       }
