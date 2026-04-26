@@ -41,14 +41,19 @@ OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
 The `OMI_SKIP_*` flags disable all inherited Omi cloud services. They must always
 be set when building locally.
 
-**Backend-Rust (API daemon):**
+**Backend-Rust (Cargo workspace — daemon + CLI):**
 
 ```bash
+# Build everything (both binaries)
 cd Backend-Rust && cargo build
+
+# Ad-hoc CLI install to ~/.cargo/bin/recall
+cargo install --path Backend-Rust/cli
 ```
 
-The `scripts/setup-api-server.sh` wrapper handles first-run token generation and
-launchd plist installation.
+The `scripts/setup-api-server.sh` wrapper handles first-run token generation,
+launchd plist installation, and symlinking both `infinite-recall-api` and
+`recall` binaries to `/usr/local/bin/`.
 
 ---
 
@@ -66,7 +71,8 @@ Desktop/Sources/          Swift source tree
   REST/                   MCPAPIService, Backend-Rust wrappers
   UI/                     SwiftUI views (MainWindow, Rewind, settings panels)
   Assistants/             Focus / Task / Insight / Memory assistants
-Backend-Rust/src/         axum REST handler, SQLite reader, auth middleware
+Backend-Rust/api/src/     axum REST handler, SQLite reader/writer, auth middleware
+Backend-Rust/cli/src/     recall CLI (clap, reqwest blocking, --json output)
 scripts/                  setup-mlx-server.sh, setup-vlm-server.sh,
                           setup-api-server.sh
 ```

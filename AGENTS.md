@@ -1,214 +1,234 @@
-# Infinite Recall — Agent Onboarding Guide
+# AGENTS.md — Infinite Recall
 
-This file is the entry point for AI agents (Claude Code via MCP, Cursor, custom
-scripts) that want to read the user's local data through the Infinite Recall API.
-
----
-
-## What This Is
-
-Infinite Recall is a **local-first macOS app** that continuously captures screen
-and audio, transcribes speech on-device with WhisperKit, extracts memories and
-action items with a local LLM, and indexes visual activity with a vision LLM.
-
-**Everything lives on the user's machine.** There is no cloud sync, no remote
-database, no outbound network traffic from the app or the API server. Agent calls
-to the API are loopback-only (`127.0.0.1:7331`).
-
-As an agent you can:
-
-- Search conversations by keyword across audio transcripts, OCR text, and visual
-  activity summaries
-- Retrieve full conversation transcripts with per-speaker segment timing
-- Query extracted memories (facts, preferences, and observations the LLM derived
-  from conversations)
-- List open or completed action items
-- Look up known people and correlate them with conversations
-- Search screen activity (what the user was looking at) by app, time window, or
-  content keyword
-- Get daily activity rollups (screenshot count, conversation count, etc.)
-
-**No write operations exist.** This API is strictly read-only. Agents cannot
-create, update, or delete any records.
+> **For coding agents (Claude Code, Cursor, Codex, etc.).**
+> Human contributors: see [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
-## Prerequisites
+## What this codebase is
 
-The Backend-Rust API server must be running. Verify:
-
-```bash
-curl http://127.0.0.1:7331/v1/health
-```
-
-If the server is not running, start it:
-
-```bash
-~/src/infinite-recall/scripts/setup-api-server.sh
-```
-
-This builds the binary and registers it as a launchd agent that starts at login.
-See `Backend-Rust/API.md` for full setup details.
+Infinite Recall is a local-first macOS app that continuously captures screen and
+audio, transcribes everything on-device with WhisperKit, and indexes activity into
+a private SQLite database. A Rust daemon (`infinite-recall-api`) exposes that
+database over a local REST API on `127.0.0.1:7331`. A companion CLI (`recall`)
+wraps the API so agents can query — and write — activity data without raw HTTP.
+All data stays on-device: no cloud, no telemetry, no auth beyond a local bearer
+token auto-generated at first run.
 
 ---
 
-## MCP Setup (Claude Code / Cursor)
+## The `recall` CLI
 
-The Settings panel in Infinite Recall (Settings → AI / Models → MCP API card)
-shows a ready-to-paste `claude mcp add` command with the correct token already
-filled in. Click "Copy command" there for the authoritative one-liner.
+`recall` is the correct way for an agent to interact with Infinite Recall data.
+Prefer it over raw `curl` — it handles authentication, formats human output for
+terminals, and emits clean JSON for machines.
 
-The general form is:
+**Always pass `--json`** in scripts and agent contexts. Without it, output is
+human-readable tables whose format may change across versions.
 
 ```bash
-claude mcp add infinite-recall \
-  --transport http \
-  --url http://127.0.0.1:7331 \
-  --header "Authorization: Bearer $(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)"
+# Confirm the daemon is alive before doing anything else
+recall health --json
 ```
 
-Run this once per machine. Claude Code will persist the config and use it for
-future sessions.
+The daemon runs as a launchd user agent (`com.infiniterecall.api`) and starts
+automatically at login after the first `./scripts/setup-api-server.sh` run.
 
-### Fallback: manual `mcp.json` snippet
+### Global flags
 
-If you prefer to configure the MCP client manually, add this to your
-`mcp.json` (location depends on client — Claude Code uses
-`~/.claude/mcp.json`):
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | Emit raw JSON instead of human-readable output |
+| `--base-url URL` | `http://127.0.0.1:7331` | Override daemon address |
+| `--token-path PATH` | `~/Library/Application Support/InfiniteRecall/api-token.txt` | Override token file |
+| `--timeout SECS` | 10 | Request timeout |
 
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Runtime error (network failure, parse error) |
+| 2 | Usage error (bad flags — printed by clap) |
+| 3 | Daemon unreachable (connection refused) |
+| 4 | Auth failed (HTTP 401) |
+| 5 | Not found (HTTP 404) |
+
+---
+
+## Choosing a command
+
+```
+What do I need?
+│
+├── Something that happened / what was on screen? ──→  recall search <q> --json
+│
+├── An audio conversation (transcript)? ────────────→  recall conversations list --json
+│                                                       recall conversations show <id> --json
+│
+├── A stable fact the app extracted about me? ───────→  recall memories list --json
+│                                                        recall memories show <id> --json
+│
+├── Action items / todos? ───────────────────────────→  recall action-items list --json
+│   (also: create / update / complete / delete)          recall action-items create ...
+│
+├── Who was in a conversation? ──────────────────────→  recall people list --json
+│                                                        recall people show <id> --json
+│
+└── How much activity happened on a day? ────────────→  recall scores --date YYYY-MM-DD --json
+```
+
+**Rule of thumb:**
+- Searching for an event, incident, or "what was I looking at" → `search` or `conversations`
+- Looking for a durable extracted fact (preferences, names, decisions) → `memories`
+- Managing todos → `action-items`
+- Daily summary / volume check → `scores`
+
+---
+
+## Command reference
+
+Run `recall <subcommand> --help` for the authoritative flag list — examples
+below were captured against a live daemon.
+
+---
+
+### `recall health`
+
+Check whether the daemon is alive and the database is readable. No auth required.
+
+```bash
+recall health --json
+```
+
+Example response:
 ```json
 {
-  "mcpServers": {
-    "infinite-recall": {
-      "transport": "http",
-      "url": "http://127.0.0.1:7331",
-      "headers": {
-        "Authorization": "Bearer <paste token here>"
-      }
-    }
-  }
+  "db_readable": true,
+  "pending_work": {
+    "claimed": 0,
+    "dead": 0,
+    "failed": 0,
+    "migrated": true,
+    "oldest_queued_seconds": null,
+    "queued": 0
+  },
+  "status": "ok"
 }
 ```
 
-Replace `<paste token here>` with the contents of
-`~/Library/Application Support/InfiniteRecall/api-token.txt` (without the
-trailing newline). The token is a 64-character hex string.
+`status` is `"ok"` or `"degraded"`. If `db_readable` is `false`, the SQLite file
+is not accessible — typically because the Swift app has never run its migrations.
 
 ---
 
-## Auth Pattern for Custom Agents
+### `recall conversations`
 
-Read the bearer token once at startup. Set it as an environment variable or
-store it in a local variable. Send it on every authed request.
+List transcription sessions (audio recordings), newest first.
 
 ```bash
-# Shell
-TOKEN=$(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7331/v1/conversations
+recall conversations list --json
+recall conversations list --limit 10 --since 2025-04-24 --json
+recall conversations list --since 2025-04-01 --until 2025-04-30 --json
 ```
 
-```python
-# Python
-from pathlib import Path
-import requests
+Flags: `--limit N` (default 50, max 500), `--since DATE`, `--until DATE` (ISO 8601 or YYYY-MM-DD).
 
-token = Path.home() / "Library/Application Support/InfiniteRecall/api-token.txt"
-bearer = token.read_text().strip()
-headers = {"Authorization": f"Bearer {bearer}"}
-
-resp = requests.get("http://127.0.0.1:7331/v1/conversations", headers=headers)
-resp.raise_for_status()
-conversations = resp.json()["conversations"]
+Example response (abbreviated):
+```json
+{
+  "conversations": [
+    {
+      "created_at": "2026-04-26 11:12:15.213",
+      "finished_at": null,
+      "id": 82,
+      "language": "multi",
+      "source": "desktop",
+      "started_at": "2026-04-26 11:12:15.213",
+      "status": "recording",
+      "timezone": "America/New_York",
+      "updated_at": "2026-04-26 11:12:15.213"
+    }
+  ],
+  "limit": 10,
+  "offset": 0
+}
 ```
 
-```javascript
-// Node.js
-import { readFileSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
+`finished_at` is `null` while a session is still active. `status` is one of
+`recording`, `processing`, `completed`.
 
-const token = readFileSync(
-  join(homedir(), "Library/Application Support/InfiniteRecall/api-token.txt"),
-  "utf8"
-).trim();
+Fetch a single conversation with its full transcript:
 
-const resp = await fetch("http://127.0.0.1:7331/v1/conversations", {
-  headers: { Authorization: `Bearer ${token}` },
-});
-const { conversations } = await resp.json();
+```bash
+recall conversations show 42 --json
 ```
 
-**Do not log or print the token.** It grants full read access to all local data.
+Response includes `"conversation": {...}` and `"transcript_segments": [{"speaker_id", "text", "start", "end", "order"}, ...]`.
 
 ---
 
-## Privacy Posture
+### `recall memories`
 
-- The API server binds exclusively to `127.0.0.1`. No network interface except
-  loopback can reach it.
-- The Swift app and the Rust daemon make zero outbound network connections during
-  normal operation (apart from one-time model downloads during initial setup).
-  Verified with `lsof`.
-- All telemetry SDKs (Sentry, PostHog, Mixpanel, Heap, Firebase) have been
-  stripped or disabled.
-- Agent calls never leave the user's machine via this API.
+List memories extracted from conversations and screen activity, newest first.
+Soft-deleted rows are excluded.
+
+```bash
+recall memories list --json
+recall memories list --limit 20 --json
+recall memories list --category preference --json
+```
+
+Flags: `--limit N` (default 50, max 500), `--category CAT` (exact match).
+
+Example response (abbreviated):
+```json
+{
+  "limit": 20,
+  "memories": [
+    {
+      "backend_id": null,
+      "category": "system",
+      "confidence": null,
+      "content": "Focused on iTerm2: prod deploy",
+      "conversation_id": null,
+      "created_at": "2026-04-26 11:40:08.170",
+      "id": 47,
+      "manually_added": false,
+      "reviewed": false,
+      "source": "desktop",
+      "source_app": "iTerm2",
+      "tags": "[\"focus\",\"focused\",\"app:iTerm2\"]",
+      "updated_at": "2026-04-26 11:40:08.170",
+      "visibility": "private"
+    }
+  ],
+  "offset": 0
+}
+```
+
+`tags` is a JSON-encoded string (parse twice). `confidence` is null for
+auto-extracted system memories; populated for LLM-derived memories.
+
+Fetch one memory:
+
+```bash
+recall memories show 7 --json
+```
 
 ---
 
-## Capabilities Reference
+### `recall action-items`
 
-| Capability | Endpoint | Key parameters |
-|---|---|---|
-| List recent conversations | `GET /v1/conversations` | `limit`, `offset`, `start_date`, `end_date` |
-| Get full transcript | `GET /v1/conversations/:id` | path: integer ID |
-| Search audio (spoken words) | `GET /v1/search?content_type=audio` | `q`, `limit` |
-| Search screen OCR | `GET /v1/search?content_type=ocr` | `q`, `app`, `start`, `end` |
-| Search visual summaries | `GET /v1/search?content_type=visual` | `q`, `app`, `start`, `end` |
-| Search everything | `GET /v1/search?content_type=both` | `q`, `app`, `start`, `end`, `limit` |
-| List memories | `GET /v3/memories` | `limit`, `offset`, `category` |
-| Get one memory | `GET /v3/memories/:id` | path: integer ID |
-| List action items | `GET /v1/action-items` | `limit`, `offset`, `completed` |
-| List people | `GET /v1/people` | — |
-| Get one person | `GET /v1/people/:id` | path: string ID |
-| Daily activity rollup | `GET /v1/scores` | `date` (YYYY-MM-DD) |
-| Health check | `GET /v1/health` | — (no auth required) |
-
----
-
-## Common Tasks with Examples
-
-All examples assume:
+List action items (todos), newest first. Soft-deleted rows excluded.
 
 ```bash
-TOKEN=$(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)
+recall action-items list --json              # open items only (default)
+recall action-items list --completed --json  # completed items only
+recall action-items list --limit 25 --json
 ```
 
-### 1. Find conversations from yesterday about a topic
-
-```bash
-# Yesterday's date (macOS date command)
-YESTERDAY=$(date -v-1d +%Y-%m-%d)
-
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/conversations?start_date=${YESTERDAY}T00:00:00&end_date=${YESTERDAY}T23:59:59&limit=50"
-```
-
-Then search the transcript text:
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/search?q=deployment&content_type=audio&start=${YESTERDAY}T00:00:00&end=${YESTERDAY}T23:59:59"
-```
-
-### 2. List open action items
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/action-items?completed=false&limit=50"
-```
-
-Sample response excerpt:
-
+Example response (abbreviated):
 ```json
 {
   "action_items": [
@@ -217,7 +237,8 @@ Sample response excerpt:
       "description": "File expense report for April conference",
       "completed": false,
       "priority": "high",
-      "due_at": null
+      "due_at": null,
+      "conversation_id": "42"
     }
   ],
   "limit": 50,
@@ -225,102 +246,195 @@ Sample response excerpt:
 }
 ```
 
-### 3. Search screen activity for "GitHub PR"
+**Action items are the only resource the CLI can mutate.** All write commands
+return `{"action_item": {...}}` on success.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/search?q=GitHub+PR&content_type=ocr"
+# Create
+recall action-items create --description "Follow up with Alice re: budget" --json
+recall action-items create --description "Send invoice" --due-at 2025-05-01 --priority high --json
+recall action-items create --description "Review PR" --conversation-id 42 --json
+
+# Update (patch — only supplied fields change)
+recall action-items update 3 --description "File April expense report by Friday" --json
+recall action-items update 3 --due-at 2025-05-02 --json
+
+# Mark done / reopen
+recall action-items complete   3 --json
+recall action-items uncomplete 3 --json
+
+# Soft-delete (item disappears from default list; not permanently destroyed)
+recall action-items delete 3 --json
 ```
-
-To restrict to a specific app:
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/search?q=GitHub+PR&content_type=ocr&app=Google+Chrome"
-```
-
-OCR hits include a `snippet` field with `<b>` tags around matched terms.
-
-### 4. Get a memory's full content
-
-```bash
-# List recent memories
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v3/memories?limit=10"
-
-# Fetch one by ID
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v3/memories/7"
-```
-
-### 5. Fetch one conversation with its full transcript
-
-```bash
-# First get the ID from the list endpoint
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/conversations?limit=5"
-
-# Then fetch with segments
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/conversations/42"
-```
-
-The response includes `transcript_segments` ordered by `order` with per-speaker
-`start`/`end` timing in seconds.
-
-### 6. Filter screen search by app and time window
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     "http://127.0.0.1:7331/v1/search?q=budget&content_type=ocr&app=Microsoft+Excel&start=2025-04-01T00:00:00&end=2025-04-30T23:59:59&limit=20"
-```
-
-Use `content_type=visual` instead for VLM-derived activity summaries (available
-once the vision sidecar has indexed frames).
 
 ---
 
-## Limits
+### `recall people`
 
-- **Single-user only.** The app always runs as the `anonymous` user. There is no
-  multi-user support and no user-switching in this API.
-- **Read-only.** No endpoints exist for creating, editing, or deleting data.
-- **Pagination.** Most list endpoints support `limit` (max 500) and `offset` for
-  cursor-free pagination. `/v1/people` has no pagination parameters.
-- **Search is synchronous.** FTS5 queries (OCR, visual) are fast. The audio
-  branch uses a full-table `LIKE` scan and may be slower on large databases.
-- **Visual hits require VLM.** `visual_hits` in search results are empty until
-  the vision LLM sidecar (`mlx-vlm` on port 8081) has processed frames. The VLM
-  must be running for new frames to be indexed.
-- **No semantic/vector search via this API.** Embedding-based similarity search
-  is performed inside the Swift app; there is no vector search endpoint here.
+List speaker profiles, alphabetically by display name. No pagination (table is
+typically small).
 
----
+```bash
+recall people list --json
+```
 
-## Errors and Retry
+Example response:
+```json
+{
+  "people": [
+    {
+      "id": "person-uuid-or-rowid",
+      "display_name": "Alice",
+      "default_emoji": "👩‍💻",
+      "created_at": "2025-03-10T08:00:00.000"
+    }
+  ]
+}
+```
 
-| HTTP status | Meaning | Action |
-|---|---|---|
-| 200 | Success | Consume the JSON body |
-| 400 | Bad request (invalid parameter) | Fix the query string before retrying |
-| 401 | Token missing or wrong | Re-read `api-token.txt` — the token may have been rotated. Reconstruct the `Authorization` header. |
-| 404 | ID not found | The row does not exist or was soft-deleted. Do not retry. |
-| 500 | Internal server error | Check `/tmp/infinite-recall-api.err.log`. May indicate a DB corruption or missing table. |
+Fetch one person by their text ID:
 
-On 401: the token file is the source of truth. Re-read it and retry once. If
-still 401, the server may need to be restarted (`launchctl unload` then
-`launchctl load` the plist).
-
-On 500: inspect the error log at `/tmp/infinite-recall-api.err.log`. Common
-cause is a missing SQLite table (e.g., `screenshots` or `visual_activity` if the
-app has not yet run those migrations). The health endpoint (`/v1/health`) does
-not require auth and is always a safe probe.
+```bash
+recall people show person-uuid-or-rowid --json
+```
 
 ---
 
-## Schema Reference
+### `recall search`
 
-Full route documentation with request/response shapes, field tables, and curl
-examples: `Backend-Rust/API.md`
+Full-text search across OCR screenshots, audio transcripts, and visual activity
+summaries. Returns hits from all three corpora by default.
 
-SQLite schema (GRDB migrations, ground truth): `Desktop/Sources/Rewind/Core/RewindDatabase.swift`
+```bash
+recall search "quarterly budget" --json
+recall search "quarterly budget" --type ocr --json          # screenshots only
+recall search "standup" --type audio --since 2025-04-24 --json
+recall search "GitHub PR" --type visual --json              # visual activity only
+recall search "deploy" --app Xcode --limit 20 --json
+```
+
+Flags:
+- `--type ocr|audio|visual|both` (default: `both`)
+- `--app NAME` — filter to a specific app (exact match on app name)
+- `--since DATE`, `--until DATE` — ISO 8601 time bounds
+- `--limit N` — max results per corpus (default 50, max 500; applied independently per corpus when `--type both`)
+
+Example response (abbreviated, `--type both`):
+```json
+{
+  "query": "quarterly budget",
+  "content_type": "both",
+  "ocr_hits": [
+    {
+      "screenshot_id": 5012,
+      "timestamp": "2025-04-24T11:33:45.000",
+      "app_name": "Numbers",
+      "window_title": "Q1 Budget.numbers",
+      "snippet": "…<b>quarterly budget</b> projections for…"
+    }
+  ],
+  "audio_hits": [
+    {
+      "session_id": 42,
+      "segment_order": 3,
+      "speaker": 1,
+      "start_time": 18.4,
+      "end_time": 22.1,
+      "text": "Let's go over the quarterly budget."
+    }
+  ],
+  "visual_hits": []
+}
+```
+
+> `visual_hits` will be empty until the VLM sidecar has processed at least one
+> frame. See [Troubleshooting](#troubleshooting) if visual search is unexpectedly
+> empty.
+
+---
+
+### `recall scores`
+
+Daily activity rollup. Defaults to today (UTC).
+
+```bash
+recall scores --json
+recall scores --date 2025-04-24 --json
+```
+
+Example response:
+```json
+{
+  "date": "2025-04-24",
+  "counts": {
+    "screenshots": 1420,
+    "conversations": 3,
+    "memories": 12,
+    "action_items": 5,
+    "action_items_completed": 2
+  }
+}
+```
+
+---
+
+## What `recall` does NOT do
+
+If you need any of the following, **stop and tell the user** — do not attempt
+workarounds.
+
+| Capability | Status |
+|-----------|--------|
+| Vector / semantic search | Not implemented. FTS5 + LIKE only. |
+| Raw SQL passthrough | No `execute_sql` command. Use the structured subcommands. |
+| Conversation mutations | Conversations are append-only; the Swift app is the sole writer. |
+| Memory mutations | Memories are auto-extracted. No create / edit / delete via CLI. |
+| People mutations | Speaker profiles are managed by the Swift app only. |
+| Firestore / cloud sync | Infinite Recall is local-only. No sync endpoint exists. |
+| Streaming / live tail | All commands are request/response. No event-stream mode. |
+| Browser automation | Out of scope for this CLI. |
+
+---
+
+## Troubleshooting
+
+**Start here:**
+
+```bash
+recall health --json
+```
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `exit 3` / "connection refused" | Daemon not running | `launchctl kickstart gui/$(id -u)/com.infiniterecall.api` |
+| `exit 4` / auth error | Wrong or missing token | Open Infinite Recall → Settings → MCP API → Copy token; or verify `~/Library/Application Support/InfiniteRecall/api-token.txt` exists (mode 0600) |
+| `exit 5` / not found | Bad ID | Verify the ID with a `list` command first |
+| `recall: command not found` | Binary not on PATH | Re-run `./scripts/setup-api-server.sh`; it symlinks `recall` to `/usr/local/bin/recall` |
+| Daemon starts then crashes | Binary missing or PATH issue | Re-run `./scripts/setup-api-server.sh` |
+| `visual_hits` always empty | VLM sidecar not running, or `isVLMAvailable()` stub | Run `./scripts/setup-vlm-server.sh`; known stub issue tracked in the plan |
+
+**Daemon logs:**
+
+```bash
+tail -f /tmp/infinite-recall-api.err.log
+tail -f /tmp/infinite-recall-api.out.log
+```
+
+**Manual launchd control:**
+
+```bash
+# Stop
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.infiniterecall.api.plist
+
+# Start
+launchctl kickstart gui/$(id -u)/com.infiniterecall.api
+
+# Legacy (older macOS)
+launchctl unload  ~/Library/LaunchAgents/com.infiniterecall.api.plist
+launchctl load    ~/Library/LaunchAgents/com.infiniterecall.api.plist
+```
+
+---
+
+*For the full HTTP API surface (useful when adding new CLI commands), see
+[Backend-Rust/API.md](Backend-Rust/API.md).*
