@@ -1,0 +1,262 @@
+//! Stream A: `/v1/activity/*` route handlers.
+//!
+//! Assembles `ActivitySnapshot` from the four trait objects parked on
+//! `AppState` (`PauseStore`, `InflightRegistry`, `ResourceSampler`,
+//! `ProcessingGate`) and exposes pause/resume + a Swift→Rust loopback
+//! in-flight reporting endpoint.
+//!
+//! Wire-format types live in `crate::activity::types`. Concrete trait
+//! impls are owned by Streams B/C/D and the idle-gate agent — the Phase 0
+//! contract (`activity/contract.md`) is the source of truth.
+
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use chrono::Utc;
+use serde_json::json;
+
+use crate::activity::traits::PauseStoreError;
+use crate::activity::types::{
+    ActivitySnapshot, CaptureKind, CaptureRow, InflightUpdate, KindRow, PauseRequest, PauseTarget,
+    ResumeRequest, WorkKind,
+};
+use crate::state::{AppState, PauseChange};
+
+/// All `WorkKind`s, in display order. Used to assemble the `kinds` array
+/// in the snapshot — every kind gets a row even if there's no in-flight
+/// item or pause, so the UI can render a stable table.
+const ALL_KINDS: [WorkKind; 5] = [
+    WorkKind::Transcribe,
+    WorkKind::Ocr,
+    WorkKind::Summarize,
+    WorkKind::ExtractMemory,
+    WorkKind::ExtractActionItems,
+];
+
+const ALL_CAPTURES: [CaptureKind; 2] = [CaptureKind::Audio, CaptureKind::Screen];
+
+fn kind_id(k: WorkKind) -> &'static str {
+    match k {
+        WorkKind::Transcribe => "transcribe",
+        WorkKind::Ocr => "ocr",
+        WorkKind::Summarize => "summarize",
+        WorkKind::ExtractMemory => "extract_memory",
+        WorkKind::ExtractActionItems => "extract_action_items",
+    }
+}
+
+fn capture_id(c: CaptureKind) -> &'static str {
+    match c {
+        CaptureKind::Audio => "audio",
+        CaptureKind::Screen => "screen",
+    }
+}
+
+/// `GET /v1/activity/snapshot` — full live snapshot.
+pub async fn snapshot(
+    State(state): State<AppState>,
+) -> Result<Json<ActivitySnapshot>, (StatusCode, String)> {
+    // Pull each piece independently. Sampler + gate are expected to cache
+    // their own work; pause_store is a cheap SQLite point-lookup; inflight
+    // is an in-memory RwLock read.
+    let inflight_map = state.inflight.snapshot();
+
+    // Singleton-fixer S4: `SystemResourceSampler::sample()` blocks the
+    // calling thread for ~300ms on a cache miss (it `thread::sleep(250ms)`
+    // for the CPU-delta window plus ~5 sync subprocess forks for ioreg /
+    // sysctl / pmset). With the sampler's 2s cache TTL and the Swift
+    // poller hitting `/snapshot` at 1Hz, on the old `.sample()`-on-the-
+    // tokio-worker path every other tick stalled an entire runtime
+    // worker. Move the sample to a blocking pool so the async runtime
+    // stays free to serve the rest of the daemon.
+    let sampler = state.resource_sampler.clone();
+    let resources = tokio::task::spawn_blocking(move || sampler.sample())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("resource sampler join error: {e}"),
+            )
+        })?;
+    let processing_gate = state.processing_gate.current();
+
+    let kinds: Vec<KindRow> = ALL_KINDS
+        .iter()
+        .map(|k| KindRow {
+            kind: *k,
+            in_flight: inflight_map.get(k).cloned(),
+            // Queue depth + failure counters live in the Swift app's domain
+            // (PendingWork rows). Until Stream G/F surface those into the
+            // Rust daemon, report 0/0 — the UI degrades gracefully.
+            queued: 0,
+            failed: 0,
+            last_done_at: None,
+            paused_until: state.pause_store.paused_until(PauseTarget::Kind, kind_id(*k)),
+        })
+        .collect();
+
+    let capture: Vec<CaptureRow> = ALL_CAPTURES
+        .iter()
+        .map(|c| {
+            let paused = state
+                .pause_store
+                .paused_until(PauseTarget::Capture, capture_id(*c));
+            CaptureRow {
+                kind: *c,
+                // We don't yet observe live capture state from the Rust daemon
+                // (Swift side owns AVCapture / SCStream). The Swift Activity
+                // service overlays its local `running` view on top of this row.
+                // Default: "would be running unless paused".
+                running: paused.is_none(),
+                paused_until: paused,
+            }
+        })
+        .collect();
+
+    Ok(Json(ActivitySnapshot {
+        kinds,
+        capture,
+        resources,
+        processing_gate,
+        generated_at: Utc::now(),
+    }))
+}
+
+/// Resolve a `PauseRequest`/`ResumeRequest` `id` against its `target`. The
+/// id space is tiny and validated server-side so the Swift caller can't
+/// pause an unknown kind.
+fn validate_target_id(target: PauseTarget, id: &str) -> Result<(), StatusCode> {
+    match target {
+        PauseTarget::Kind => {
+            if ALL_KINDS.iter().any(|k| kind_id(*k) == id) {
+                Ok(())
+            } else {
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+        PauseTarget::Capture => {
+            if ALL_CAPTURES.iter().any(|c| capture_id(*c) == id) {
+                Ok(())
+            } else {
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+    }
+}
+
+/// Map `PauseStoreError` to a 5xx response with structured JSON detail
+/// (consensus-fix C3) so the Swift caller can show the real failure
+/// instead of silently rolling back optimistic UI state.
+fn pause_store_error_response(e: PauseStoreError) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "pause_store_failure",
+            "detail": e.to_string(),
+        })),
+    )
+}
+
+/// `POST /v1/activity/pause` — pause a kind or live capture for N minutes.
+pub async fn pause(
+    State(state): State<AppState>,
+    Json(body): Json<PauseRequest>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    if body.minutes == 0 {
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+    validate_target_id(body.target, &body.id).map_err(|s| s.into_response())?;
+
+    let resume_at = state
+        .pause_store
+        .pause(body.target, &body.id, body.minutes)
+        .map_err(|e| pause_store_error_response(e).into_response())?;
+
+    // Best-effort fanout. No subscribers = ok; the Swift poller still
+    // refreshes on its 1s tick.
+    let _ = state.pause_tx.send(PauseChange {
+        target: body.target,
+        id: body.id.clone(),
+        paused_until: Some(resume_at),
+    });
+
+    Ok(Json(
+        json!({ "paused_until": resume_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) }),
+    ))
+}
+
+/// `POST /v1/activity/resume` — clear a pause row.
+pub async fn resume(
+    State(state): State<AppState>,
+    Json(body): Json<ResumeRequest>,
+) -> Result<StatusCode, axum::response::Response> {
+    validate_target_id(body.target, &body.id).map_err(|s| s.into_response())?;
+
+    let was_paused = state
+        .pause_store
+        .resume(body.target, &body.id)
+        .map_err(|e| pause_store_error_response(e).into_response())?;
+
+    // Only fan out a notification if a row was actually deleted — otherwise
+    // we'd wake every Swift poller for every UI Cmd-R no-op.
+    if was_paused {
+        let _ = state.pause_tx.send(PauseChange {
+            target: body.target,
+            id: body.id.clone(),
+            paused_until: None,
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/activity/_internal/inflight` — Swift → Rust loopback.
+///
+/// The daemon binds to 127.0.0.1 only (see `main.rs`), so loopback is
+/// enforced by the listener. We still require bearer auth via the
+/// `authed` middleware.
+pub async fn inflight(
+    State(state): State<AppState>,
+    Json(body): Json<InflightUpdate>,
+) -> Result<StatusCode, StatusCode> {
+    let kind = parse_work_kind(&body.kind).ok_or(StatusCode::BAD_REQUEST)?;
+    state.inflight.update(kind, body.in_flight);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_work_kind(s: &str) -> Option<WorkKind> {
+    match s {
+        "transcribe" => Some(WorkKind::Transcribe),
+        "ocr" => Some(WorkKind::Ocr),
+        "summarize" => Some(WorkKind::Summarize),
+        "extract_memory" => Some(WorkKind::ExtractMemory),
+        "extract_action_items" => Some(WorkKind::ExtractActionItems),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_work_kind_round_trip() {
+        for k in ALL_KINDS {
+            assert_eq!(parse_work_kind(kind_id(k)), Some(k));
+        }
+        assert_eq!(parse_work_kind("nope"), None);
+    }
+
+    #[test]
+    fn validate_target_id_accepts_known() {
+        assert!(validate_target_id(PauseTarget::Kind, "ocr").is_ok());
+        assert!(validate_target_id(PauseTarget::Capture, "audio").is_ok());
+        assert!(validate_target_id(PauseTarget::Capture, "screen").is_ok());
+    }
+
+    #[test]
+    fn validate_target_id_rejects_unknown() {
+        assert!(validate_target_id(PauseTarget::Kind, "audio").is_err());
+        assert!(validate_target_id(PauseTarget::Capture, "ocr").is_err());
+        assert!(validate_target_id(PauseTarget::Kind, "").is_err());
+    }
+
+}

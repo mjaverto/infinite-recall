@@ -43,3 +43,19 @@ hex = "0.4"
 
 # CLI args / env
 dirs = "5"
+
+# === activity:stream-C resource sampler ===
+# macOS process-tree CPU/RSS sampler used by Activity Tab.
+libproc = "0.14"
+
+[features]
+# Enables the Activity Tab integration test wiring (Stream I, issue #19).
+# When on, the gated tests in `tests/activity_endpoints.rs` compile and
+# run against the real `infinite_recall_api::routes::router` library
+# surface (now exposed by `lib.rs`).
+activity_test_wiring = []
+
+[dev-dependencies]
+tempfile = "3"
+# Pulled in for `ServiceExt::oneshot` used by the activity_endpoints tests.
+tower = { version = "0.5", features = ["util"] }

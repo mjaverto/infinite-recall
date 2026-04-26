@@ -683,6 +683,13 @@ final class ScreenCaptureService: Sendable {
 
   /// Async capture - main entry point
   func captureActiveWindowAsync() async -> Data? {
+    // === activity:H ===
+    if await Self.isScreenPaused() {
+      let until = await Self.screenPausedUntil()
+      log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+      return nil
+    }
+    // === /activity:H ===
     let (_, _, windowID) = await Self.getActiveWindowInfoAsync()
     guard let windowID else {
       log("No active window ID found")
@@ -820,6 +827,13 @@ final class ScreenCaptureService: Sendable {
   }
 
   func captureActiveWindowCGImage() async -> CGImage? {
+    // === activity:H ===
+    if await Self.isScreenPaused() {
+      let until = await Self.screenPausedUntil()
+      log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+      return nil
+    }
+    // === /activity:H ===
     let (_, _, windowID) = await Self.getActiveWindowInfoAsync()
     guard let windowID else {
       log("No active window ID found")
@@ -887,6 +901,17 @@ final class ScreenCaptureService: Sendable {
 
   /// Capture the active window and return as JPEG data (synchronous - legacy)
   func captureActiveWindow() -> Data? {
+    // === activity:H === (consensus-fix C6)
+    // Use the nonisolated, lock-protected mirror so we can read the gate
+    // from any thread — including the main thread. The previous
+    // `!Thread.isMainThread` guard silently skipped the gate when called
+    // from MainActor, which let user-paused screen captures continue.
+    if CapturePauseGate.shared.isPausedSync(target: "capture", id: "screen") {
+      let until = CapturePauseGate.shared.pausedUntilSync(target: "capture", id: "screen")
+      log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+      return nil
+    }
+    // === /activity:H ===
     guard let windowID = Self.getActiveWindowID() else {
       log("No active window ID found")
       return nil
@@ -985,4 +1010,21 @@ final class ScreenCaptureService: Sendable {
       properties: [.compressionFactor: jpegQuality]
     )
   }
+
+  // === activity:H ===
+  /// Bridge helper: read the Activity tab's pause gate (MainActor-isolated)
+  /// from a Sendable context. Used by the async capture entry points.
+  private static func isScreenPaused() async -> Bool {
+    return await MainActor.run {
+      CapturePauseGate.shared.isPaused(target: "capture", id: "screen")
+    }
+  }
+
+  /// Bridge helper for the resume timestamp. See `isScreenPaused`.
+  private static func screenPausedUntil() async -> Date? {
+    return await MainActor.run {
+      CapturePauseGate.shared.pausedUntil(target: "capture", id: "screen")
+    }
+  }
+  // === /activity:H ===
 }

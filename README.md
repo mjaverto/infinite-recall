@@ -41,12 +41,13 @@ are pending merge.
 
 ## Screenshots
 
-> Placeholders — not yet captured. Drop real screenshots into `screenshots/`
-> and update these paths before making the repo public.
+| Conversations | Memories |
+|---------------|----------|
+| ![Conversations](screenshots/conversations.png) | ![Memories](screenshots/memories.png) |
 
-| Home / chat | Conversations | Transcript detail | Settings — AI / Models |
-|-------------|---------------|-------------------|------------------------|
-| ![Home](screenshots/home.png) | ![Conversations](screenshots/conversations.png) | ![Transcript](screenshots/transcript.png) | ![Settings](screenshots/settings-ai.png) |
+| Settings — AI Provider | Settings — Local Models & MCP |
+|------------------------|-------------------------------|
+| ![AI Provider](screenshots/settings-ai-provider.png) | ![Local Models](screenshots/settings-local-models.png) |
 
 ---
 

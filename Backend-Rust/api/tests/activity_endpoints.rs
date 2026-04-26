@@ -1,0 +1,663 @@
+//! Activity Tab — Stream I integration tests.
+//!
+//! These exercise the `/v1/activity/*` HTTP surface against the assembled
+//! axum app, with stub implementations of the four backend traits
+//! (`PauseStore`, `InflightRegistry`, `ResourceSampler`, `ProcessingGate`).
+//!
+//! ## Why everything is gated
+//!
+//! Integration tests in `tests/` need to import the crate as a library
+//! (`use infinite_recall_api::...`). The Phase 0 stub crate is binary-only
+//! (`Backend-Rust/Cargo.toml` declares no `[lib]`), and Stream A owns
+//! `state.rs` / `routes/mod.rs` wiring + `main.rs` constructor. Until Stream A
+//! lands a `lib.rs` exposing `routes::router` and the extended `AppState`,
+//! these tests CANNOT compile against the trait-extended state — there is no
+//! library surface to import.
+//!
+//! Strategy:
+//!   1. Wrap the entire test body in `#[cfg(feature = "activity_test_wiring")]`
+//!      so `cargo test` is a no-op today (the file compiles to zero tests).
+//!   2. Stream I's post-merge follow-up flips the feature on (or, more likely,
+//!      Stream A's `lib.rs` makes the imports valid and we drop the gate).
+//!   3. Each test that further depends on a *specific* downstream stream is
+//!      tagged with a `#[ignore = "stream-X"]` so the operator can see at a
+//!      glance which stream's impl unlocks it.
+//!
+//! ## Pre-flight before flipping the feature on
+//!
+//! When this file is enabled, the following Cargo.toml additions are
+//! required (Stream I's post-merge follow-up will own this single edit
+//! to avoid colliding with Stream C's `libproc` add):
+//!
+//! ```toml
+//! [features]
+//! activity_test_wiring = []
+//!
+//! [dev-dependencies]
+//! tempfile = "3"
+//! tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+//! ```
+//!
+//! `tower` and `axum` are already in `[dependencies]`.
+//!
+//! ## Verification matrix (mirrors §Verification in the plan)
+//!
+//! | Test                                  | Gated on streams |
+//! |---------------------------------------|------------------|
+//! | `snapshot_returns_200_with_full_shape` | A                |
+//! | `pause_returns_paused_until`           | A + B            |
+//! | `paused_kind_visible_in_snapshot`      | A + B            |
+//! | `pause_persists_across_restart`        | A + B            |
+//! | `resume_clears_pause`                  | A + B            |
+//! | `inflight_loopback_round_trip`         | A + D            |
+//! | `missing_bearer_returns_401`           | A                |
+//! | `pause_request_validation`             | A                |
+//! | `enum_round_trip_via_wire`             | (none — type-only) |
+
+#![cfg(feature = "activity_test_wiring")]
+
+// =====================================================================
+// The block below assumes Stream A has shipped the following:
+//
+//   1. `Backend-Rust/Cargo.toml` declares a `[lib]` with `name = "infinite_recall_api"`
+//      and `path = "src/lib.rs"`.
+//   2. `src/lib.rs` re-exports `routes::router`, `state::AppState`, and the
+//      `activity::traits` module.
+//   3. `AppState` is extended with the four `Arc<dyn ...>` fields named
+//      in `activity/contract.md`: `pause_store`, `inflight`,
+//      `resource_sampler`, `processing_gate`.
+//   4. `routes::router(state)` mounts `/v1/activity/*` behind `require_bearer`,
+//      with `/v1/activity/_internal/inflight` additionally restricted to
+//      loopback peers (or at minimum still authed).
+//
+// Plus the per-test gating noted above for B/C/D.
+// =====================================================================
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+
+use axum::body::{to_bytes, Body};
+use axum::http::{header, Method, Request, StatusCode};
+use chrono::{DateTime, Duration, Utc};
+use serde_json::{json, Value};
+use tower::util::ServiceExt; // brings `oneshot` onto Router
+
+use infinite_recall_api::activity::traits::{
+    InflightRegistry, PauseStore, PauseStoreError, ProcessingGate, ResourceSampler,
+};
+use infinite_recall_api::activity::types::{
+    GateReason, GateState, InFlight, PauseTarget, ProcessBreakdown,
+    ResourceSample, ThermalState, WorkKind,
+};
+use infinite_recall_api::routes;
+use infinite_recall_api::state::AppState;
+
+// ---------------------------------------------------------------------
+// Stub implementations
+// ---------------------------------------------------------------------
+
+/// Minimal in-memory `PauseStore` used when Stream B's SQLite impl is not
+/// the unit under test. For persistence test, use Stream B's `SqlPauseStore`
+/// directly (see `pause_persists_across_restart`).
+struct MemPauseStore {
+    inner: Mutex<HashMap<(PauseTarget, String), DateTime<Utc>>>,
+}
+
+impl MemPauseStore {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl PauseStore for MemPauseStore {
+    fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&(target, id.to_string()))
+            .copied()
+    }
+
+    fn pause(
+        &self,
+        target: PauseTarget,
+        id: &str,
+        minutes: u32,
+    ) -> Result<DateTime<Utc>, PauseStoreError> {
+        let resume_at = Utc::now() + Duration::minutes(minutes as i64);
+        self.inner
+            .lock()
+            .unwrap()
+            .insert((target, id.to_string()), resume_at);
+        Ok(resume_at)
+    }
+
+    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError> {
+        let removed = self
+            .inner
+            .lock()
+            .unwrap()
+            .remove(&(target, id.to_string()))
+            .is_some();
+        Ok(removed)
+    }
+}
+
+/// Minimal in-memory `InflightRegistry`.
+struct MemInflight {
+    inner: RwLock<HashMap<WorkKind, InFlight>>,
+}
+
+impl MemInflight {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl InflightRegistry for MemInflight {
+    fn snapshot(&self) -> HashMap<WorkKind, InFlight> {
+        self.inner.read().unwrap().clone()
+    }
+
+    fn update(&self, kind: WorkKind, in_flight: Option<InFlight>) {
+        let mut g = self.inner.write().unwrap();
+        match in_flight {
+            Some(f) => {
+                g.insert(kind, f);
+            }
+            None => {
+                g.remove(&kind);
+            }
+        }
+    }
+}
+
+/// Returns a fixed `ResourceSample` so assertions are deterministic.
+struct FakeSampler;
+impl ResourceSampler for FakeSampler {
+    fn sample(&self) -> ResourceSample {
+        ResourceSample {
+            cpu_percent: 12.5,
+            rss_mb: 256,
+            gpu_system_percent: Some(33.3),
+            thermal_state: ThermalState::Nominal,
+            on_battery: false,
+            low_power: false,
+            process_breakdown: vec![ProcessBreakdown {
+                name: "infinite-recall-api".into(),
+                pid: 4242,
+                cpu_percent: 12.5,
+                rss_mb: 256,
+            }],
+        }
+    }
+}
+
+/// Always-allow gate for stub purposes; tests that need a "blocked" gate
+/// substitute their own.
+struct FakeGate {
+    state: GateState,
+}
+impl FakeGate {
+    fn allow() -> Self {
+        Self {
+            state: GateState {
+                allowed: true,
+                reason: GateReason::None,
+                since: Utc::now(),
+                waiting_for: None,
+            },
+        }
+    }
+}
+impl ProcessingGate for FakeGate {
+    fn current(&self) -> GateState {
+        self.state.clone()
+    }
+}
+
+// ---------------------------------------------------------------------
+// App builder
+// ---------------------------------------------------------------------
+
+const TEST_TOKEN: &str = "test-bearer-token-deadbeef";
+
+/// Build an `AppState` with stub trait impls. The two SQLite pools come
+/// from an `:memory:` DB so we don't touch disk.
+///
+/// NOTE: Stream A is responsible for ensuring `AppState` has a constructor
+/// (or at least public fields) that lets test code populate the four new
+/// `Arc<dyn ...>` slots independently of the real one in `main.rs`.
+fn make_state(
+    pause_store: Arc<dyn PauseStore>,
+    inflight: Arc<dyn InflightRegistry>,
+    sampler: Arc<dyn ResourceSampler>,
+    gate: Arc<dyn ProcessingGate>,
+) -> AppState {
+    let pool = infinite_recall_api::db::open_in_memory_pool()
+        .expect("in-memory pool — Stream A should expose a test helper");
+    let write_pool = infinite_recall_api::db::open_in_memory_pool()
+        .expect("in-memory write pool");
+    let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
+    AppState {
+        pool,
+        write_pool,
+        token: TEST_TOKEN.to_string(),
+        pause_store,
+        inflight,
+        resource_sampler: sampler,
+        processing_gate: gate,
+        pause_tx,
+    }
+}
+
+fn make_default_app() -> axum::Router {
+    let state = make_state(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    routes::router(state)
+}
+
+fn auth_header() -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    (
+        header::AUTHORIZATION,
+        format!("Bearer {TEST_TOKEN}").parse().unwrap(),
+    )
+}
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    serde_json::from_slice(&bytes).expect("response body is valid JSON")
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+/// §Verification step 6: snapshot returns the full shape with every field
+/// present and correctly typed.
+#[tokio::test]
+async fn snapshot_returns_200_with_full_shape() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = json_body(resp).await;
+
+    // Top-level shape per contract.md.
+    for required in [
+        "kinds",
+        "capture",
+        "resources",
+        "processing_gate",
+        "generated_at",
+    ] {
+        assert!(
+            body.get(required).is_some(),
+            "missing required field `{required}` in: {body}"
+        );
+    }
+
+    // `kinds` is an array of objects with all six keys.
+    let kinds = body["kinds"].as_array().expect("kinds is an array");
+    for row in kinds {
+        for required in [
+            "kind",
+            "in_flight",
+            "queued",
+            "failed",
+            "last_done_at",
+            "paused_until",
+        ] {
+            assert!(
+                row.get(required).is_some(),
+                "kind row missing `{required}`: {row}"
+            );
+        }
+    }
+
+    // `capture` is an array of {kind, running, paused_until}.
+    let capture = body["capture"].as_array().expect("capture is an array");
+    for row in capture {
+        for required in ["kind", "running", "paused_until"] {
+            assert!(row.get(required).is_some());
+        }
+    }
+
+    // `resources` populated by FakeSampler.
+    let res = &body["resources"];
+    assert_eq!(res["cpu_percent"], json!(12.5));
+    assert_eq!(res["rss_mb"], json!(256));
+    assert_eq!(res["gpu_system_percent"], json!(33.3));
+    assert_eq!(res["thermal_state"], json!("nominal"));
+    assert_eq!(res["on_battery"], json!(false));
+    assert_eq!(res["low_power"], json!(false));
+    assert!(res["process_breakdown"].is_array());
+
+    // `processing_gate` populated by FakeGate::allow.
+    let g = &body["processing_gate"];
+    assert_eq!(g["allowed"], json!(true));
+    assert_eq!(g["reason"], json!("none"));
+    assert!(g["since"].is_string());
+
+    // `generated_at` is ISO-8601 string.
+    assert!(body["generated_at"].is_string());
+}
+
+/// §Verification step 7: POST pause writes the row and returns
+/// `{paused_until: iso8601}`.
+#[tokio::test]
+async fn pause_returns_paused_until() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    let body = json!({ "target": "kind", "id": "ocr", "minutes": 1 });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/pause")
+        .header(k, v)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = json_body(resp).await;
+    let s = body["paused_until"].as_str().expect("paused_until is a string");
+    let parsed: DateTime<Utc> = s.parse().expect("paused_until is iso8601");
+    let delta = parsed - Utc::now();
+    assert!(
+        delta.num_seconds().abs() <= 70,
+        "paused_until should be ~now+60s; got delta {}s",
+        delta.num_seconds()
+    );
+}
+
+/// After a pause, the kind row in the snapshot reflects `paused_until`.
+#[tokio::test]
+async fn paused_kind_visible_in_snapshot() {
+    // Single AppState shared across the two requests so the pause persists.
+    let pause_store: Arc<dyn PauseStore> = Arc::new(MemPauseStore::new());
+    let state = make_state(
+        pause_store.clone(),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+
+    // 1. Pause OCR for 1 minute.
+    let pause_req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/pause")
+        .header(&k, v.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"target":"kind","id":"ocr","minutes":1}).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(pause_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Snapshot should now show ocr row with paused_until ≈ now+60s.
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.oneshot(snap_req).await.unwrap()).await;
+
+    let ocr = snap["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "ocr")
+        .expect("snapshot must contain a row for every WorkKind");
+    let pu = ocr["paused_until"].as_str().expect("ocr.paused_until is set");
+    let parsed: DateTime<Utc> = pu.parse().expect("iso8601");
+    let delta = parsed - Utc::now();
+    assert!(
+        delta.num_seconds() > 0 && delta.num_seconds() <= 70,
+        "paused_until should be ~now+60s; got {}s",
+        delta.num_seconds()
+    );
+}
+
+/// §Verification step 9: pause persists across daemon restart.
+/// Uses Stream B's `SqlPauseStore` directly — both lifecycles point at the
+/// same SQLite file path.
+#[tokio::test]
+async fn pause_persists_across_restart() {
+    use infinite_recall_api::activity::pause_store::SqlPauseStore;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    // Lifecycle 1: write a pause then drop everything.
+    {
+        let store = SqlPauseStore::open(&path).expect("open SqlPauseStore");
+        let resume_at = store
+            .pause(PauseTarget::Kind, "ocr", 30)
+            .expect("pause should persist");
+        assert!(resume_at > Utc::now());
+        // store dropped here.
+    }
+
+    // Lifecycle 2: re-open the same file; the pause must still be there.
+    {
+        let store = SqlPauseStore::open(&path).expect("re-open SqlPauseStore");
+        let pu = store
+            .paused_until(PauseTarget::Kind, "ocr")
+            .expect("pause must survive restart");
+        let delta = pu - Utc::now();
+        assert!(
+            delta.num_minutes() > 25 && delta.num_minutes() <= 30,
+            "resume time drifted: {}m",
+            delta.num_minutes()
+        );
+    }
+}
+
+/// POST resume clears the pause row.
+#[tokio::test]
+async fn resume_clears_pause() {
+    let pause_store: Arc<dyn PauseStore> = Arc::new(MemPauseStore::new());
+    let state = make_state(
+        pause_store.clone(),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+
+    pause_store
+        .pause(PauseTarget::Kind, "ocr", 5)
+        .expect("pause ok");
+    assert!(pause_store.paused_until(PauseTarget::Kind, "ocr").is_some());
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/resume")
+        .header(k, v)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"target":"kind","id":"ocr"}).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        pause_store.paused_until(PauseTarget::Kind, "ocr").is_none(),
+        "resume must clear the row"
+    );
+}
+
+/// `_internal/inflight` updates the registry; subsequent snapshot reflects it.
+#[tokio::test]
+async fn inflight_loopback_round_trip() {
+    let inflight: Arc<dyn InflightRegistry> = Arc::new(MemInflight::new());
+    let state = make_state(
+        Arc::new(MemPauseStore::new()),
+        inflight.clone(),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+
+    let body = json!({
+        "kind": "transcribe",
+        "in_flight": {
+            "label": "Transcribing 14:22:01→14:25:00 (en)",
+            "started_at": "2026-04-26T14:22:03.812Z"
+        }
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/inflight")
+        .header(&k, v.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Snapshot now shows transcribe.in_flight populated.
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.oneshot(snap_req).await.unwrap()).await;
+    let transcribe = snap["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "transcribe")
+        .unwrap();
+    let inf = &transcribe["in_flight"];
+    assert!(!inf.is_null(), "in_flight must be populated after loopback POST");
+    assert_eq!(inf["label"], json!("Transcribing 14:22:01→14:25:00 (en)"));
+
+    // Clearing form: in_flight: null
+    let clear = json!({ "kind": "transcribe", "in_flight": null });
+    let (k2, v2) = auth_header();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/inflight")
+        .header(k2, v2)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(clear.to_string()))
+        .unwrap();
+    let app2 = routes::router(make_state(
+        Arc::new(MemPauseStore::new()),
+        inflight.clone(),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    ));
+    let resp = app2.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(inflight.snapshot().get(&WorkKind::Transcribe).is_none());
+}
+
+/// Auth: missing bearer → 401.
+#[tokio::test]
+async fn missing_bearer_returns_401() {
+    let app = make_default_app();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Bad pause body → 400 (or 422). Stream A picks the exact code; we accept
+/// any 4xx that signals client error.
+#[tokio::test]
+async fn pause_request_validation() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    // Missing `minutes`.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/pause")
+        .header(k, v)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"target":"kind","id":"ocr"}).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for invalid body; got {}",
+        resp.status()
+    );
+}
+
+/// Type-only round trip — no Stream A wiring needed. Sanity check that
+/// the contract.md snake_case wire format matches what serde emits.
+#[tokio::test]
+async fn enum_round_trip_via_wire() {
+    use infinite_recall_api::activity::types as t;
+
+    // Every WorkKind value.
+    for (kind, wire) in [
+        (t::WorkKind::Transcribe, "transcribe"),
+        (t::WorkKind::Ocr, "ocr"),
+        (t::WorkKind::Summarize, "summarize"),
+        (t::WorkKind::ExtractMemory, "extract_memory"),
+        (t::WorkKind::ExtractActionItems, "extract_action_items"),
+    ] {
+        let s = serde_json::to_string(&kind).unwrap();
+        assert_eq!(s, format!("\"{wire}\""));
+        let back: t::WorkKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(kind, back);
+    }
+
+    // Every GateReason value.
+    for (reason, wire) in [
+        (t::GateReason::Idle, "idle"),
+        (t::GateReason::DeviceActive, "device_active"),
+        (t::GateReason::OnBattery, "on_battery"),
+        (t::GateReason::Thermal, "thermal"),
+        (t::GateReason::Locked, "locked"),
+        (t::GateReason::ManualPause, "manual_pause"),
+        (t::GateReason::None, "none"),
+    ] {
+        let s = serde_json::to_string(&reason).unwrap();
+        assert_eq!(s, format!("\"{wire}\""));
+    }
+
+    // Every ThermalState.
+    for (ts, wire) in [
+        (t::ThermalState::Nominal, "nominal"),
+        (t::ThermalState::Fair, "fair"),
+        (t::ThermalState::Serious, "serious"),
+        (t::ThermalState::Critical, "critical"),
+    ] {
+        let s = serde_json::to_string(&ts).unwrap();
+        assert_eq!(s, format!("\"{wire}\""));
+    }
+
+    // PauseTarget.
+    for (pt, wire) in [
+        (t::PauseTarget::Kind, "kind"),
+        (t::PauseTarget::Capture, "capture"),
+    ] {
+        let s = serde_json::to_string(&pt).unwrap();
+        assert_eq!(s, format!("\"{wire}\""));
+    }
+}
