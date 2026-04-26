@@ -95,6 +95,12 @@ public final class BatteryAwareScheduler: ObservableObject {
   @Published public private(set) var pendingWorkCount: Int = 0
   @Published public private(set) var isDraining: Bool = false
 
+  /// True when the macOS screen is locked. Updated by direct subscription to
+  /// `.screenDidLock` / `.screenDidUnlock` (posted by AppState lifecycle observers).
+  /// We subscribe directly here rather than depending on AppState observer order —
+  /// the scheduler must be able to evaluate `allowAutonomousAIWork` at any time.
+  @Published public private(set) var isScreenLocked: Bool = false
+
   /// Power-user override. When `true`, `allowHeavyWork` is forced true
   /// regardless of battery / low-power-mode / thermal signals.
   @AppStorage("battery_override_allowHeavyWork")
@@ -109,6 +115,27 @@ public final class BatteryAwareScheduler: ObservableObject {
     if isLowPowerMode { return false }
     if thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { return false }
     return true
+  }
+
+  /// Stricter readiness gate for autonomous AI work (e.g. `.summarize`).
+  ///
+  /// Requires `allowHeavyWork` PLUS one of:
+  ///   - the screen is locked, OR
+  ///   - the user has been input-idle for at least
+  ///     `IdleAIController.shared.idleTimeoutMinutes * 60` seconds.
+  ///
+  /// Lock-or-idle ensures autonomous LLM drain never interrupts an active
+  /// user. Idle threshold reuses the existing Memory Saver setting — no new
+  /// user-facing knob is introduced.
+  ///
+  /// Used ONLY for `.summarize` (and future autonomous-LLM kinds). Existing
+  /// kinds (`.transcribe`, `.ocr`, …) keep using `allowHeavyWork`, so their
+  /// behavior is unchanged.
+  public var allowAutonomousAIWork: Bool {
+    guard allowHeavyWork else { return false }
+    if isScreenLocked { return true }
+    let threshold = TimeInterval(IdleAIController.shared.idleTimeoutMinutes * 60)
+    return IdleAIController.shared.systemIdleSeconds() >= threshold
   }
 
   /// Human-readable summary for the menu-bar badge.
@@ -137,7 +164,11 @@ public final class BatteryAwareScheduler: ObservableObject {
   private var handlers: [PendingWork.Kind: Handler] = [:]
   private var monitorTask: Task<Void, Never>?
   private var countPollerTask: Task<Void, Never>?
+  private var readinessTickTask: Task<Void, Never>?
+  private var screenLockObserver: NSObjectProtocol?
+  private var screenUnlockObserver: NSObjectProtocol?
   private var lastAllow: Bool = true
+  private var lastAutonomousAllow: Bool = false
 
   /// The power source that `allowHeavyWork` is evaluated against.
   /// Updated only after a debounce window elapses — not on every raw signal.
@@ -192,6 +223,51 @@ public final class BatteryAwareScheduler: ObservableObject {
         try? await Task.sleep(nanoseconds: 5_000_000_000)
       }
     }
+
+    // Lock-state observers. Subscribe directly to AppState's notifications so
+    // we don't depend on AppState observer order. `isScreenLocked` is part of
+    // `allowAutonomousAIWork`, so a flip in either direction must re-evaluate
+    // readiness immediately and (if it just became true) kick off a drain.
+    if screenLockObserver == nil {
+      screenLockObserver = NotificationCenter.default.addObserver(
+        forName: .screenDidLock,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.isScreenLocked = true
+          self?.reevaluateAutonomousReadiness()
+        }
+      }
+    }
+    if screenUnlockObserver == nil {
+      screenUnlockObserver = NotificationCenter.default.addObserver(
+        forName: .screenDidUnlock,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.isScreenLocked = false
+          self?.reevaluateAutonomousReadiness()
+        }
+      }
+    }
+
+    // 60s periodic readiness tick. `systemIdleSeconds()` changes silently — no
+    // notification fires when the user crosses the idle threshold — so we
+    // poll. AC / low-power / thermal still drive their own immediate paths
+    // via the snapshot loop above.
+    readinessTickTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+        guard let self else { return }
+        self.reevaluateAutonomousReadiness()
+      }
+    }
+
+    // Seed lastAutonomousAllow from current state so the first tick doesn't
+    // mistake "still false" for "just transitioned to false".
+    self.lastAutonomousAllow = self.allowAutonomousAIWork
   }
 
   /// Stop watching for transitions. Mainly for tests.
@@ -200,8 +276,19 @@ public final class BatteryAwareScheduler: ObservableObject {
     monitorTask = nil
     countPollerTask?.cancel()
     countPollerTask = nil
+    readinessTickTask?.cancel()
+    readinessTickTask = nil
     pendingTransitionTask?.cancel()
     pendingTransitionTask = nil
+
+    if let obs = screenLockObserver {
+      NotificationCenter.default.removeObserver(obs)
+      screenLockObserver = nil
+    }
+    if let obs = screenUnlockObserver {
+      NotificationCenter.default.removeObserver(obs)
+      screenUnlockObserver = nil
+    }
   }
 
   // MARK: - Handler registration
@@ -262,8 +349,29 @@ public final class BatteryAwareScheduler: ObservableObject {
     }
 
     let tag = workerTag
+    var drainedAnyAutonomous = false
     while allowHeavyWork {
       guard let work = try? await PendingWorkStorage.shared.claimNext(claimedBy: tag) else {
+        break
+      }
+      // Per-kind readiness gate: `.summarize` (and future autonomous-LLM
+      // kinds) require the stricter `allowAutonomousAIWork`. Other kinds
+      // (`.transcribe`, `.ocr`, …) keep the existing `allowHeavyWork` gate
+      // so their behavior is unchanged.
+      //
+      // If we just claimed a `.summarize` row but autonomous readiness is
+      // false, fail the row with a transient error so PendingWorkStorage
+      // releases the claim (clears `claimedBy` / `leaseExpiresAt`) and
+      // schedules a backoff retry. The next safe window will pick it up.
+      if Self.requiresAutonomousReadiness(work.kind), !allowAutonomousAIWork {
+        if let storageId = work.storageId {
+          let err = NSError(
+            domain: "BatteryAwareScheduler",
+            code: 100,
+            userInfo: [NSLocalizedDescriptionKey: "Autonomous AI work readiness lost mid-claim; will retry on next safe window."]
+          )
+          try? await PendingWorkStorage.shared.fail(storageId: storageId, error: err)
+        }
         break
       }
       guard let handler = handlers[work.kind] else {
@@ -280,11 +388,40 @@ public final class BatteryAwareScheduler: ObservableObject {
       do {
         try await handler(work)
         try? await PendingWorkStorage.shared.ack(storageId: storageId)
+        if Self.requiresAutonomousReadiness(work.kind) {
+          drainedAnyAutonomous = true
+        }
       } catch {
         try? await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
         // Stop draining; next state transition or explicit drain() can retry.
         break
       }
+    }
+
+    // Memory Saver: after each batch drain, if we touched any autonomous-LLM
+    // work AND the .summarize queue is now empty AND the user is idle/locked
+    // with Memory Saver enabled, give IdleAIController a chance to unload the
+    // local LLM. `chatAutonomous` deliberately does NOT bump
+    // `IdleAIController.lastAICall`, so this release path is the only thing
+    // that prevents autonomous drains from pinning the model in memory.
+    if drainedAnyAutonomous {
+      let depth = try? await PendingWorkStorage.shared.depthSummary()
+      let key = PendingWork.Kind.summarize.rawValue
+      let summarizeRemaining = (depth?.queued[key] ?? 0) + (depth?.failed[key] ?? 0)
+      if summarizeRemaining == 0 {
+        await IdleAIController.shared.releaseAfterAutonomousWorkIfAppropriate()
+      }
+    }
+  }
+
+  /// Returns true for kinds gated by `allowAutonomousAIWork`.
+  /// Currently: `.summarize`. Future autonomous-LLM kinds should be added here.
+  fileprivate static func requiresAutonomousReadiness(_ kind: PendingWork.Kind) -> Bool {
+    switch kind {
+    case .summarize:
+      return true
+    case .transcribe, .ocr, .extractMemory, .extractActionItems:
+      return false
     }
   }
 
@@ -318,6 +455,9 @@ public final class BatteryAwareScheduler: ObservableObject {
           await self.drain()
         }
       }
+      // Autonomous readiness depends on heavy + lock/idle; re-evaluate too so
+      // a thermal / low-power flip can also unblock or block summarize work.
+      reevaluateAutonomousReadiness()
       return
     }
 
@@ -347,6 +487,24 @@ public final class BatteryAwareScheduler: ObservableObject {
         // next real transition is detected correctly.
         self.lastAllow = now
       }
+      self.reevaluateAutonomousReadiness()
+    }
+  }
+
+  /// Reads the latest `allowAutonomousAIWork` value and, if it just flipped
+  /// false → true, kicks off `drain()` so any waiting `.summarize` rows pick
+  /// up immediately rather than waiting for the next 60s tick or AC flip.
+  ///
+  /// Idempotent and cheap — safe to call from any signal source (AC change,
+  /// thermal, lock state, periodic tick).
+  fileprivate func reevaluateAutonomousReadiness() {
+    let now = allowAutonomousAIWork
+    let was = lastAutonomousAllow
+    lastAutonomousAllow = now
+    if !was && now && !isDraining {
+      Task { @MainActor in
+        await self.drain()
+      }
     }
   }
 
@@ -364,6 +522,25 @@ public final class BatteryAwareScheduler: ObservableObject {
     if let isLowPowerMode { self.isLowPowerMode = isLowPowerMode }
     if let thermalState { self.thermalState = thermalState }
     handlePossibleTransition()
+  }
+
+  /// For tests: bypass the debounce window and commit a power source
+  /// immediately so unit tests don't wait 30s.
+  public func _testCommitSource(_ source: PowerSource) {
+    pendingTransitionTask?.cancel()
+    pendingTransitionTask = nil
+    self.source = source
+    self.committedSource = source
+    self.lastAllow = self.allowHeavyWork
+    self.lastAutonomousAllow = self.allowAutonomousAIWork
+  }
+
+  /// For tests: drive lock state directly without raising real distributed
+  /// notifications. Mirrors what the production `.screenDidLock`/`Unlock`
+  /// observer would do.
+  public func _testSetScreenLocked(_ locked: Bool) {
+    self.isScreenLocked = locked
+    self.reevaluateAutonomousReadiness()
   }
   #endif
 }

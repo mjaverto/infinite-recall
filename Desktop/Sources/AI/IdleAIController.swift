@@ -282,6 +282,67 @@ final class IdleAIController: ObservableObject {
     )
   }
 
+  // MARK: - Autonomous-work release
+
+  /// Called by `BatteryAwareScheduler` after each batch drain of autonomous
+  /// `.summarize` work, when the `.summarize` queue has gone empty.
+  ///
+  /// `chatAutonomous` deliberately skips `recordAICall()`, so the regular
+  /// `tick()` loop CAN still unload during a drain — but the drain may have
+  /// touched the server within the last second, so this method exists as an
+  /// explicit "queue is empty, please reconsider releasing" hook.
+  ///
+  /// Memory Saver semantics: only unloads when
+  ///   - `isEnabled == true` (user opted in to release-on-idle), AND
+  ///   - screen is locked OR `systemIdleSeconds >= idleTimeoutMinutes * 60`.
+  /// Otherwise this is a no-op so we don't surprise users who disabled
+  /// Memory Saver to keep the model warm.
+  ///
+  /// Mirrors the unload branch of `tick()` for the text + vision tiers
+  /// (pyannote isn't relevant to autonomous summary work). This does NOT
+  /// touch `lastAICall` — the next user-initiated `chat(...)` will restart
+  /// the server through the existing `recordAICall` path.
+  func releaseAfterAutonomousWorkIfAppropriate() async {
+    guard isEnabled else { return }
+
+    let sysIdle = systemIdleSeconds()
+    let threshold = TimeInterval(idleTimeoutMinutes * 60)
+    let isIdle = sysIdle >= threshold
+    // Lock state lives on `BatteryAwareScheduler` (which subscribes directly
+    // to `.screenDidLock` / `.screenDidUnlock`). Reading it back here keeps a
+    // single source of truth without re-subscribing to the same notifications.
+    let locked = BatteryAwareScheduler.shared.isScreenLocked
+    guard locked || isIdle else { return }
+
+    // Text tier
+    if MLXLifecycleManager.shared.serverRunning {
+      log(
+        "IdleAIController: autonomous drain finished and idle/locked — stopping local LLM server (sys=\(Int(sysIdle))s, threshold=\(Int(threshold))s, locked=\(locked))"
+      )
+      isTransitioning = true
+      let ok = await MLXLifecycleManager.shared.stopServer()
+      await MLXLifecycleManager.shared.refresh()
+      isTransitioning = false
+      if ok {
+        serverStoppedByIdle = true
+        log("IdleAIController: local LLM server stopped (post-autonomous-drain).")
+      }
+    }
+
+    // Vision tier — mirror tick() so VLM doesn't survive an autonomous drain
+    // window that text tier already cleared.
+    if VLMLifecycleManager.shared.serverRunning {
+      log("IdleAIController: post-autonomous-drain — stopping vision LLM server")
+      isTransitioning = true
+      let okVLM = await VLMLifecycleManager.shared.stopServer()
+      await VLMLifecycleManager.shared.refresh()
+      isTransitioning = false
+      if okVLM {
+        vlmStoppedByIdle = true
+      }
+    }
+  }
+
   // MARK: - UI helpers
 
   /// Human-readable status line for the Settings → AI / Models → Autonomous Work Mode card.

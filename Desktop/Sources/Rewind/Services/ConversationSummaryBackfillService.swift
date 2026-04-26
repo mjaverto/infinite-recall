@@ -615,34 +615,39 @@ actor ConversationSummaryBackfillService {
         }
     }
 
-    /// Autonomous-mode JSON generation. MUST route through
-    /// `LocalLLMClient.shared.chatAutonomous` (Agent B's deliverable in
-    /// `task-002`) which mirrors `chat(...)` but does NOT call
-    /// `IdleAIController.recordAICall`, so Memory Saver can still unload the
-    /// model after an autonomous drain.
+    /// Autonomous-mode JSON generation. Routes through
+    /// `LocalLLMClient.shared.chatAutonomous` which mirrors `chat(...)` but
+    /// does NOT call `IdleAIController.recordAICall`, so Memory Saver can
+    /// still unload the model after an autonomous drain.
     ///
-    /// Strips JSON code fences best-effort, mirroring `LLMBridge.generateJSON`.
-    ///
-    /// **Wave-1 compile note:** `LocalLLMClient.chatAutonomous` is owned by
-    /// Agent B (`task-002`). Until that branch merges, this Wave-1 build
-    /// temporarily routes the autonomous call through `LLMBridge.generateJSON`
-    /// so the package compiles and tests can run. The autonomous-flag
-    /// plumbing through `processSummary` is in place; only the final LLM call
-    /// site needs to be swapped in Wave 2 to remove `recordAICall` pinning.
-    /// See contracts/IRSummaryContracts.swift `LocalLLMClientAutonomousContract`.
+    /// Augments the system prompt with a JSON-only instruction (mirroring
+    /// `LLMBridge.generateJSON`) and strips ```json fences from the response
+    /// best-effort. Returns nil on any error — matches `LLMBridge.generate`
+    /// failure semantics so call-sites can stay graceful.
     private static func generateJSONAutonomous(
         systemPrompt: String,
         userPrompt: String,
         label: String
     ) async -> String? {
-        // TODO(agent-b/task-002): replace this fallback with a direct call to
-        //   LocalLLMClient.shared.chatAutonomous(messages:stream:) once Agent B's
-        //   branch lands. The autonomous flag plumbing in processSummary stays
-        //   the same — only the LLM call site changes.
-        return await LLMBridge.generateJSON(
-            systemPrompt: systemPrompt,
-            userPrompt: userPrompt,
-            label: label + ":pending-chatAutonomous"
-        )
+        let augmentedSystem = systemPrompt + "\n\nRespond ONLY with a single valid JSON object that conforms to the schema described in the user prompt. Do not include code fences, prose, or commentary."
+        let messages: [LLM.ChatMessage] = [
+            .init(role: .system, content: augmentedSystem),
+            .init(role: .user, content: userPrompt),
+        ]
+
+        do {
+            let stream = try await LocalLLMClient.shared.chatAutonomous(
+                messages: messages,
+                stream: false
+            )
+            var fullText = ""
+            for try await chunk in stream {
+                fullText += chunk.delta
+            }
+            return LLMBridge.stripJSONWrapper(fullText)
+        } catch {
+            log("[\(label)] autonomous LLM call failed: \(error.localizedDescription)")
+            return nil
+        }
     }
 }
