@@ -96,7 +96,7 @@ substep() {
 
 # App configuration
 BINARY_NAME="Omi Computer"  # Package.swift target — binary paths, pkill, CFBundleExecutable
-APP_NAME="${OMI_APP_NAME:-Infinite Recall Dev}"
+APP_NAME="${OMI_APP_NAME:-Infinite Recall}"
 IS_NAMED_BUNDLE=false
 [ -n "${OMI_APP_NAME:-}" ] && IS_NAMED_BUNDLE=true
 
