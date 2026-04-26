@@ -33,7 +33,7 @@ xcrun swift build -c debug --package-path Desktop
 **Full build + sign + launch:**
 
 ```bash
-OMI_APP_NAME="infinite-recall" \
+OMI_APP_NAME="Infinite Recall" \
 OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
 ./run.sh --yolo
 ```
