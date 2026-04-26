@@ -473,7 +473,7 @@ final class ActivityModelsTests: XCTestCase {
         // We assert Swift's actual behaviour here so a future encoder swap
         // (e.g. to one that emits explicit nulls) is a deliberate change with
         // a failing test as the heads-up.
-        let cleared = InflightUpdate(kind: "transcribe", inFlight: nil)
+        let cleared = InflightUpdate(kind: .transcribe, inFlight: nil)
         let data = try Self.makeEncoder().encode(cleared)
         let str = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(str.contains("\"kind\":\"transcribe\""), "got: \(str)")
@@ -485,14 +485,14 @@ final class ActivityModelsTests: XCTestCase {
 
         // Round-trip: the receiver must decode this back to nil.
         let decoded = try Self.makeDecoder().decode(InflightUpdate.self, from: data)
-        XCTAssertEqual(decoded.kind, "transcribe")
+        XCTAssertEqual(decoded.kind, .transcribe)
         XCTAssertNil(decoded.inFlight)
     }
 
     func testInflightUpdateEncodesPopulated() throws {
         let date = Self.isoFractional.date(from: "2026-04-26T14:22:03.812Z")!
         let upd = InflightUpdate(
-            kind: "transcribe",
+            kind: .transcribe,
             inFlight: InFlight(label: "Transcribing 14:22:01→14:25:00 (en)", startedAt: date)
         )
         let data = try Self.makeEncoder().encode(upd)

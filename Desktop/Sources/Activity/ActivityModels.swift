@@ -350,7 +350,7 @@ public struct ResumeRequest: Codable {
 }
 
 public struct InflightUpdate: Codable {
-    public let kind: String
+    public let kind: WorkKind
     public let inFlight: InFlight?
 
     enum CodingKeys: String, CodingKey {
@@ -358,7 +358,7 @@ public struct InflightUpdate: Codable {
         case inFlight = "in_flight"
     }
 
-    public init(kind: String, inFlight: InFlight?) {
+    public init(kind: WorkKind, inFlight: InFlight?) {
         self.kind = kind
         self.inFlight = inFlight
     }

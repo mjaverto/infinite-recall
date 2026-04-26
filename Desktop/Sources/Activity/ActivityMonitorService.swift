@@ -132,10 +132,15 @@ public final class ActivityMonitorService: ObservableObject {
     /// returns success. On failure we set `lastError` and leave the
     /// snapshot untouched so the UI never silently rolls back.
     private func pause(target: PauseTargetId, minutes: Int) async {
-        // Issue #34: clamp to a valid `UInt32 > 0` before the typed
-        // `PauseRequest.init` does the same — surfaces a clean error
-        // instead of throwing across the actor boundary.
-        let mins = UInt32(max(1, minutes))
+        // Issue #34 (PR #39 review): a `minutes <= 0` value is a caller
+        // bug — surface it as a user-visible error instead of silently
+        // coercing to a 1-minute pause. Mirrors the throwing
+        // `PauseRequest.init` invariant (Rust's `NonZeroU32`).
+        guard minutes > 0 else {
+            self.lastError = "Pause failed: minutes must be greater than zero."
+            return
+        }
+        let mins = UInt32(minutes)
         do {
             let until = try await APIClient.shared.pauseActivity(
                 target: target,

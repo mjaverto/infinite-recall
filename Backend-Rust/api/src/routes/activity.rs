@@ -183,34 +183,17 @@ pub async fn inflight(
     State(state): State<AppState>,
     Json(body): Json<InflightUpdate>,
 ) -> Result<StatusCode, StatusCode> {
-    let kind = parse_work_kind(&body.kind).ok_or(StatusCode::BAD_REQUEST)?;
-    state.inflight.update(kind, body.in_flight);
+    // PR #39 review: `body.kind` is a typed `WorkKind` — serde's
+    // `rename_all = "snake_case"` rejects any unknown variant at
+    // the parse layer (returns 400/422), so no manual guard needed.
+    state.inflight.update(body.kind, body.in_flight);
     Ok(StatusCode::NO_CONTENT)
-}
-
-fn parse_work_kind(s: &str) -> Option<WorkKind> {
-    match s {
-        "transcribe" => Some(WorkKind::Transcribe),
-        "ocr" => Some(WorkKind::Ocr),
-        "summarize" => Some(WorkKind::Summarize),
-        "extract_memory" => Some(WorkKind::ExtractMemory),
-        "extract_action_items" => Some(WorkKind::ExtractActionItems),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU32;
-
-    #[test]
-    fn parse_work_kind_round_trip() {
-        for k in ALL_KINDS {
-            assert_eq!(parse_work_kind(k.as_str()), Some(k));
-        }
-        assert_eq!(parse_work_kind("nope"), None);
-    }
 
     // --- Issue #34: wire-format round-trip for `PauseTargetId` ---
     //

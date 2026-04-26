@@ -5153,7 +5153,7 @@ extension APIClient {
   /// POST /v1/activity/_internal/inflight — Swift→Rust loopback, called by
   /// Stream G's drain-loop wrapper to publish in-flight item labels into the
   /// snapshot. `inFlight = nil` clears the slot.
-  func reportInFlight(kind: String, inFlight: InFlight?) async throws {
+  func reportInFlight(kind: WorkKind, inFlight: InFlight?) async throws {
     let base = rustBackendURL
     guard !base.isEmpty, let url = URL(string: base + "v1/activity/_internal/inflight") else {
       throw APIError.invalidResponse

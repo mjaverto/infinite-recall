@@ -424,7 +424,7 @@ public final class BatteryAwareScheduler: ObservableObject {
       Task {
         do {
           try await APIClient.shared.reportInFlight(
-            kind: work.kind.rawValue,
+            kind: Self.toWireWorkKind(work.kind),
             inFlight: inflightEntry
           )
         } catch {
@@ -445,7 +445,7 @@ public final class BatteryAwareScheduler: ObservableObject {
         Task {
           do {
             try await APIClient.shared.reportInFlight(
-              kind: work.kind.rawValue,
+              kind: Self.toWireWorkKind(work.kind),
               inFlight: nil
             )
           } catch {
@@ -461,7 +461,7 @@ public final class BatteryAwareScheduler: ObservableObject {
         Task {
           do {
             try await APIClient.shared.reportInFlight(
-              kind: work.kind.rawValue,
+              kind: Self.toWireWorkKind(work.kind),
               inFlight: nil
             )
           } catch {
@@ -499,6 +499,22 @@ public final class BatteryAwareScheduler: ObservableObject {
       return true
     case .transcribe, .ocr, .extractMemory, .extractActionItems:
       return false
+    }
+  }
+
+  /// Map the scheduler's local `PendingWork.Kind` to the wire-level
+  /// `WorkKind` used by the activity API. PR #39 review: the loopback
+  /// inflight endpoint now takes a typed `WorkKind`, not a string, so
+  /// the conversion happens here at the boundary instead of being
+  /// implicit via `rawValue` (which would produce `"extractMemory"`
+  /// instead of the snake_case `"extract_memory"` the daemon expects).
+  fileprivate static func toWireWorkKind(_ kind: PendingWork.Kind) -> WorkKind {
+    switch kind {
+    case .transcribe: return .transcribe
+    case .ocr: return .ocr
+    case .summarize: return .summarize
+    case .extractMemory: return .extractMemory
+    case .extractActionItems: return .extractActionItems
     }
   }
 

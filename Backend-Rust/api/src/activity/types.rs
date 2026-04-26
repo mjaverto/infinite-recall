@@ -215,8 +215,46 @@ pub struct ResumeRequest {
 /// POST /v1/activity/_internal/inflight body (Swift → Rust loopback).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InflightUpdate {
-    /// `WorkKind` snake_case string.
-    pub kind: String,
+    pub kind: WorkKind,
     /// `None` clears the slot.
     pub in_flight: Option<InFlight>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR #39 review: guard against future drift between `WorkKind::as_str()`
+    /// and the snake_case derivation `serde(rename_all = "snake_case")` uses
+    /// on the wire. If a contributor adds a `WorkKind` variant and forgets
+    /// to extend `as_str()`, this test will fail.
+    #[test]
+    fn workkind_as_str_matches_serde() {
+        for k in [
+            WorkKind::Transcribe,
+            WorkKind::Ocr,
+            WorkKind::Summarize,
+            WorkKind::ExtractMemory,
+            WorkKind::ExtractActionItems,
+        ] {
+            assert_eq!(
+                serde_json::to_value(k).unwrap(),
+                serde_json::Value::String(k.as_str().to_string()),
+                "WorkKind::{:?} as_str() drifted from serde rename",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn capturekind_as_str_matches_serde() {
+        for c in [CaptureKind::Audio, CaptureKind::Screen] {
+            assert_eq!(
+                serde_json::to_value(c).unwrap(),
+                serde_json::Value::String(c.as_str().to_string()),
+                "CaptureKind::{:?} as_str() drifted from serde rename",
+                c
+            );
+        }
+    }
 }
