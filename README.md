@@ -7,9 +7,20 @@ local SQLite database, and exposes an Omi-shaped REST API so MCP-compatible clie
 (Claude Code, Cursor, etc.) can query your own activity history — all without a
 network connection, a cloud account, or any telemetry.
 
-Forked from the `desktop/` subtree of
-[BasedHardware/omi](https://github.com/BasedHardware/omi) at v0.11.358.
-See [ATTRIBUTION.md](ATTRIBUTION.md) for upstream credits.
+## Why this exists
+
+[Omi](https://github.com/BasedHardware/omi) by Based Hardware is a great
+always-on recorder, and the desktop app is what made me want this category of
+tool to exist on my Mac. The thing I wanted that it didn't quite do was run
+the AI side **entirely locally** — no Deepgram for transcription, no cloud
+LLM for memory extraction, no Firebase, no account. Just a MacBook Pro with
+reasonable specs (M-series, 24-36 GB) doing the whole loop on-device.
+
+Infinite Recall started as a fork of Omi's `desktop/` subtree at v0.11.358
+and rebuilt the AI plane around WhisperKit (transcription), `mlx-lm.server`
+(text LLM), and `mlx-vlm` (vision LLM), with a local SQLite store and a
+REST API for MCP clients. See [ATTRIBUTION.md](ATTRIBUTION.md) for the full
+accounting of what came from upstream and what was changed.
 
 ---
 
@@ -127,7 +138,7 @@ xcrun swift build -c debug --package-path Desktop
                           ▼
          ┌─────────────────────────────────────┐
          │ Backend-Rust (axum)  127.0.0.1:7331 │
-         │ Read-only SQLite reader             │
+         │ SQLite reader + action-item writer  │
          │ Bearer auth via api-token.txt       │
          │ Routes: /v1/health  /v1/version     │
          │   /v1/conversations /v3/memories    │
@@ -221,7 +232,7 @@ The MLX/VLM model weights are stored separately (typically under
 
 ## REST API
 
-The Backend-Rust daemon exposes a read-only REST API on `127.0.0.1:7331`.
+The Backend-Rust daemon exposes a local REST API on `127.0.0.1:7331`.
 All routes require a `Bearer` token stored at
 `~/Library/Application Support/InfiniteRecall/api-token.txt` (created
 automatically on first run, mode 0600).
@@ -238,11 +249,15 @@ status, the masked bearer token with a one-click copy, and a pre-built
 | GET | `/v1/version` | Build metadata |
 | GET | `/v1/conversations` | Paginated conversation list |
 | GET | `/v3/memories` | Extracted memories |
-| GET | `/v1/action-items` | Action items |
+| GET | `/v1/action-items` | Action items (read + write) |
 | GET | `/v1/people` | Speaker profiles |
 | GET | `/v1/search` | Full-text + semantic search |
 | GET | `/v1/search?content_type=visual` | Visual activity FTS search |
 | GET | `/v1/scores` | Activity scores |
+| POST | `/v1/action-items` | Create action item |
+| PATCH | `/v1/action-items/:id` | Update action item |
+| POST | `/v1/action-items/:id/complete` | Toggle completed |
+| DELETE | `/v1/action-items/:id` | Soft-delete action item |
 
 > **Note:** The Rust daemon requires a one-time `cargo` build
 > (`setup-api-server.sh`). Until that step is run, the MCP API card will show
@@ -251,16 +266,41 @@ status, the masked bearer token with a one-click copy, and a pre-built
 
 ---
 
+## Recall CLI
+
+The `recall` command-line tool wraps the REST API for use in terminals and by
+coding agents. It handles bearer auth automatically, prints human-readable tables
+by default, and emits stable JSON with `--json` for scripting.
+
+```bash
+# Check the daemon is running
+recall health --json
+
+# Search across everything you recorded
+recall search "quarterly budget" --json
+
+# List open todos
+recall action-items list --json
+
+# Create a todo
+recall action-items create --description "Review the PR" --json
+```
+
+**Agents:** see [AGENTS.md](AGENTS.md) for the full command reference, decision
+flowchart, and troubleshooting guide.
+
+Install: `./scripts/setup-api-server.sh` builds both `infinite-recall-api` and
+`recall`, then symlinks `recall` to `/usr/local/bin/recall`.
+
+---
+
 ## Project Layout
 
 ```
 Desktop/          SwiftUI macOS app (SwiftPM, no .xcodeproj)
-Backend-Rust/     axum REST API daemon (Cargo workspace)
+Backend-Rust/     Cargo workspace: axum REST daemon (api/) + recall CLI (cli/)
 scripts/          setup-mlx-server.sh, setup-vlm-server.sh, setup-api-server.sh
 run.sh            Build + sign + launch orchestrator
-agent/            Inherited from Omi — scope TBD
-agent-cloud/      Inherited from Omi — scope TBD
-Auth-Python/      Inherited from Omi — pending removal
 pi-mono-extension/ Inherited from Omi — scope TBD
 dmg-assets/       App icon + DMG background
 e2e/              Inherited Omi end-to-end test stubs
