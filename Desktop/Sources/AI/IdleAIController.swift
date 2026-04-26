@@ -38,8 +38,9 @@ final class IdleAIController: ObservableObject {
 
   // MARK: - User-configurable state (persisted via @AppStorage in Settings)
 
-  /// Master toggle. When false, idle-unload is fully disabled.
-  @AppStorage("idle_ai_enabled") var isEnabled: Bool = true
+  /// Memory Saver toggle. When false, idle-unload is fully disabled so
+  /// Autonomous Work Mode can keep local AI available while the Mac is idle.
+  @AppStorage("idle_ai_enabled") var isEnabled: Bool = false
 
   /// Minutes of combined system-idle + AI-idle before the server is stopped.
   /// Allowed values in the picker: 5, 10, 15, 30, 60.
@@ -271,7 +272,7 @@ final class IdleAIController: ObservableObject {
 
   // MARK: - UI helpers
 
-  /// Human-readable status line for the Settings → AI / Models → Power Saving card.
+  /// Human-readable status line for the Settings → AI / Models → Autonomous Work Mode card.
   var statusText: String {
     if isTransitioning {
       return serverStoppedByIdle ? "Restarting…" : "Stopping…"

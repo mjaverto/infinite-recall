@@ -97,10 +97,10 @@ xcrun swift build -c debug --package-path Desktop
 │  Embeddings   — Apple NLEmbedding.sentenceEmbedding (512-dim)  │
 │  Persistence  — GRDB SQLite                                    │
 │                                                                │
-│  Lifecycle managers (idle-unload, user-switchable models)      │
+│  Lifecycle managers (autonomous work, user-switchable models)  │
 │   ├── MLXLifecycleManager  ── text sidecar (port 8080)         │
 │   ├── VLMLifecycleManager  ── vision sidecar (port 8081)       │
-│   ├── IdleAIController     ── auto-unload after 10 min idle    │
+│   ├── IdleAIController     ── optional memory saver on idle    │
 │   └── BatteryAwareScheduler── capture always; ML defers on bat │
 │                                                                │
 │  AI assistants  (Focus / Task / Insight / Memory)              │
@@ -156,8 +156,9 @@ Managed by `MLXLifecycleManager` as a launchd service
 All models are Apache 2.0 or MIT licensed. Install and switch models from
 **Settings → AI / Models → Local Model** — no Terminal required.
 
-Idle-unload is on by default (10 min). Configurable in
-**Settings → AI / Models → Power Saving**.
+Autonomous Work Mode keeps local AI available while you are away; turning it off
+enables Memory Saver idle-unload (10 min by default). Configurable in
+**Settings → AI / Models → Autonomous Work Mode**.
 
 ### Vision tier — `mlx-vlm` sidecar (port 8081)
 
