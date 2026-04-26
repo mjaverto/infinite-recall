@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # swift-build + swift-test deferred to #63 — pre-existing failures on main
+  # (#64, #65, #67) must be fixed before swift test can run green.
+  rust-test:
+    name: Rust tests (api)
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: Backend-Rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: Backend-Rust -> target
+
+      - name: cargo test -p infinite-recall-api
+        run: cargo test --locked -p infinite-recall-api
+      # activity_test_wiring run deferred to #70 — tower 0.4/0.5 dep
+      # collision (#69) breaks compile on a clean cache (E0464).
