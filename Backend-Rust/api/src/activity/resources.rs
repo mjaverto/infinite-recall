@@ -41,7 +41,13 @@ const MLX_LABEL_CANDIDATES: &[&str] = &[
 ];
 
 /// How long to hold a sample in cache before re-sampling.
-const CACHE_TTL: Duration = Duration::from_secs(1);
+///
+/// Singleton-fixer S4: bumped 1s → 2s. The sampler costs ~300ms per
+/// miss (250ms CPU-delta sleep + ~5 subprocess forks). With the Swift
+/// Activity tab polling at 1Hz, a 1s TTL meant a cache miss every tick;
+/// 2s halves that to every other tick without any user-visible staleness
+/// (CPU/RSS/GPU are coarse readouts, not real-time meters).
+const CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Window over which we measure CPU% deltas.
 const CPU_SAMPLE_WINDOW: Duration = Duration::from_millis(250);
@@ -161,6 +167,10 @@ impl ResourceSampler for SystemResourceSampler {
 /// Returns `[(name, pid)]` for self + Swift app + mlx-lm if found.
 ///
 /// Order is meaningful so tests / logs are stable: `api`, `swift`, `mlx`.
+///
+/// Singleton-fixer S7: each discovery path emits a structured tracing
+/// breadcrumb so the next contributor can tell whether a missing pid is
+/// "no pidfile yet" vs "launchctl label renamed" vs "stale pidfile".
 fn discover_pids(support_dir_override: Option<&std::path::Path>) -> Vec<(String, i32)> {
     let mut out: Vec<(String, i32)> = Vec::with_capacity(3);
 
@@ -171,15 +181,47 @@ fn discover_pids(support_dir_override: Option<&std::path::Path>) -> Vec<(String,
         .map(|p| p.to_path_buf())
         .unwrap_or_else(default_support_dir);
 
-    if let Some(pid) = read_pidfile(&support_dir.join("swift.pid"))
-        .or_else(|| pid_from_launchctl_any(SWIFT_LABEL_CANDIDATES))
-    {
+    let swift_pidfile = support_dir.join("swift.pid");
+    if let Some(pid) = read_pidfile(&swift_pidfile) {
+        tracing::debug!(
+            component = "activity.discover",
+            target = "swift",
+            via = "pidfile",
+            path = %swift_pidfile.display(),
+            pid,
+            "discovered pid via pidfile"
+        );
+        out.push(("swift".to_string(), pid));
+    } else if let Some(pid) = pid_from_launchctl_any(SWIFT_LABEL_CANDIDATES, "swift") {
+        tracing::debug!(
+            component = "activity.discover",
+            target = "swift",
+            via = "launchctl",
+            pid,
+            "discovered pid via launchctl"
+        );
         out.push(("swift".to_string(), pid));
     }
 
-    if let Some(pid) = read_pidfile(&support_dir.join("mlxlm.pid"))
-        .or_else(|| pid_from_launchctl_any(MLX_LABEL_CANDIDATES))
-    {
+    let mlx_pidfile = support_dir.join("mlxlm.pid");
+    if let Some(pid) = read_pidfile(&mlx_pidfile) {
+        tracing::debug!(
+            component = "activity.discover",
+            target = "mlx",
+            via = "pidfile",
+            path = %mlx_pidfile.display(),
+            pid,
+            "discovered pid via pidfile"
+        );
+        out.push(("mlx-lm".to_string(), pid));
+    } else if let Some(pid) = pid_from_launchctl_any(MLX_LABEL_CANDIDATES, "mlx") {
+        tracing::debug!(
+            component = "activity.discover",
+            target = "mlx",
+            via = "launchctl",
+            pid,
+            "discovered pid via launchctl"
+        );
         out.push(("mlx-lm".to_string(), pid));
     }
 
@@ -192,31 +234,93 @@ fn default_support_dir() -> PathBuf {
         .join("Library/Application Support/InfiniteRecall")
 }
 
-/// Reads a single integer pid from the given file. Returns `None` if the file
-/// does not exist, is unreadable, or does not contain a positive integer.
+/// Reads a single integer pid from the given file. Returns `None` if the
+/// file is missing, unreadable, contains garbage, or names a dead pid.
+///
+/// Singleton-fixer S7: each failure mode emits a `tracing::debug!` so the
+/// "why didn't we discover this pid?" question is answerable from logs.
+/// `debug` (not `warn`) because pidfile-missing is normal at first launch
+/// before the Swift app + mlx-lm have been started by the user.
 fn read_pidfile(path: &std::path::Path) -> Option<i32> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let pid: i32 = raw.trim().parse().ok()?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                component = "activity.discover.pidfile",
+                path = %path.display(),
+                reason = "missing",
+                "pidfile not present"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(
+                component = "activity.discover.pidfile",
+                path = %path.display(),
+                reason = "unreadable",
+                error = %e,
+                "pidfile read failed"
+            );
+            return None;
+        }
+    };
+    let pid: i32 = match raw.trim().parse() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(
+                component = "activity.discover.pidfile",
+                path = %path.display(),
+                reason = "unparseable",
+                contents = %raw.trim(),
+                error = %e,
+                "pidfile contents not an integer"
+            );
+            return None;
+        }
+    };
     if pid <= 0 {
+        tracing::debug!(
+            component = "activity.discover.pidfile",
+            path = %path.display(),
+            reason = "unparseable",
+            pid,
+            "pidfile contains non-positive pid"
+        );
         return None;
     }
     if !pid_alive(pid) {
+        tracing::debug!(
+            component = "activity.discover.pidfile",
+            path = %path.display(),
+            reason = "stale",
+            pid,
+            "pidfile points at a dead pid"
+        );
         return None;
     }
     Some(pid)
 }
 
-/// Tries each candidate label until one returns a live pid.
-fn pid_from_launchctl_any(labels: &[&str]) -> Option<i32> {
+/// Tries each candidate label until one returns a live pid. If none match,
+/// emits a single `tracing::warn!` listing the candidates we tried so the
+/// next person who renames a launchd label sees an actionable breadcrumb.
+fn pid_from_launchctl_any(labels: &[&str], target: &str) -> Option<i32> {
     for label in labels {
         if let Some(pid) = pid_from_launchctl(label) {
             return Some(pid);
         }
     }
+    tracing::warn!(
+        component = "activity.discover",
+        target,
+        labels = ?labels,
+        "no launchctl entry found for {target} (tried all candidate labels)"
+    );
     None
 }
 
-/// Parses `launchctl list <label>` for a `"PID" = <int>;` line.
+/// Parses `launchctl list <label>` for a `"PID" = <int>;` (legacy) or
+/// `pid = N` (newer macOS) line.
 fn pid_from_launchctl(label: &str) -> Option<i32> {
     let out = Command::new("launchctl")
         .args(["list", label])
@@ -229,17 +333,38 @@ fn pid_from_launchctl(label: &str) -> Option<i32> {
     parse_launchctl_pid(&stdout)
 }
 
+/// Parse a `launchctl list <label>` stdout buffer for the service pid.
+///
+/// Tolerates two known formats:
+///   - Legacy plist-ish:  `"PID" = 12345;`
+///   - Newer key/value:   `pid = 12345`  (or `pid = 12345;`)
+///
+/// Singleton-fixer S7 / Broad reviewer MED-14.
 fn parse_launchctl_pid(stdout: &str) -> Option<i32> {
     for line in stdout.lines() {
         let line = line.trim();
-        // Expected shape: `"PID" = 12345;`
-        if let Some(rest) = line.strip_prefix("\"PID\"") {
-            let rest = rest.trim_start_matches([' ', '=']).trim();
-            let rest = rest.trim_end_matches(';').trim();
-            if let Ok(pid) = rest.parse::<i32>() {
-                if pid > 0 {
-                    return Some(pid);
-                }
+
+        // Legacy `"PID" = N;`
+        let rest_legacy = line.strip_prefix("\"PID\"");
+
+        // Newer `pid = N` (case-insensitive — newer launchctl prints lowercase).
+        let rest_new = line
+            .strip_prefix("pid")
+            .or_else(|| line.strip_prefix("PID"));
+        // Guard: only accept the bare-key form when the next char is `=` or
+        // whitespace, so we don't grab e.g. `pidsignal = 9`.
+        let rest_new = rest_new.filter(|tail| {
+            tail.chars().next().map_or(false, |c| c == '=' || c.is_whitespace())
+        });
+
+        let rest = rest_legacy.or(rest_new);
+        let Some(rest) = rest else { continue };
+
+        let rest = rest.trim_start_matches([' ', '\t', '=']).trim();
+        let rest = rest.trim_end_matches(';').trim();
+        if let Ok(pid) = rest.parse::<i32>() {
+            if pid > 0 {
+                return Some(pid);
             }
         }
     }
@@ -617,6 +742,22 @@ mod tests {
     fn parses_launchctl_pid_missing() {
         let stdout = r#"{ "Label" = "x"; }"#;
         assert_eq!(parse_launchctl_pid(stdout), None);
+    }
+
+    /// Singleton-fixer S7 / Broad reviewer MED-14: tolerate the newer
+    /// `launchctl print` / `launchctl list` lowercase-key format. Without
+    /// this, after Apple flips the format the next contributor sees pid
+    /// discovery silently regressing to "self-only" with zero log signal.
+    #[test]
+    fn parses_launchctl_pid_new_format() {
+        let stdout = "  pid = 12345\n  state = running\n";
+        assert_eq!(parse_launchctl_pid(stdout), Some(12345));
+        // Trailing semicolon variant.
+        let stdout2 = "pid = 6789;";
+        assert_eq!(parse_launchctl_pid(stdout2), Some(6789));
+        // Must not match e.g. `pidsignal = 9` — that's a different field.
+        let stdout3 = "pidsignal = 9";
+        assert_eq!(parse_launchctl_pid(stdout3), None);
     }
 
     #[test]
