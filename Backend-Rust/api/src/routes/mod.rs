@@ -56,6 +56,13 @@ pub fn router(state: AppState) -> Router {
             post(activity::internal_queue_depth),
         )
         // === /activity:A ===
+        // === activity:32 ===
+        // Swift→Rust loopback for the processing gate (issue #32).
+        .route(
+            "/v1/activity/_internal/gate-state",
+            post(activity::gate_state),
+        )
+        // === /activity:32 ===
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

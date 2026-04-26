@@ -234,15 +234,15 @@ struct ActivityPage: View {
                 color: OmiColors.error
             )
         case .unwired:
-            // PR #40 review: the Rust `AlwaysAllowedGate` placeholder
-            // reports `.unwired` until the real `ProcessingGate` (#32)
-            // ships. Render an honest, non-alarming banner instead of
-            // pretending we're processing.
+            // Issue #32: with the Swift→Rust gate-state bridge live, the
+            // Rust gate only emits `.unwired` during the brief startup
+            // window before the first `ProcessingGateReporter` POST
+            // arrives (typically <3s). Soften the copy accordingly.
             return BannerInfo(
-                icon: "wrench.and.screwdriver",
-                title: "Activity gate not yet wired",
-                detail: "Processing decisions are placeholder. Tracking issue: #32.",
-                color: OmiColors.warning
+                icon: "hourglass",
+                title: "Initializing…",
+                detail: "Reading idle / power / thermal state.",
+                color: OmiColors.textTertiary
             )
         }
     }
@@ -638,12 +638,13 @@ struct ActivityPage: View {
             case .allowed:
                 return ("Up to date — 0 queued", "Idle processing standing by.")
             case .blocked(let reason, _, let waitingFor):
-                // PR #40 review: don't say "Up to date" when the gate is
-                // just unwired — that's misleading. Honest title for the
-                // placeholder; existing semantics for real block reasons.
+                // Issue #32: with the Swift→Rust bridge live, `.unwired`
+                // is now just the brief boot window before the first
+                // `ProcessingGateReporter` POST. Render as "Initializing…"
+                // instead of the alarming pre-#32 copy.
                 let detail = emptyStateBlockedDetail(reason: reason, waitingFor: waitingFor)
                 let title = (reason == .unwired)
-                    ? "Activity gate not yet wired"
+                    ? "Initializing…"
                     : "Up to date — 0 queued"
                 return (title, detail)
             }
@@ -681,7 +682,7 @@ struct ActivityPage: View {
         case .thermal:      return "Waiting for thermal cooldown."
         case .locked:       return "Resumes when you unlock."
         case .manualPause:  return "Manually paused."
-        case .unwired:      return "Processing decisions are placeholder until issue #32 ships."
+        case .unwired:      return "Reading idle / power / thermal state."
         }
     }
 

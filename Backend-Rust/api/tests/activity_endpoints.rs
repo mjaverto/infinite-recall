@@ -85,6 +85,7 @@ use tower::util::ServiceExt; // brings `oneshot` onto Router
 
 use infinite_recall_api::activity::traits::{
     InflightRegistry, PauseStore, PauseStoreError, ProcessingGate, ResourceSampler,
+    WritableProcessingGate,
 };
 use infinite_recall_api::activity::types::{
     BlockReason, CaptureKind, GateState, InFlight, PauseTargetId, ProcessBreakdown,
@@ -210,6 +211,20 @@ impl ProcessingGate for FakeGate {
     }
 }
 
+/// Test stub for the writable side. Tests that don't exercise the
+/// gate-state POST endpoint use this so they don't have to mock out the
+/// production `BridgedProcessingGate`. Writes are silently ignored —
+/// fine here because the read side returns a fixed `FakeGate` value.
+struct NoopWritableGate;
+impl ProcessingGate for NoopWritableGate {
+    fn current(&self) -> GateState {
+        GateState::Allowed { since: Utc::now() }
+    }
+}
+impl WritableProcessingGate for NoopWritableGate {
+    fn set(&self, _new_state: GateState) {}
+}
+
 // ---------------------------------------------------------------------
 // App builder
 // ---------------------------------------------------------------------
@@ -228,6 +243,16 @@ fn make_state(
     sampler: Arc<dyn ResourceSampler>,
     gate: Arc<dyn ProcessingGate>,
 ) -> AppState {
+    make_state_with_writer(pause_store, inflight, sampler, gate, Arc::new(NoopWritableGate))
+}
+
+fn make_state_with_writer(
+    pause_store: Arc<dyn PauseStore>,
+    inflight: Arc<dyn InflightRegistry>,
+    sampler: Arc<dyn ResourceSampler>,
+    gate: Arc<dyn ProcessingGate>,
+    gate_writer: Arc<dyn WritableProcessingGate>,
+) -> AppState {
     let pool = infinite_recall_api::db::open_in_memory_pool()
         .expect("in-memory pool — Stream A should expose a test helper");
     let write_pool = infinite_recall_api::db::open_in_memory_pool()
@@ -241,6 +266,7 @@ fn make_state(
         inflight,
         resource_sampler: sampler,
         processing_gate: gate,
+        processing_gate_writer: gate_writer,
         pause_tx,
     }
 }
@@ -942,4 +968,235 @@ async fn resume_round_trip_for_kind_and_capture() {
     assert!(pause_store
         .paused_until(&PauseTargetId::Capture(CaptureKind::Audio))
         .is_none());
+}
+
+// ---------------------------------------------------------------------
+// Issue #32 — `BridgedProcessingGate` + `_internal/gate-state` endpoint
+// ---------------------------------------------------------------------
+
+/// Posting a `GateState` to the gate-state loopback updates what
+/// `/snapshot` returns for `processing_gate`. End-to-end round trip.
+#[tokio::test]
+async fn gate_state_post_updates_snapshot() {
+    use infinite_recall_api::activity::BridgedProcessingGate;
+
+    // Use the production `BridgedProcessingGate` so the route handler's
+    // `set()` actually mutates state (the test `FakeGate` defaults to a
+    // no-op `set`).
+    let gate: Arc<BridgedProcessingGate> = Arc::new(BridgedProcessingGate::new());
+    let state = make_state_with_writer(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        gate.clone(),
+        gate.clone(),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+
+    // Pre-condition: snapshot reports `Blocked { reason: Unwired }` until
+    // the first POST arrives.
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(&k, v.clone())
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
+    assert_eq!(snap["processing_gate"]["state"], json!("blocked"));
+    assert_eq!(snap["processing_gate"]["reason"], json!("unwired"));
+
+    // POST a real `Allowed` state.
+    let body = json!({
+        "state": "allowed",
+        "since": "2026-04-26T14:25:00.000Z"
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/gate-state")
+        .header(&k, v.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Snapshot now reflects the new state.
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(&k, v.clone())
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
+    assert_eq!(snap["processing_gate"]["state"], json!("allowed"));
+    assert!(snap["processing_gate"].get("reason").is_none());
+
+    // POST a `Blocked { DeviceActive, IdleFor 120s }` state.
+    let body = json!({
+        "state": "blocked",
+        "reason": "device_active",
+        "since": "2026-04-26T14:30:00.000Z",
+        "waiting_for": { "type": "idle_for", "duration_secs": 120 }
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/gate-state")
+        .header(&k, v.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Direct `current()` read on the gate matches what we POSTed.
+    match gate.current() {
+        GateState::Blocked { reason, waiting_for, .. } => {
+            assert_eq!(reason, BlockReason::DeviceActive);
+            assert_eq!(
+                waiting_for,
+                WaitCondition::IdleFor {
+                    duration: std::time::Duration::from_secs(120)
+                }
+            );
+        }
+        _ => panic!("expected Blocked after POST"),
+    }
+}
+
+/// Missing bearer → 401, even on the loopback gate-state endpoint.
+#[tokio::test]
+async fn gate_state_post_requires_bearer() {
+    let app = make_default_app();
+    let body = json!({
+        "state": "allowed",
+        "since": "2026-04-26T14:25:00.000Z"
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/gate-state")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Bodies that don't decode as a `GateState` (missing `waiting_for` on a
+/// `Blocked`, unknown variant tag, ...) are rejected at the serde layer
+/// with a 4xx — no manual guard needed in the handler.
+#[tokio::test]
+async fn gate_state_post_rejects_invalid_bodies() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+
+    let cases = [
+        // Unknown state tag.
+        json!({"state":"throttled","since":"2026-04-26T14:25:00Z"}),
+        // Blocked missing `waiting_for`.
+        json!({"state":"blocked","reason":"device_active","since":"2026-04-26T14:25:00Z"}),
+        // Blocked with unknown reason.
+        json!({
+            "state":"blocked","reason":"galactic_radiation",
+            "since":"2026-04-26T14:25:00Z",
+            "waiting_for":{"type":"idle_for","duration_secs":120}
+        }),
+        // Blocked with unknown waiting_for type.
+        json!({
+            "state":"blocked","reason":"device_active",
+            "since":"2026-04-26T14:25:00Z",
+            "waiting_for":{"type":"warp_drive"}
+        }),
+    ];
+
+    for body in cases {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/activity/_internal/gate-state")
+            .header(&k, v.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx for body {body:?}; got {}",
+            resp.status()
+        );
+    }
+}
+
+/// `BridgedProcessingGate::set` rejects external `Blocked { Unwired, .. }`
+/// posts (defense-in-depth). The `Unwired` variant exists ONLY to
+/// represent "haven't received the first POST yet" — Swift should never
+/// post it, but if it ever does, we must not let it latch the gate back
+/// into the boot-window state. The route handler still returns 204 (this
+/// is internal validation that doesn't leak to the caller); the post-
+/// condition is that the stored gate state is unchanged.
+#[tokio::test]
+async fn gate_state_post_rejects_external_unwired_silently() {
+    use infinite_recall_api::activity::BridgedProcessingGate;
+
+    let gate: Arc<BridgedProcessingGate> = Arc::new(BridgedProcessingGate::new());
+    let state = make_state_with_writer(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        gate.clone(),
+        gate.clone(),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+
+    // Pre: snapshot reports Unwired (initial state, no real POST yet).
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(&k, v.clone())
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
+    assert_eq!(snap["processing_gate"]["state"], json!("blocked"));
+    assert_eq!(snap["processing_gate"]["reason"], json!("unwired"));
+    let initial_since = snap["processing_gate"]["since"]
+        .as_str()
+        .expect("since must be a string")
+        .to_string();
+
+    // POST a `Blocked { Unwired, .. }` body — the handler must accept it
+    // at the wire level (return 204) but the gate's internal state must
+    // be unchanged (rejected by `BridgedProcessingGate::set`).
+    let body = json!({
+        "state": "blocked",
+        "reason": "unwired",
+        "since": "2030-01-01T00:00:00.000Z",
+        "waiting_for": { "type": "manual" }
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/gate-state")
+        .header(&k, v.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    // 204 — defense-in-depth, no validation leak.
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Post: snapshot still reports the original Unwired state (the same
+    // `since` from before — the rejected POST didn't overwrite anything).
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(&k, v.clone())
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
+    assert_eq!(snap["processing_gate"]["state"], json!("blocked"));
+    assert_eq!(snap["processing_gate"]["reason"], json!("unwired"));
+    assert_eq!(
+        snap["processing_gate"]["since"].as_str().unwrap(),
+        initial_since,
+        "`since` must NOT advance — the Unwired POST should be a no-op"
+    );
 }

@@ -5233,6 +5233,34 @@ extension APIClient {
       throw APIError.httpError(statusCode: http.statusCode)
     }
   }
+
+  /// POST /v1/activity/_internal/gate-state — Swift→Rust loopback (issue #32).
+  ///
+  /// Called by `ProcessingGateReporter` when its computed `GateState`
+  /// changes from the last-posted value. The Rust daemon stores the new
+  /// state in its `BridgedProcessingGate` and surfaces it on the next
+  /// `/v1/activity/snapshot` call.
+  func reportGateState(_ gateState: GateState) async throws {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/_internal/gate-state") else {
+      throw APIError.invalidResponse
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.allHTTPHeaderFields = try activityHeaders()
+    request.httpBody = try Self.makeActivityEncoder().encode(gateState)
+    request.timeoutInterval = 5
+
+    let (_, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+  }
 }
 
 /// Wire shape for `POST /v1/activity/_internal/queue-depth` (interface I1).
