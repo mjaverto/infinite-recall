@@ -364,6 +364,13 @@ struct SettingsContentView: View {
   // approximation by a few hundred MB).
   @State private var localModelDiskSizes: [String: Int64] = [:]
 
+  // "Other (Hugging Face repo)" row state. The freeform draft persists so
+  // it repopulates the TextField even after toggling rows or sheets. The
+  // sentinel id "__custom__" is used in `localModelPickerSelection` to
+  // mark the custom row as highlighted (it's not a valid HF repo path so
+  // it can't collide with any real id).
+  @AppStorage(CustomHFModelDefaults.localKey) private var customLocalModelDraft: String = ""
+
   // Vision Model picker — mirrors the text-tier state block above but
   // pointed at `VLMLifecycleManager` / `VisionModelCatalog`.
   @AppStorage("activeVisionModelID") private var activeVisionModelID: String =
@@ -388,6 +395,10 @@ struct SettingsContentView: View {
 
   // Cached on-disk sizes for vision models.
   @State private var visionModelDiskSizes: [String: Int64] = [:]
+
+  // "Other (Hugging Face repo)" row state for the vision tier — mirrors
+  // the text-tier draft above, persisted under a separate key.
+  @AppStorage(CustomHFModelDefaults.visionKey) private var customVisionModelDraft: String = ""
 
   // MCP API card — expandable response viewer + transient "copied" feedback.
   @State private var mcpAPIShowResponse: Bool = false
@@ -2159,8 +2170,10 @@ struct SettingsContentView: View {
   // MARK: Vision Model — active summary
 
   private var activeVisionModelSummary: some View {
-    let active = VisionModelCatalog.option(forId: activeVisionModelID)
-      ?? VisionModelCatalog.recommended
+    // Mirror the text-tier summary: use `entry(forId:)` so a custom HF id
+    // renders as "<id> · Custom · size unknown" instead of falling back to
+    // the recommended catalog entry.
+    let active = VisionModelCatalog.entry(forId: activeVisionModelID)
     let installed = vlmLifecycle.isModelInstalled(modelId: active.id)
     return HStack(spacing: 8) {
       Text("Active:")
@@ -2175,6 +2188,10 @@ struct SettingsContentView: View {
           .foregroundColor(OmiColors.success)
         if let bytes = visionModelDiskSizes[active.id], bytes > 0 {
           Text("Installed (\(formatBytes(bytes)) on disk)")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+        } else if active.approxDiskGB == 0 {
+          Text("Installed (size unknown)")
             .scaledFont(size: 12)
             .foregroundColor(OmiColors.textSecondary)
         } else {
@@ -2206,8 +2223,12 @@ struct SettingsContentView: View {
             visionModelRow(option)
           }
 
+          // "Other (Hugging Face repo)" — mirrors the text tier.
+          customVisionModelRow
+
           if let pendingId = visionModelPickerSelection,
              pendingId != activeVisionModelID,
+             pendingId != Self.customRowSentinel,
              vlmLifecycle.isModelInstalled(modelId: pendingId)
           {
             HStack {
@@ -2568,8 +2589,10 @@ struct SettingsContentView: View {
   // MARK: Active model summary (top of card)
 
   private var activeModelSummary: some View {
-    let active = LocalModelCatalog.option(forId: activeLocalModelID)
-      ?? LocalModelCatalog.recommended
+    // Use `entry(forId:)` so user-supplied custom ids render with a
+    // synthesized "Custom" placeholder instead of falling back to the
+    // recommended catalog entry.
+    let active = LocalModelCatalog.entry(forId: activeLocalModelID)
     let installed = mlxLifecycle.isModelInstalled(modelId: active.id)
     return HStack(spacing: 8) {
       Text("Active:")
@@ -2583,9 +2606,14 @@ struct SettingsContentView: View {
           .scaledFont(size: 11)
           .foregroundColor(OmiColors.success)
         // Prefer the real on-disk figure if we've measured it; fall back to
-        // the catalog approximation otherwise.
+        // the catalog approximation otherwise. Custom ids have no catalog
+        // size — render "size unknown" rather than a misleading "0.0 GB".
         if let bytes = localModelDiskSizes[active.id], bytes > 0 {
           Text("Installed (\(formatBytes(bytes)) on disk)")
+            .scaledFont(size: 12)
+            .foregroundColor(OmiColors.textSecondary)
+        } else if active.approxDiskGB == 0 {
+          Text("Installed (size unknown)")
             .scaledFont(size: 12)
             .foregroundColor(OmiColors.textSecondary)
         } else {
@@ -2622,8 +2650,14 @@ struct SettingsContentView: View {
             localModelRow(option)
           }
 
+          // "Other (Hugging Face repo)" — freeform id entry. Selecting the
+          // row reveals a TextField with inline validation; the Install
+          // button stays disabled until validation succeeds.
+          customLocalModelRow
+
           if let pendingId = localModelPickerSelection,
              pendingId != activeLocalModelID,
+             pendingId != Self.customRowSentinel,
              mlxLifecycle.isModelInstalled(modelId: pendingId)
           {
             HStack {
@@ -2834,6 +2868,177 @@ struct SettingsContentView: View {
     .onTapGesture {
       localModelPickerSelection = option.id
     }
+  }
+
+  // MARK: Custom HF repo row (text tier)
+
+  /// Sentinel id used in `localModelPickerSelection` /
+  /// `visionModelPickerSelection` to mark the "Other (Hugging Face repo)"
+  /// row as highlighted. Contains a slash so it can never collide with a
+  /// real catalog id, but isn't a valid HF repo path either (the regex
+  /// rejects leading underscores so this can't be a typed-in collision).
+  fileprivate static let customRowSentinel = "__custom__/__custom__"
+
+  /// Validation result for the current local-tier draft. Surfaces both for
+  /// the inline error label and to gate the Install button.
+  private var customLocalModelValidation: Result<String, CustomHFError> {
+    CustomHFModelID.validate(customLocalModelDraft)
+  }
+
+  /// Validation result for the current vision-tier draft.
+  private var customVisionModelValidation: Result<String, CustomHFError> {
+    CustomHFModelID.validate(customVisionModelDraft)
+  }
+
+  /// "Other (Hugging Face repo)" row for the text-tier picker. Tapping the
+  /// row highlights it (sentinel selection). When highlighted, the body
+  /// reveals a TextField bound to `customLocalModelDraft` with inline
+  /// validation. The Install button stays disabled until validation
+  /// succeeds; on click it persists the trimmed valid id as the active
+  /// model and kicks the existing install sheet flow.
+  @ViewBuilder
+  private var customLocalModelRow: some View {
+    let isSelected = localModelPickerSelection == Self.customRowSentinel
+    HStack(alignment: .top, spacing: 10) {
+      Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+        .scaledFont(size: 14)
+        .foregroundColor(
+          isSelected ? OmiColors.purplePrimary : OmiColors.textTertiary
+        )
+        .padding(.top, 1)
+
+      VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 8) {
+          Text("Other (Hugging Face repo)")
+            .scaledFont(size: 13, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+          Text("Custom")
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textSecondary)
+          Spacer()
+        }
+
+        Text("Paste any MLX-compatible repo, e.g. mlx-community/Llama-3.2-3B-Instruct-4bit.")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.textTertiary)
+
+        if isSelected {
+          TextField("org/repo", text: $customLocalModelDraft)
+            .textFieldStyle(.roundedBorder)
+            .scaledFont(size: 12)
+            .disableAutocorrection(true)
+
+          if case .failure(let err) = customLocalModelValidation,
+             !customLocalModelDraft.isEmpty || err != .empty
+          {
+            Text(err.errorDescription ?? "Invalid id")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.error)
+          }
+
+          HStack(spacing: 8) {
+            Spacer()
+            Button("Install") {
+              if case .success(let trimmed) = customLocalModelValidation {
+                installCustomLocalModel(trimmed)
+              }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(OmiColors.purplePrimary)
+            .controlSize(.small)
+            .disabled({
+              if case .success = customLocalModelValidation { return false }
+              return true
+            }())
+          }
+        }
+      }
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      localModelPickerSelection = Self.customRowSentinel
+    }
+  }
+
+  /// Persist the trimmed valid id as the active model and route into the
+  /// existing install sheet so the user gets the same step list + progress
+  /// bar UX. Stream C wires up the installer side (custom id → snapshot).
+  private func installCustomLocalModel(_ modelId: String) {
+    setActiveModel(modelId)
+    installLocalModel(modelId)
+  }
+
+  // MARK: Custom HF repo row (vision tier)
+
+  /// Vision-tier mirror of `customLocalModelRow`.
+  @ViewBuilder
+  private var customVisionModelRow: some View {
+    let isSelected = visionModelPickerSelection == Self.customRowSentinel
+    HStack(alignment: .top, spacing: 10) {
+      Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+        .scaledFont(size: 14)
+        .foregroundColor(
+          isSelected ? OmiColors.purplePrimary : OmiColors.textTertiary
+        )
+        .padding(.top, 1)
+
+      VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 8) {
+          Text("Other (Hugging Face repo)")
+            .scaledFont(size: 13, weight: .semibold)
+            .foregroundColor(OmiColors.textPrimary)
+          Text("Custom")
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textSecondary)
+          Spacer()
+        }
+
+        Text("Paste any mlx-vlm-compatible repo, e.g. mlx-community/Qwen2-VL-7B-Instruct-4bit.")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.textTertiary)
+
+        if isSelected {
+          TextField("org/repo", text: $customVisionModelDraft)
+            .textFieldStyle(.roundedBorder)
+            .scaledFont(size: 12)
+            .disableAutocorrection(true)
+
+          if case .failure(let err) = customVisionModelValidation,
+             !customVisionModelDraft.isEmpty || err != .empty
+          {
+            Text(err.errorDescription ?? "Invalid id")
+              .scaledFont(size: 11)
+              .foregroundColor(OmiColors.error)
+          }
+
+          HStack(spacing: 8) {
+            Spacer()
+            Button("Install") {
+              if case .success(let trimmed) = customVisionModelValidation {
+                installCustomVisionModel(trimmed)
+              }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(OmiColors.purplePrimary)
+            .controlSize(.small)
+            .disabled({
+              if case .success = customVisionModelValidation { return false }
+              return true
+            }())
+          }
+        }
+      }
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      visionModelPickerSelection = Self.customRowSentinel
+    }
+  }
+
+  /// Vision-tier mirror of `installCustomLocalModel`.
+  private func installCustomVisionModel(_ modelId: String) {
+    setActiveVisionModel(modelId)
+    installVisionModel(modelId)
   }
 
   // MARK: Local Model picker — helpers

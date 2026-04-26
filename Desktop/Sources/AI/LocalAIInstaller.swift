@@ -181,16 +181,33 @@ final class LocalAIInstaller: ObservableObject {
     pendingVLMModelId = (kind == .vlm) ? modelId : nil
 
     // Seed modelTotalBytes from the catalog so the progress label never shows
-    // a stale hardcoded number. Fall back to 0 if the id isn't in the catalog.
+    // a stale hardcoded number. For custom (user-supplied) HF ids the catalog
+    // returns nil — leave modelTotalBytes at 0 so the UI runs an indeterminate
+    // progress bar rather than a misleading total. For the default install
+    // (no modelId), fall back to the catalog's recommended entry.
     switch kind {
     case .mlx:
-      let entry = modelId.flatMap { LocalModelCatalog.option(forId: $0) }
-        ?? LocalModelCatalog.recommended
-      modelTotalBytes = Int64(entry.approxDiskGB * 1_000_000_000)
+      if let id = modelId {
+        if let entry = LocalModelCatalog.option(forId: id) {
+          modelTotalBytes = Int64(entry.approxDiskGB * 1_000_000_000)
+        } else {
+          // Custom id — unknown size; leave indeterminate.
+          modelTotalBytes = 0
+        }
+      } else {
+        modelTotalBytes = Int64(LocalModelCatalog.recommended.approxDiskGB * 1_000_000_000)
+      }
     case .vlm:
-      let entry = modelId.flatMap { VisionModelCatalog.option(forId: $0) }
-        ?? VisionModelCatalog.recommended
-      modelTotalBytes = Int64(entry.approxDiskGB * 1_000_000_000)
+      if let id = modelId {
+        if let entry = VisionModelCatalog.option(forId: id) {
+          modelTotalBytes = Int64(entry.approxDiskGB * 1_000_000_000)
+        } else {
+          // Custom id — unknown size; leave indeterminate.
+          modelTotalBytes = 0
+        }
+      } else {
+        modelTotalBytes = Int64(VisionModelCatalog.recommended.approxDiskGB * 1_000_000_000)
+      }
     case .api:
       modelTotalBytes = 0
     }
@@ -432,6 +449,20 @@ final class LocalAIInstaller: ObservableObject {
       if let n = Int64(value) {
         modelDownloadedBytes = n
       }
+
+    case "DOWNLOAD_FAIL":
+      // Embedded Python in the install scripts emits this sentinel when
+      // huggingface_hub.snapshot_download raises (bad id, gated repo, HTTP
+      // error, etc.). Capture the reason verbatim, mark the install failed,
+      // and let the process-exit branch surface our error rather than the
+      // generic "exited with status N" fallback.
+      let reason = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !reason.isEmpty {
+        error = "Download failed: \(reason)"
+      } else {
+        error = "Download failed."
+      }
+      currentStep = .failed
 
     default:
       break
