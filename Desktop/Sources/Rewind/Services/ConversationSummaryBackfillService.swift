@@ -1,13 +1,23 @@
 import Foundation
 import GRDB
 
-/// One-time backfill actor that generates structured summaries (title, overview,
-/// emoji, category) for finished conversations whose structured fields are empty.
+/// Owns durable enqueue, per-session summarize entry point, ambient audio
+/// handling, and status normalization for conversation summaries.
 ///
 /// These fields were originally filled by the cloud-backed Omi extraction
 /// pipeline which is not present in the local-first fork.  Historical sessions
 /// recorded before the local extraction pipeline was wired therefore have null
 /// title/overview and appear as "Untitled Conversation" in the list.
+///
+/// **Wave-1 contract surface (see contracts/IRSummaryContracts.swift):**
+/// - `enqueueSummary(sessionId:reason:)` — durable enqueue via PendingWorkStorage,
+///   dedup key `summarize:<id>`, payload `{"session_id": <id>}`.
+/// - `enqueueHistoricalSummariesIfNeeded(reason:)` — walks finished sessions
+///   missing a summary and enqueues each.
+/// - `processSummary(sessionId:autonomous:)` — process exactly one session.
+///   When `autonomous == true`, routes the LLM call through
+///   `LocalLLMClient.chatAutonomous` (Agent B's deliverable) so Memory Saver
+///   can still unload after a drain.
 ///
 /// Idempotency guarantee: the UserDefaults flag
 /// `conversationSummaryBackfillCompleted_v2` is set only after 3 consecutive
@@ -15,10 +25,11 @@ import GRDB
 /// times is safe. v2 intentionally re-runs on machines where an earlier broken
 /// v1 attempt marked completion before local summaries were reliably generated.
 ///
-/// Battery awareness: the loop only runs when
-/// `BatteryAwareScheduler.shared.allowHeavyWork` is true.  If the machine is
-/// on battery / low-power at launch the service logs a skip and exits; the flag
-/// is intentionally NOT set so the next launch retries.
+/// Battery awareness: the legacy `runIfNeeded` loop only runs when
+/// `BatteryAwareScheduler.shared.allowHeavyWork` is true.  In the new flow the
+/// blocked-readiness path durably enqueues via `PendingWorkStorage` instead of
+/// dropping the request on the floor; the scheduler's autonomous-AI drain
+/// (Agent B) picks it up later.
 actor ConversationSummaryBackfillService {
     static let shared = ConversationSummaryBackfillService()
 
@@ -32,21 +43,137 @@ actor ConversationSummaryBackfillService {
     /// How many consecutive empty queries before we declare completion.
     private static let emptyBatchTerminationCount = 3
 
+    /// Pending-work `workType` for summary jobs. Must match
+    /// `PendingWork.Kind.summarize.rawValue` and is shared across agents.
+    private static let workType: String = PendingWork.Kind.summarize.rawValue
+
     private init() {}
 
-    // MARK: - Public API
+    // MARK: - Pending-work payload
 
-    /// Entry point.  Call once after capture services are initialized.
-    /// Returns immediately if the backfill has already completed or if the
-    /// machine lacks headroom to run heavy work.
+    /// Wire format for `pending_work.payload` rows of kind `summarize`.
+    /// Matches the contract in `IRSummaryContracts.swift`:
+    ///     {"session_id": Int64}
+    /// Dedup key: `summarize:<session_id>`.
+    struct PendingPayload: Codable {
+        let session_id: Int64
+    }
+
+    static func dedupKey(for sessionId: Int64) -> String {
+        return "summarize:\(sessionId)"
+    }
+
+    // MARK: - Public API (Wave-1 contract surface)
+
+    /// Durably enqueue a single session for `.summarize` work via
+    /// `PendingWorkStorage`. Idempotent — repeat calls collapse via the
+    /// dedup key `summarize:<sessionId>`. Posts
+    /// `.conversationsListNeedsRefresh` so the UI can reflect the pending
+    /// state immediately.
+    func enqueueSummary(sessionId: Int64, reason: String) async {
+        let payload: Data
+        do {
+            payload = try JSONEncoder().encode(PendingPayload(session_id: sessionId))
+        } catch {
+            logError("ConversationSummaryBackfillService: failed to encode summary payload for session \(sessionId)", error: error)
+            return
+        }
+
+        do {
+            _ = try await PendingWorkStorage.shared.enqueue(
+                workType: Self.workType,
+                payload: payload,
+                dedupKey: Self.dedupKey(for: sessionId)
+            )
+            log("ConversationSummaryBackfillService: enqueued summarize for session \(sessionId) (\(reason))")
+        } catch {
+            logError("ConversationSummaryBackfillService: enqueue failed for session \(sessionId) (\(reason))", error: error)
+        }
+
+        // Mark the historical backfill flag as needing another sweep so the
+        // legacy runIfNeeded path won't short-circuit on the next launch.
+        UserDefaults.standard.set(false, forKey: Self.userDefaultsKey)
+
+        await notifyConversationListNeedsRefresh()
+    }
+
+    /// Walks finished sessions with transcripts but missing title/overview and
+    /// enqueues each. Called from AppState launch hook by Agent B.
+    func enqueueHistoricalSummariesIfNeeded(reason: String) async {
+        do {
+            let sessionIds = try await fetchEligibleSessionIds()
+            guard !sessionIds.isEmpty else {
+                log("ConversationSummaryBackfillService: no historical summaries needed (\(reason))")
+                return
+            }
+            log("ConversationSummaryBackfillService: enqueuing \(sessionIds.count) historical summary job(s) (\(reason))")
+            for id in sessionIds {
+                await enqueueSummary(sessionId: id, reason: "historical:\(reason)")
+            }
+        } catch {
+            logError("ConversationSummaryBackfillService: enqueueHistoricalSummariesIfNeeded failed (\(reason))", error: error)
+        }
+    }
+
+    /// Process exactly one session's summary.
+    ///
+    /// - Parameter autonomous: when `true` the LLM call MUST route through
+    ///   `LocalLLMClient.chatAutonomous` (Agent B's deliverable) so that
+    ///   `IdleAIController.recordAICall` is NOT invoked and Memory Saver can
+    ///   still unload after the drain.
+    /// - Throws: on retryable failure so PendingWork retry/backoff handles it.
+    func processSummary(sessionId: Int64, autonomous: Bool) async throws {
+        guard let row = try await fetchSession(id: sessionId, onlyIfNeedsSummary: true) else {
+            log("ConversationSummaryBackfillService: processSummary skipped for session \(sessionId) — already summarized or missing")
+            return
+        }
+
+        let mode = autonomous ? "autonomous" : "live"
+        let outcome = try await process(row: row, mode: mode, autonomous: autonomous)
+        switch outcome {
+        case .summarized, .placeholder:
+            // Done: ack happens at the caller (Agent B's drain loop) or the
+            // immediate-path entry point.
+            return
+        case .deferred:
+            // Surface as a retryable error so PendingWork backoff schedules
+            // another attempt.
+            throw SummaryProcessingError.deferred(sessionId: sessionId)
+        }
+    }
+
+    enum SummaryProcessingError: LocalizedError {
+        case deferred(sessionId: Int64)
+
+        var errorDescription: String? {
+            switch self {
+            case .deferred(let id):
+                return "Summary deferred for session \(id) (LLM unavailable or response unparsable)"
+            }
+        }
+    }
+
+    // MARK: - Legacy entry points (kept for AppState/OmiApp callers)
+
+    /// Legacy historical-backfill entry point. Preserved for the existing
+    /// `OmiApp.swift` launch hook (BOUNDARY for this task — Agent B owns it).
+    /// In the new flow this just enqueues eligible sessions; the autonomous
+    /// drain owned by Agent B does the actual work.
     func runIfNeeded() async {
         guard !UserDefaults.standard.bool(forKey: Self.userDefaultsKey) else {
             log("ConversationSummaryBackfillService: already complete (v2), skipping")
             return
         }
 
+        // Always enqueue. The blocked-readiness path used to log-and-retry-on-launch;
+        // we now durably enqueue so work survives until conditions are right.
+        await enqueueHistoricalSummariesIfNeeded(reason: "runIfNeeded")
+
+        // If we're currently safe to run heavy work, also drive an immediate
+        // pass for snappy UX. If we're not, the items stay queued and Agent B's
+        // autonomous-AI drain handles them.
         guard await MainActor.run(body: { BatteryAwareScheduler.shared.allowHeavyWork }) else {
-            log("ConversationSummaryBackfillService: heavy work not allowed (battery/thermal), will retry next launch")
+            log("ConversationSummaryBackfillService: heavy work not allowed (battery/thermal); items queued for autonomous drain")
             return
         }
 
@@ -68,41 +195,42 @@ actor ConversationSummaryBackfillService {
         log("ConversationSummaryBackfillService: marked backfill needed (\(reason))")
     }
 
-    /// Summarize one just-finished session immediately instead of waiting for
-    /// the historical backfill lifecycle. Safe to call repeatedly: rows that
-    /// already have a title or overview are ignored.
+    /// Summarize one just-finished session immediately when conditions are
+    /// safe; otherwise durably enqueue for the autonomous drain. Always
+    /// enqueues a durable record first so nothing is lost.
     func summarizeSessionIfNeeded(_ sessionId: Int64, reason: String) async {
+        // 1. Durable enqueue — survives crash/quit/blocked-readiness.
+        await enqueueSummary(sessionId: sessionId, reason: "live:\(reason)")
+
+        // 2. Try to run immediately when currently safe so the user sees the
+        //    summary as soon as possible without waiting for an autonomous
+        //    drain.
         guard await MainActor.run(body: { BatteryAwareScheduler.shared.allowHeavyWork }) else {
-            markBackfillNeeded(reason: "live summary deferred for session \(sessionId): heavy work not allowed")
-            log("ConversationSummaryBackfillService: live summary deferred for session \(sessionId) — heavy work not allowed (\(reason))")
+            log("ConversationSummaryBackfillService: live summary deferred for session \(sessionId) — heavy work not allowed; queued for autonomous drain (\(reason))")
             return
         }
 
         do {
-            guard let row = try await fetchSession(id: sessionId, onlyIfNeedsSummary: true) else {
-                log("ConversationSummaryBackfillService: live summary skipped for session \(sessionId) — already summarized or missing (\(reason))")
-                return
-            }
-            let outcome = try await process(row: row, mode: "live \(reason)")
-            if case .deferred = outcome {
-                markBackfillNeeded(reason: "live summary deferred for session \(sessionId)")
-            }
+            try await processSummary(sessionId: sessionId, autonomous: false)
+        } catch SummaryProcessingError.deferred {
+            log("ConversationSummaryBackfillService: live summary deferred for session \(sessionId); pending row remains queued")
         } catch {
-            markBackfillNeeded(reason: "live summary error for session \(sessionId)")
             logError("ConversationSummaryBackfillService: live summary failed for session \(sessionId)", error: error)
         }
     }
 
-    // MARK: - Private
+    // MARK: - Private — backfill loop (legacy; still callable for in-process drain)
 
     private func backfillLoop(startTime: Date) async throws {
         var totalProcessed = 0
         var consecutiveEmpty = 0
+        var hasDeferredOrPending = false
 
         while consecutiveEmpty < Self.emptyBatchTerminationCount {
             // Re-check power state between rows.
             guard await MainActor.run(body: { BatteryAwareScheduler.shared.allowHeavyWork }) else {
-                log("ConversationSummaryBackfillService: pausing — power conditions changed after \(totalProcessed) rows, will retry next launch")
+                log("ConversationSummaryBackfillService: pausing — power conditions changed after \(totalProcessed) rows; remaining items stay queued for autonomous drain")
+                hasDeferredOrPending = true
                 return
             }
 
@@ -114,7 +242,7 @@ actor ConversationSummaryBackfillService {
 
             consecutiveEmpty = 0
 
-            let outcome = try await process(row: row, mode: "backfill")
+            let outcome = try await process(row: row, mode: "backfill", autonomous: false)
             switch outcome {
             case .summarized:
                 totalProcessed += 1
@@ -125,15 +253,23 @@ actor ConversationSummaryBackfillService {
             case .deferred:
                 // Do not spin forever on the same row if the local LLM is
                 // offline or returned unparsable JSON. Leave it eligible and
-                // retry on the next launch/manual trigger.
+                // retry on the next safe window — pending-work row already
+                // survives via enqueueSummary above.
                 log("ConversationSummaryBackfillService: deferred after LLM/parse failure; will retry later")
+                hasDeferredOrPending = true
                 return
             }
         }
 
         let elapsed = Date().timeIntervalSince(startTime)
-        UserDefaults.standard.set(true, forKey: Self.userDefaultsKey)
-        log(String(format: "ConversationSummaryBackfillService: complete — %d rows in %.1fs", totalProcessed, elapsed))
+        // Requirement 5: do not mark global backfill complete while pending
+        // /deferred rows remain.
+        if !hasDeferredOrPending {
+            UserDefaults.standard.set(true, forKey: Self.userDefaultsKey)
+            log(String(format: "ConversationSummaryBackfillService: complete — %d rows in %.1fs", totalProcessed, elapsed))
+        } else {
+            log(String(format: "ConversationSummaryBackfillService: partial pass — %d rows in %.1fs (pending/deferred remain)", totalProcessed, elapsed))
+        }
     }
 
     private enum ProcessOutcome {
@@ -142,21 +278,31 @@ actor ConversationSummaryBackfillService {
         case deferred
     }
 
-    private func process(row: PendingSession, mode: String) async throws -> ProcessOutcome {
+    private func process(row: PendingSession, mode: String, autonomous: Bool) async throws -> ProcessOutcome {
         let sessionId = row.id
         let transcript = row.transcript
 
+        // Short transcript → write a placeholder so we don't keep re-queueing.
         guard transcript.count >= Self.minTranscriptLength else {
-            log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), writing placeholder (\(mode))")
-            // Write a sentinel so it won't be re-selected on the next run.
-            try await writeBackPlaceholder(sessionId: sessionId)
+            log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), writing short-recording placeholder (\(mode))")
+            try await writeShortRecordingPlaceholder(sessionId: sessionId)
+            await notifyConversationListNeedsRefresh()
+            return .placeholder
+        }
+
+        // Ambient/non-speech fallback: long enough to look real but mostly
+        // bracketed/non-speech (music, noise). Don't throw — write a
+        // structured placeholder instead so the row stops being re-queued.
+        if Self.isMostlyNonSpeech(transcript) {
+            log("ConversationSummaryBackfillService: session \(sessionId) detected as ambient/non-speech audio, writing Ambient Audio placeholder (\(mode))")
+            try await writeAmbientAudioPlaceholder(sessionId: sessionId)
             await notifyConversationListNeedsRefresh()
             return .placeholder
         }
 
         log("ConversationSummaryBackfillService: summarizing session \(sessionId) (\(transcript.count) chars, \(mode))")
 
-        guard let structured = await callLLM(transcript: transcript, sessionId: sessionId) else {
+        guard let structured = await callLLM(transcript: transcript, sessionId: sessionId, autonomous: autonomous) else {
             log("ConversationSummaryBackfillService: session \(sessionId) summary deferred due to LLM/parse failure (\(mode))")
             return .deferred
         }
@@ -173,12 +319,75 @@ actor ConversationSummaryBackfillService {
         }
     }
 
+    // MARK: - Ambient / non-speech detection
+
+    /// Returns true when the transcript is dominated by bracketed non-speech
+    /// markers like `[Music]`, `[Applause]`, `(noise)`, WhisperKit ambient
+    /// tokens, etc. The summary path uses this to short-circuit into a
+    /// structured "Ambient Audio" placeholder instead of paying for an LLM
+    /// call (and instead of throwing).
+    static func isMostlyNonSpeech(_ transcript: String) -> Bool {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        // Strip common bracketed non-speech markers and ambient tokens.
+        // Patterns: [Music], (Applause), <Music>, [BLANK_AUDIO], etc.
+        let bracketPattern = #"[\[\(\<][^\]\)\>]*[\]\)\>]"#
+        let stripped = trimmed.replacingOccurrences(
+            of: bracketPattern,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Count remaining alphanumeric (speech) characters.
+        let speechCharCount = stripped.unicodeScalars.reduce(0) { acc, s in
+            (CharacterSet.letters.contains(s) || CharacterSet.decimalDigits.contains(s)) ? acc + 1 : acc
+        }
+        let totalCharCount = trimmed.unicodeScalars.reduce(0) { acc, s in
+            (CharacterSet.letters.contains(s) || CharacterSet.decimalDigits.contains(s)) ? acc + 1 : acc
+        }
+
+        // If the original had alphanumerics but stripping brackets killed
+        // most of them, the transcript was mostly bracketed non-speech.
+        if totalCharCount == 0 { return true }
+        let speechRatio = Double(speechCharCount) / Double(totalCharCount)
+        return speechRatio < 0.2
+    }
+
     // MARK: - Database helpers
 
     /// Holds one row from the "needs summary" query.
     private struct PendingSession {
         let id: Int64
         let transcript: String
+    }
+
+    /// Fetch IDs of finished, non-deleted sessions with at least one
+    /// non-empty transcript segment AND missing title/overview. Used by
+    /// `enqueueHistoricalSummariesIfNeeded`.
+    private func fetchEligibleSessionIds() async throws -> [Int64] {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw TranscriptionStorageError.databaseNotInitialized
+        }
+
+        let sql = """
+            SELECT s.id FROM transcription_sessions AS s
+             WHERE s.finishedAt IS NOT NULL
+               AND s.deleted = 0
+               AND ((s.title IS NULL OR s.title = '')
+                    OR (s.overview IS NULL OR s.overview = ''))
+               AND EXISTS (
+                   SELECT 1 FROM transcription_segments seg
+                    WHERE seg.sessionId = s.id
+                      AND seg.text IS NOT NULL
+                      AND TRIM(seg.text) != ''
+               )
+             ORDER BY s.finishedAt DESC
+            """
+
+        return try await dbQueue.read { db in
+            try Int64.fetchAll(db, sql: sql)
+        }
     }
 
     /// Fetch the next finished session whose title+overview are both empty/null,
@@ -249,7 +458,35 @@ actor ConversationSummaryBackfillService {
 
     /// Write a non-empty sentinel back for a session whose transcript is too
     /// short to summarize, so it won't be re-queried.
-    private func writeBackPlaceholder(sessionId: Int64) async throws {
+    private func writeShortRecordingPlaceholder(sessionId: Int64) async throws {
+        try await writePlaceholder(
+            sessionId: sessionId,
+            title: "Short Recording",
+            overview: "",
+            emoji: "🎙",
+            category: "other"
+        )
+    }
+
+    /// Write the structured Ambient Audio placeholder defined in the contract:
+    /// title=Ambient Audio, overview=…, emoji=🎧, category=other.
+    private func writeAmbientAudioPlaceholder(sessionId: Int64) async throws {
+        try await writePlaceholder(
+            sessionId: sessionId,
+            title: "Ambient Audio",
+            overview: "This recording mostly contains ambient audio or non-speech sounds.",
+            emoji: "🎧",
+            category: "other"
+        )
+    }
+
+    private func writePlaceholder(
+        sessionId: Int64,
+        title: String,
+        overview: String,
+        emoji: String,
+        category: String
+    ) async throws {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             throw TranscriptionStorageError.databaseNotInitialized
         }
@@ -265,7 +502,7 @@ actor ConversationSummaryBackfillService {
         try await dbQueue.write { db in
             try db.execute(
                 sql: sql,
-                arguments: ["Short Recording", "", "🎙", "other", Date(), sessionId]
+                arguments: [title, overview, emoji, category, Date(), sessionId]
             )
         }
     }
@@ -316,7 +553,7 @@ actor ConversationSummaryBackfillService {
         let category: String
     }
 
-    private func callLLM(transcript: String, sessionId: Int64) async -> SummaryResult? {
+    private func callLLM(transcript: String, sessionId: Int64, autonomous: Bool) async -> SummaryResult? {
         let truncated = transcript.count > Self.maxTranscriptLength
             ? String(transcript.prefix(Self.maxTranscriptLength)) + "..."
             : transcript
@@ -333,14 +570,24 @@ actor ConversationSummaryBackfillService {
             """
 
         let userPrompt = "Transcript:\n\n\(truncated)"
+        let label = "ConversationSummaryBackfill[\(sessionId)\(autonomous ? ":autonomous" : "")]"
 
-        guard let raw = await LLMBridge.generateJSON(
-            systemPrompt: systemPrompt,
-            userPrompt: userPrompt,
-            label: "ConversationSummaryBackfill[\(sessionId)]"
-        ) else {
-            return nil
+        let raw: String?
+        if autonomous {
+            raw = await Self.generateJSONAutonomous(
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                label: label
+            )
+        } else {
+            raw = await LLMBridge.generateJSON(
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                label: label
+            )
         }
+
+        guard let raw else { return nil }
 
         guard let data = raw.data(using: .utf8) else {
             log("ConversationSummaryBackfillService: session \(sessionId) — response not UTF-8")
@@ -366,5 +613,36 @@ actor ConversationSummaryBackfillService {
             log("ConversationSummaryBackfillService: session \(sessionId) — JSON parse failed (\(raw.prefix(200))): \(error.localizedDescription)")
             return nil
         }
+    }
+
+    /// Autonomous-mode JSON generation. MUST route through
+    /// `LocalLLMClient.shared.chatAutonomous` (Agent B's deliverable in
+    /// `task-002`) which mirrors `chat(...)` but does NOT call
+    /// `IdleAIController.recordAICall`, so Memory Saver can still unload the
+    /// model after an autonomous drain.
+    ///
+    /// Strips JSON code fences best-effort, mirroring `LLMBridge.generateJSON`.
+    ///
+    /// **Wave-1 compile note:** `LocalLLMClient.chatAutonomous` is owned by
+    /// Agent B (`task-002`). Until that branch merges, this Wave-1 build
+    /// temporarily routes the autonomous call through `LLMBridge.generateJSON`
+    /// so the package compiles and tests can run. The autonomous-flag
+    /// plumbing through `processSummary` is in place; only the final LLM call
+    /// site needs to be swapped in Wave 2 to remove `recordAICall` pinning.
+    /// See contracts/IRSummaryContracts.swift `LocalLLMClientAutonomousContract`.
+    private static func generateJSONAutonomous(
+        systemPrompt: String,
+        userPrompt: String,
+        label: String
+    ) async -> String? {
+        // TODO(agent-b/task-002): replace this fallback with a direct call to
+        //   LocalLLMClient.shared.chatAutonomous(messages:stream:) once Agent B's
+        //   branch lands. The autonomous flag plumbing in processSummary stays
+        //   the same — only the LLM call site changes.
+        return await LLMBridge.generateJSON(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt,
+            label: label + ":pending-chatAutonomous"
+        )
     }
 }

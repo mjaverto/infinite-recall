@@ -503,6 +503,50 @@ actor TranscriptionStorage {
         }
     }
 
+    /// Idempotent repair for sessions left in `conversationStatus = 'in_progress'`
+    /// after a crash/quit, where the recording itself is finished but the
+    /// conversation status was never advanced. Without this, the
+    /// Conversations list keeps showing them as "In Progress" forever and the
+    /// summary pipeline considers them ineligible.
+    ///
+    /// Runs the SQL semantics required by the contract
+    /// (`TranscriptionStorageRepairContract.repairFinishedInProgressSessions`):
+    ///
+    ///     UPDATE transcription_sessions
+    ///        SET conversationStatus = 'completed', updatedAt = ?
+    ///      WHERE finishedAt IS NOT NULL
+    ///        AND conversationStatus = 'in_progress'
+    ///        AND status != 'recording';
+    ///
+    /// - Returns: number of rows updated. Idempotent: subsequent calls return 0.
+    /// - Note: explicitly EXCLUDES rows where `status = 'recording'` so an
+    ///   active recording is never accidentally normalized.
+    @discardableResult
+    func repairFinishedInProgressSessions() async throws -> Int {
+        let db = try await ensureInitialized()
+        let now = Date()
+
+        let changed = try await db.write { database -> Int in
+            try database.execute(
+                sql: """
+                    UPDATE transcription_sessions
+                       SET conversationStatus = 'completed',
+                           updatedAt = ?
+                     WHERE finishedAt IS NOT NULL
+                       AND conversationStatus = 'in_progress'
+                       AND status != 'recording'
+                    """,
+                arguments: [now]
+            )
+            return database.changesCount
+        }
+
+        if changed > 0 {
+            log("TranscriptionStorage: Repaired \(changed) finished/in_progress session(s) → completed")
+        }
+        return changed
+    }
+
     /// Recover sessions left in `recording` after an app crash/quit. In the
     /// local-first fork there is no remote backend retry to reconcile these, so
     /// old recording rows with transcript/audio must be closed locally; otherwise
