@@ -212,7 +212,10 @@ pub async fn gate_state(
     State(state): State<AppState>,
     Json(body): Json<GateState>,
 ) -> StatusCode {
-    state.processing_gate.set(body);
+    // Uses the write-side `WritableProcessingGate` trait — read-only stub
+    // gates (e.g. `#[cfg(test)] AlwaysAllowedGate`) cannot be wired here
+    // by mistake, since they don't implement the writable trait at all.
+    state.processing_gate_writer.set(body);
     StatusCode::NO_CONTENT
 }
 

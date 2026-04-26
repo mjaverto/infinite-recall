@@ -100,10 +100,10 @@ public enum BlockReason: String, Codable, Hashable, CaseIterable {
     case thermal
     case locked
     case manualPause = "manual_pause"
-    /// PR #40 review: the placeholder `AlwaysAllowedGate` (Rust) reports
-    /// this until the real `ProcessingGate` lands (issue #32). The UI
-    /// renders an honest "gate not yet wired" banner instead of falsely
-    /// claiming `.allowed`. Removed when #32 ships.
+    /// Initial state before the first gate-state report from Swift
+    /// arrives. Should only be observed during the brief boot window
+    /// (~3s — one `ProcessingGateReporter` poll cycle). External POSTs
+    /// of this variant are rejected by the Rust `BridgedProcessingGate`.
     case unwired
 }
 

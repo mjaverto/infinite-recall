@@ -92,10 +92,19 @@ public struct ProcessingGateInputs: Equatable {
 /// Priority (highest first):
 ///   1. Locked            → `Blocked(.locked,        WaitCondition.unlock)`
 ///   2. Thermal serious+  → `Blocked(.thermal,       .thermalCooldown)`
-///   3. On battery + LPM  → `Blocked(.onBattery,     .acPower)`
+///   3. On battery        → `Blocked(.onBattery,     .acPower)`
 ///      (only when there's queued work — empty queue + battery = Allowed)
 ///   4. Idle < threshold  → `Blocked(.deviceActive,  .idleFor(remaining))`
 ///   5. Else              → `Allowed(since: idleEnteredAt)`
+///
+/// MUST mirror `BatteryAwareScheduler.allowHeavyWork` exactly — any
+/// condition that prevents the scheduler from draining must produce a
+/// `Blocked` state here, otherwise the snapshot will lie about
+/// `Allowed` while the scheduler quietly refuses to drain. The scheduler
+/// blocks on ANY of: source != .ac, isLowPowerMode, thermal >= .serious
+/// (modulo userOverride which is intentionally not mirrored — the
+/// override is a per-user policy choice, not a hardware fact, so the
+/// gate stays honest about the underlying signal).
 public func computeGateState(_ inputs: ProcessingGateInputs, now: Date = Date()) -> GateState {
   // 1. Lock wins over everything — even thermal cooldown, since the user
   //    is gone and we should resume the moment they unlock regardless of
@@ -118,11 +127,15 @@ public func computeGateState(_ inputs: ProcessingGateInputs, now: Date = Date())
     )
   }
 
-  // 3. Power. The existing `BatteryAwareScheduler` policy is "wait for AC
-  //    when on battery + low-power-mode". On battery without LPM is fine
-  //    (the user is willing to spend the cycles). Empty queue = nothing
-  //    to defer, so report Allowed.
-  if inputs.onBattery && inputs.isLowPowerMode && inputs.pendingWorkCount > 0 {
+  // 3. Power. `BatteryAwareScheduler.allowHeavyWork` returns false the
+  //    moment the source is not AC — LPM is a separate AND-clause but
+  //    on-battery alone is already enough to block draining. So the gate
+  //    must report `Blocked(.onBattery)` whenever the laptop is on
+  //    battery with queued work, regardless of LPM. Otherwise the
+  //    snapshot would lie: `Allowed` while the scheduler refuses to drain.
+  //    Empty queue = nothing to defer, so report Allowed (no banner spam
+  //    when there's nothing waiting).
+  if inputs.onBattery && inputs.pendingWorkCount > 0 {
     return .blocked(
       reason: .onBattery,
       since: inputs.batterySince ?? now,
@@ -258,7 +271,48 @@ public final class ProcessingGateReporter {
       // every 3s during boot is fine and was previously the
       // ActivityMonitorService pattern.
       NSLog("[gate-reporter] failed to post gate state: \(error.localizedDescription)")
+
+      // Daemon-restart heuristic: 401 (token rotated), connection refused,
+      // or 5xx gateway-style errors all indicate the daemon may have just
+      // restarted with a fresh `Blocked(.unwired)` initial state. Clear
+      // the local de-dupe cache so the NEXT successful POST re-syncs the
+      // daemon to current Swift-side truth — otherwise the daemon could
+      // stay stuck on Unwired while Swift believes it already posted the
+      // current state.
+      if Self.isDaemonRestartIndicator(error) {
+        lastPostedState = nil
+      }
     }
+  }
+
+  /// True when the error looks like the Rust daemon just restarted (token
+  /// rotated → 401, socket gone → connection refused, gateway-class 5xx).
+  /// Used to invalidate the local `lastPostedState` cache so the next
+  /// successful POST re-syncs the daemon.
+  private static func isDaemonRestartIndicator(_ error: Error) -> Bool {
+    if let api = error as? APIError {
+      switch api {
+      case .unauthorized:
+        return true
+      case .httpError(let code) where code == 502 || code == 503 || code == 504:
+        return true
+      default:
+        break
+      }
+    }
+    let nsErr = error as NSError
+    if nsErr.domain == NSURLErrorDomain {
+      switch nsErr.code {
+      case NSURLErrorCannotConnectToHost,
+        NSURLErrorNetworkConnectionLost,
+        NSURLErrorNotConnectedToInternet,
+        NSURLErrorTimedOut:
+        return true
+      default:
+        break
+      }
+    }
+    return false
   }
 
   /// Pull the live signal values from `BatteryAwareScheduler` /
@@ -333,9 +387,12 @@ public final class ProcessingGateReporter {
       // remaining-idle counter changes, because the UI binds its "resumes
       // in 30s" copy directly to that number.
       if case .idleFor(let sA) = wA, case .idleFor(let sB) = wB, rA == rB {
-        // Re-POST only when the remaining seconds change by ≥ 5s — small
-        // ticks aren't worth the round-trip.
-        return abs(Int64(sA) - Int64(sB)) < 5
+        // Re-POST whenever the remaining seconds change by ≥ 1s. The
+        // previous 5s tolerance combined with the 3s post cadence made
+        // the UI countdown stutter (e.g. "90 → 90 → 84 → 84") because
+        // every other tick fell under the threshold. 1s keeps the
+        // counter monotonic from the user's perspective.
+        return abs(Int64(sA) - Int64(sB)) < 1
       }
       return rA == rB && wA == wB
     default:

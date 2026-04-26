@@ -28,7 +28,7 @@ use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 
-use super::traits::ProcessingGate;
+use super::traits::{ProcessingGate, WritableProcessingGate};
 use super::types::{BlockReason, GateState, WaitCondition};
 
 /// Production gate impl, fed by the Swift side over the
@@ -48,6 +48,11 @@ impl BridgedProcessingGate {
     /// stub emitted; once Swift POSTs its first real reading, this is
     /// overwritten and never reverts.
     pub fn new() -> Self {
+        tracing::info!(
+            target: "activity.gate",
+            initial = "Unwired",
+            "BridgedProcessingGate constructed"
+        );
         Self {
             state: Arc::new(RwLock::new(initial_state())),
         }
@@ -59,12 +64,37 @@ impl BridgedProcessingGate {
     /// Poisoned-lock recovery: if a previous writer panicked, fall back to
     /// `into_inner()` rather than panicking the route handler. The data
     /// itself is still writable.
+    ///
+    /// `Blocked { reason: Unwired, .. }` is rejected (defense-in-depth):
+    /// the `Unwired` variant exists ONLY to represent "haven't received
+    /// the first POST yet" — Swift should never post it. We swallow the
+    /// write and emit a `tracing::warn!` so an external POST can't latch
+    /// the gate back into the boot-window state. The route handler still
+    /// returns 204; this validation is internal and never leaks to the
+    /// caller.
     pub fn set(&self, new_state: GateState) {
+        if let GateState::Blocked {
+            reason: BlockReason::Unwired,
+            ..
+        } = &new_state
+        {
+            tracing::warn!(
+                target: "activity.gate",
+                ?new_state,
+                "rejected external Unwired gate-state post (Unwired is reserved for the boot window)"
+            );
+            return;
+        }
         let mut guard = match self.state.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        *guard = new_state;
+        *guard = new_state.clone();
+        tracing::debug!(
+            target: "activity.gate",
+            ?new_state,
+            "gate state updated"
+        );
     }
 }
 
@@ -81,7 +111,9 @@ impl ProcessingGate for BridgedProcessingGate {
             Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
+}
 
+impl WritableProcessingGate for BridgedProcessingGate {
     fn set(&self, new_state: GateState) {
         Self::set(self, new_state);
     }

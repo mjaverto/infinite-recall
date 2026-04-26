@@ -66,8 +66,16 @@ pub async fn run() -> Result<()> {
     // `/v1/activity/_internal/gate-state`. Until that first POST arrives,
     // `current()` returns `Blocked { reason: Unwired, ... }` so the UI is
     // honest about the brief startup window.
-    let processing_gate: Arc<dyn activity::ProcessingGate> =
+    //
+    // Single backing Arc upcast into both the read-side (`ProcessingGate`)
+    // and the write-side (`WritableProcessingGate`) so the snapshot reader
+    // and the gate-state POST handler share the same RwLock<GateState>
+    // store. The trait split prevents a future `set()`-less gate from
+    // being silently wired into the write path.
+    let bridged_gate: Arc<activity::BridgedProcessingGate> =
         Arc::new(activity::BridgedProcessingGate::new());
+    let processing_gate: Arc<dyn activity::ProcessingGate> = bridged_gate.clone();
+    let processing_gate_writer: Arc<dyn activity::WritableProcessingGate> = bridged_gate;
     let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
     // === /activity:A ===
 
@@ -80,6 +88,7 @@ pub async fn run() -> Result<()> {
         inflight,
         resource_sampler,
         processing_gate,
+        processing_gate_writer,
         pause_tx,
         // === /activity:A ===
     };

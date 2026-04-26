@@ -19,7 +19,7 @@ pub mod traits;
 pub mod types;
 
 pub use gate::BridgedProcessingGate;
-pub use traits::{InflightRegistry, PauseStore, ProcessingGate, ResourceSampler};
+pub use traits::{InflightRegistry, PauseStore, ProcessingGate, ResourceSampler, WritableProcessingGate};
 pub use types::{
     ActivitySnapshot, BlockReason, CaptureKind, CaptureRow, GateState, InFlight, InflightUpdate,
     KindRow, PauseRequest, PauseTargetId, ProcessBreakdown, ResourceSample, ResumeRequest,
