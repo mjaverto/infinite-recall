@@ -20,7 +20,7 @@ struct LocalAIInstallSheet: View {
   }
 
   @Environment(\.dismiss) private var dismiss
-  @StateObject private var installer = LocalAIInstaller.shared
+  @ObservedObject private var installer = LocalAIInstaller.shared
   @State private var showLogs: Bool = false
 
   /// Which sidecar to install. See `Kind`.
@@ -28,10 +28,6 @@ struct LocalAIInstallSheet: View {
 
   /// Optional override of the model id (only honored for `.mlx` and `.vlm`).
   var modelId: String? = nil
-
-  /// Legacy back-compat shim: callers that pass `installAPIInstead: true` still
-  /// work and are mapped to `kind = .api`.
-  var installAPIInstead: Bool = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
@@ -67,11 +63,6 @@ struct LocalAIInstallSheet: View {
       // Kick off the install once the sheet appears, but only if we're not
       // already running (e.g. the sheet got re-presented after being closed).
       if !installer.isRunning && installer.currentStep != .done {
-        // Honor legacy installAPIInstead first, then fall through to `kind`.
-        if installAPIInstead {
-          await installer.startAPIInstall()
-          return
-        }
         switch kind {
         case .mlx:
           if let id = modelId {
@@ -92,11 +83,24 @@ struct LocalAIInstallSheet: View {
 
   /// Human-readable tier label that matches the card title in Settings.
   private var tierLabel: String {
-    let resolvedKind = installAPIInstead ? Kind.api : kind
-    switch resolvedKind {
+    switch kind {
     case .vlm: return "Vision Model"
     case .api: return "API Server"
     case .mlx: return "Local Model"
+    }
+  }
+
+  /// Resolve which model id the sheet should describe. Prefer the explicit
+  /// `modelId` argument, then fall back to the id the installer is currently
+  /// working on (set by `start{MLX,VLM}Install`). This keeps the header and
+  /// step labels aligned with the actual install — including custom HF ids —
+  /// when the call site presents the sheet without threading the id through.
+  private var resolvedModelId: String? {
+    if let id = modelId { return id }
+    switch kind {
+    case .mlx: return installer.pendingMLXModelId
+    case .vlm: return installer.pendingVLMModelId
+    case .api: return nil
     }
   }
 
@@ -106,15 +110,14 @@ struct LocalAIInstallSheet: View {
   /// network probe), so we return "size unknown" rather than seeding a
   /// misleading "0 GB" figure — the real progress comes from the installer.
   private var catalogDiskSizeLabel: String {
-    let resolvedKind = installAPIInstead ? Kind.api : kind
-    switch resolvedKind {
+    switch kind {
     case .mlx:
-      let entry = modelId.map { LocalModelCatalog.entry(forId: $0) }
+      let entry = resolvedModelId.map { LocalModelCatalog.entry(forId: $0) }
         ?? LocalModelCatalog.recommended
       if entry.approxDiskGB == 0 { return "size unknown" }
       return String(format: "%.4g GB", entry.approxDiskGB)
     case .vlm:
-      let entry = modelId.map { VisionModelCatalog.entry(forId: $0) }
+      let entry = resolvedModelId.map { VisionModelCatalog.entry(forId: $0) }
         ?? VisionModelCatalog.recommended
       if entry.approxDiskGB == 0 { return "size unknown" }
       return String(format: "%.4g GB", entry.approxDiskGB)
@@ -241,15 +244,30 @@ struct LocalAIInstallSheet: View {
 
   private var downloadProgressView: some View {
     VStack(alignment: .leading, spacing: 4) {
-      ProgressView(value: installer.modelDownloadProgress ?? 0)
-        .progressViewStyle(LinearProgressViewStyle(tint: OmiColors.purplePrimary))
+      // Custom HF ids skip the catalog-seeded total, so modelTotalBytes is 0
+      // until snapshot_download reports its first chunk. Show an indeterminate
+      // bar in that case rather than a misleading 0%-of-? sliver.
+      let hasTotal = installer.modelTotalBytes > 0
+      if hasTotal {
+        ProgressView(value: installer.modelDownloadProgress ?? 0)
+          .progressViewStyle(LinearProgressViewStyle(tint: OmiColors.purplePrimary))
+      } else {
+        ProgressView()
+          .progressViewStyle(LinearProgressViewStyle(tint: OmiColors.purplePrimary))
+      }
 
-      let pct = Int((installer.modelDownloadProgress ?? 0) * 100)
       let downloaded = LocalAIInstaller.formattedBytes(installer.modelDownloadedBytes)
-      let total = LocalAIInstaller.formattedBytes(installer.modelTotalBytes)
-      Text("\(pct)% — \(downloaded) of \(total)")
-        .scaledFont(size: 11)
-        .foregroundColor(OmiColors.textTertiary)
+      if hasTotal {
+        let pct = Int((installer.modelDownloadProgress ?? 0) * 100)
+        let total = LocalAIInstaller.formattedBytes(installer.modelTotalBytes)
+        Text("\(pct)% — \(downloaded) of \(total)")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.textTertiary)
+      } else {
+        Text("\(downloaded) downloaded")
+          .scaledFont(size: 11)
+          .foregroundColor(OmiColors.textTertiary)
+      }
     }
   }
 
