@@ -1,30 +1,33 @@
-//! Infinite Recall — local Omi-shaped REST API.
+//! Library entrypoint for the `infinite-recall-api` daemon.
 //!
-//! Read-only HTTP server over the GRDB SQLite at
-//! ~/Library/Application Support/Omi/users/anonymous/omi.db
-//! Listens on 127.0.0.1:7331 by default. Bearer-token auth.
+//! The daemon binary in `main.rs` is a thin shim that calls [`run`].
+//! The library form exists primarily so sibling crates (notably the
+//! `recall` CLI) can depend on shared building blocks like
+//! [`token::token_path`] without re-implementing them.
+
+pub mod auth;
+pub mod db;
+pub mod error;
+pub mod routes;
+pub mod state;
+pub mod token;
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
-mod auth;
-mod db;
-mod error;
-mod routes;
-mod state;
-
 use state::AppState;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Boot the HTTP daemon. Blocks until shutdown / error.
+pub async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,infinite_recall_api=info")),
         )
-        .init();
+        .try_init()
+        .ok();
 
     let db_path = resolve_db_path();
     tracing::info!(db = %db_path.display(), "opening sqlite read-only");
@@ -32,14 +35,13 @@ async fn main() -> Result<()> {
     let pool = db::open_read_only_pool(&db_path)
         .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
 
-    let token = auth::ensure_token().context("ensuring api token file")?;
+    let token = token::ensure_token().context("ensuring api token file")?;
     tracing::info!(
-        token_path = %auth::token_path().display(),
+        token_path = %token::token_path().display(),
         "bearer token ready (read it from the token file; not logged)"
     );
 
     let state = AppState { pool, token };
-
     let app = routes::router(state);
 
     let bind: SocketAddr = std::env::var("INFINITE_RECALL_BIND")
