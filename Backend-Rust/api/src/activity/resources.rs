@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -127,7 +128,10 @@ impl ResourceSampler for SystemResourceSampler {
         // 2. discover pids (without the lock held — discovery may shell out)
         let (support_dir_override, pid_override) = {
             let guard = self.inner.lock().unwrap();
-            (guard.support_dir_override.clone(), guard.pid_override.clone())
+            (
+                guard.support_dir_override.clone(),
+                guard.pid_override.clone(),
+            )
         };
 
         let pids: Vec<(String, i32)> = match pid_override {
@@ -354,7 +358,9 @@ fn parse_launchctl_pid(stdout: &str) -> Option<i32> {
         // Guard: only accept the bare-key form when the next char is `=` or
         // whitespace, so we don't grab e.g. `pidsignal = 9`.
         let rest_new = rest_new.filter(|tail| {
-            tail.chars().next().map_or(false, |c| c == '=' || c.is_whitespace())
+            tail.chars()
+                .next()
+                .map_or(false, |c| c == '=' || c.is_whitespace())
         });
 
         let rest = rest_legacy.or(rest_new);
@@ -409,7 +415,9 @@ fn sample_processes(pids: &[(String, i32)]) -> Vec<ProcessBreakdown> {
         };
 
         let du = after.pti_total_user.saturating_sub(before.pti_total_user) as f64;
-        let ds = after.pti_total_system.saturating_sub(before.pti_total_system) as f64;
+        let ds = after
+            .pti_total_system
+            .saturating_sub(before.pti_total_system) as f64;
         let cpu_ns = du + ds;
         let cpu_percent = if elapsed_ns > 0.0 {
             ((cpu_ns / (elapsed_ns * cores)) * 100.0) as f32
@@ -423,7 +431,10 @@ fn sample_processes(pids: &[(String, i32)]) -> Vec<ProcessBreakdown> {
 
         // Best-effort: prefer the OS-reported short name, fall back to the
         // discovery label.
-        let display_name = proc_pid::name(pid).ok().filter(|s| !s.is_empty()).unwrap_or(name);
+        let display_name = proc_pid::name(pid)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(name);
 
         out.push(ProcessBreakdown {
             name: display_name,
@@ -554,14 +565,20 @@ fn map_pmset_therm(stdout: &str) -> ThermalState {
 // ---------------------------------------------------------------------------
 
 /// Consensus-fix C5 (interim): replacing `pmset` shellout with
-/// `IOPSCopyPowerSourcesInfo` is the long-term goal (issue #32 follow-up),
-/// but until that lands we ship a fail-closed parse: any unrecognised /
-/// localised pmset output reports `(on_battery: true, low_power: true)`,
-/// which makes the scheduler's `allowHeavyWork` conservatively block
-/// rather than letting Whisper run wide-open on a non-English Mac.
+/// `IOPSCopyPowerSourcesInfo` is the long-term goal (issue #32 follow-up).
 ///
-/// Each fallback emits a `tracing::warn!` so the conservative branch is
-/// observable in logs.
+/// Mixed fail-closed/fail-open policy:
+/// - `on_battery` fails closed (default `true`) when parsing fails — the
+///   scheduler treats unknown power state as battery to avoid running heavy
+///   ML wide-open on a non-English Mac. `pmset -g batt` still works on
+///   macOS 26.3, so this branch is unchanged.
+/// - `low_power` fails OPEN (default `false`) when parsing fails. This field
+///   is observational only — used for the Activity tab Resources card.
+///   Swift's `ProcessingGateReporter` reads
+///   `ProcessInfo.isLowPowerModeEnabled` for the actual gate decision.
+///   Issue #49: macOS 15+ renamed `lowpowermode` → `powermode`, so the
+///   legacy parse failed every ~3s. The WARN is now rate-limited to
+///   once-per-process via `warn_low_power_parse_once`.
 fn sample_power() -> (bool, bool) {
     let on_battery = match Command::new("pmset").args(["-g", "batt"]).output() {
         Ok(o) if o.status.success() => {
@@ -592,24 +609,41 @@ fn sample_power() -> (bool, bool) {
             match parse_low_power_safe(&s) {
                 Some(v) => v,
                 None => {
-                    tracing::warn!(
-                        component = "activity.resources.power",
-                        "pmset -g output missing lowpowermode — failing closed (low_power=true)"
+                    warn_low_power_parse_once(
+                        "pmset -g output missing powermode/lowpowermode — failing open (low_power=false). Real gate uses Swift ProcessInfo.isLowPowerModeEnabled.",
                     );
-                    true
+                    // Fail open: this field is observational for the Activity tab
+                    // Resources card. Swift's ProcessingGateReporter reads
+                    // ProcessInfo.isLowPowerModeEnabled for the actual gate decision.
+                    false
                 }
             }
         }
         other => {
-            tracing::warn!(
-                component = "activity.resources.power",
-                status = ?other.as_ref().map(|o| o.status),
-                "pmset -g failed — failing closed (low_power=true)"
+            warn_low_power_parse_once(
+                &format!(
+                    "pmset -g failed (status={:?}) — failing open (low_power=false). Real gate uses Swift ProcessInfo.isLowPowerModeEnabled.",
+                    other.as_ref().map(|o| o.status)
+                ),
             );
-            true
+            // Fail open: see comment above.
+            false
         }
     };
     (on_battery, low_power)
+}
+
+/// Emit the low-power parse-failure warning at most once per process.
+/// Without this guard the WARN fires every ~3s on macOS 15+ where the
+/// pmset key was renamed from `lowpowermode` to `powermode` (issue #49).
+fn warn_low_power_parse_once(msg: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        tracing::warn!(component = "activity.resources.power", "{}", msg);
+    }
 }
 
 /// Parse the first line of `pmset -g batt`. Returns `None` (→ fail-closed)
@@ -627,31 +661,56 @@ fn parse_on_battery_safe(stdout: &str) -> Option<bool> {
     None
 }
 
-/// Parse `pmset -g` for `lowpowermode N`. Returns `None` (→ fail-closed)
-/// when the key is absent.
+/// Parse `pmset -g` for the power-mode field. Returns `None` when neither
+/// key is present (caller decides fail-open vs fail-closed).
+///
+/// macOS 15 (Sequoia) and 26 (Tahoe) renamed `lowpowermode` → `powermode`
+/// and widened it to a tri-state:
+///
+/// * `powermode 0` = Automatic / normal
+/// * `powermode 1` = Low Power Mode
+/// * `powermode 2` = High Power Mode (MBP 16" M-series only)
+///
+/// Older macOS still emits `lowpowermode 0` / `lowpowermode 1`.
+///
+/// We prefer the new key when both appear so a transitional pmset (or a
+/// bug Apple hasn't shipped yet) doesn't fool us with stale legacy data.
+/// Only `powermode 1` counts as low power — `powermode 2` is high power
+/// and must not light up the "Low Power" indicator.
 fn parse_low_power_safe(stdout: &str) -> Option<bool> {
+    let mut legacy: Option<bool> = None;
     for line in stdout.lines() {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix("lowpowermode") {
+        // Try the new key first; if both appear we trust `powermode`.
+        if let Some(rest) = l.strip_prefix("powermode") {
             let rest = rest.trim_start_matches([' ', '=']).trim();
             if let Ok(v) = rest.parse::<u32>() {
-                return Some(v != 0);
+                return Some(v == 1);
+            }
+        } else if let Some(rest) = l.strip_prefix("lowpowermode") {
+            let rest = rest.trim_start_matches([' ', '=']).trim();
+            if let Ok(v) = rest.parse::<u32>() {
+                legacy = Some(v != 0);
             }
         }
     }
-    None
+    legacy
 }
 
-// Legacy non-safe wrappers retained for the unit tests asserting the
-// fail-closed default (None → true).
+// Legacy non-safe wrappers retained for the unit tests asserting default
+// behaviour. on_battery still fails closed (None → true); low_power now
+// fails open (None → false) per issue #49.
 #[cfg(test)]
 fn parse_on_battery(stdout: &str) -> bool {
     parse_on_battery_safe(stdout).unwrap_or(true)
 }
 
+// Issue #49: low-power now fails open (the field is observational; Swift's
+// ProcessInfo.isLowPowerModeEnabled is the real gate). Legacy on-battery
+// still fails closed since `pmset -g batt` works on macOS 26.3.
 #[cfg(test)]
 fn parse_low_power(stdout: &str) -> bool {
-    parse_low_power_safe(stdout).unwrap_or(true)
+    parse_low_power_safe(stdout).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -787,21 +846,58 @@ mod tests {
         assert_eq!(parse_on_battery_safe("Source: 'Réseau'"), None);
     }
 
+    /// Legacy macOS (≤14) emits `lowpowermode N`. Keep parsing it.
     #[test]
     fn parses_low_power_mode() {
-        assert_eq!(parse_low_power_safe(" lowpowermode         1\n other line"), Some(true));
-        assert_eq!(parse_low_power_safe(" lowpowermode         0\n other line"), Some(false));
-        // Missing → None (caller fails closed).
+        assert_eq!(
+            parse_low_power_safe(" lowpowermode         1\n other line"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_low_power_safe(" lowpowermode         0\n other line"),
+            Some(false)
+        );
+        // Missing → None (caller decides default).
         assert_eq!(parse_low_power_safe("nothing here"), None);
     }
 
-    /// Consensus-fix C5: when the parse fails, `sample_power` MUST report
-    /// `(true, true)` — failing closed prevents heavy ML from running on
-    /// battery just because pmset spoke a different language.
+    /// Issue #49: macOS 15 (Sequoia) and 26 (Tahoe) renamed the field to
+    /// `powermode` and widened it to a tri-state. Only `1` is Low Power;
+    /// `2` is High Power and must NOT light the LPM indicator.
     #[test]
-    fn unrecognised_pmset_output_fails_closed() {
-        assert!(parse_on_battery("nothing useful")); // legacy wrapper
-        assert!(parse_low_power("nothing useful")); // legacy wrapper
+    fn parses_powermode_mac15() {
+        assert_eq!(
+            parse_low_power_safe(" powermode            1\n other"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_low_power_safe(" powermode            0\n other"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_low_power_safe(" powermode            2\n other"),
+            Some(false)
+        );
+    }
+
+    /// During the OS upgrade transition Apple could ship a build that emits
+    /// both keys. Trust the new one.
+    #[test]
+    fn prefers_powermode_when_both_present() {
+        let stdout = " lowpowermode         1\n powermode            0\n";
+        assert_eq!(parse_low_power_safe(stdout), Some(false));
+        let stdout2 = " powermode            1\n lowpowermode         0\n";
+        assert_eq!(parse_low_power_safe(stdout2), Some(true));
+    }
+
+    /// Issue #49: low-power now fails OPEN — the field is observational
+    /// (Activity tab Resources card only). Swift's
+    /// ProcessInfo.isLowPowerModeEnabled is the actual gate. on_battery
+    /// still fails closed because `pmset -g batt` works on macOS 26.3.
+    #[test]
+    fn unrecognised_pmset_output_fails_open() {
+        assert!(parse_on_battery("nothing useful")); // legacy wrapper, still fail-closed
+        assert!(!parse_low_power("nothing useful")); // legacy wrapper, now fail-open
     }
 
     #[test]
