@@ -77,7 +77,7 @@ actor RewindIndexer {
         // Generate structured summaries (title/overview/emoji/category) for
         // finished conversations that were recorded before the local extraction
         // pipeline was wired.  Idempotent; guarded by
-        // UserDefaults flag "conversationSummaryBackfillCompleted_v1".
+        // UserDefaults flag "conversationSummaryBackfillCompleted_v2".
         Task(priority: .background) {
             await ConversationSummaryBackfillService.shared.runIfNeeded()
         }

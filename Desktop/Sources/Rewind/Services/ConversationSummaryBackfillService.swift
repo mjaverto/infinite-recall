@@ -10,9 +10,10 @@ import GRDB
 /// title/overview and appear as "Untitled Conversation" in the list.
 ///
 /// Idempotency guarantee: the UserDefaults flag
-/// `conversationSummaryBackfillCompleted_v1` is set only after 3 consecutive
+/// `conversationSummaryBackfillCompleted_v2` is set only after 3 consecutive
 /// empty queries confirm there is nothing left to process.  Running this 100
-/// times is safe.
+/// times is safe. v2 intentionally re-runs on machines where an earlier broken
+/// v1 attempt marked completion before local summaries were reliably generated.
 ///
 /// Battery awareness: the loop only runs when
 /// `BatteryAwareScheduler.shared.allowHeavyWork` is true.  If the machine is
@@ -21,7 +22,7 @@ import GRDB
 actor ConversationSummaryBackfillService {
     static let shared = ConversationSummaryBackfillService()
 
-    private static let userDefaultsKey = "conversationSummaryBackfillCompleted_v1"
+    private static let userDefaultsKey = "conversationSummaryBackfillCompleted_v2"
     /// Nanoseconds to sleep between individual LLM calls (~1 s).
     private static let throttleNanoseconds: UInt64 = 1_000_000_000
     /// Minimum total transcript length (chars) to bother summarizing.
@@ -40,7 +41,7 @@ actor ConversationSummaryBackfillService {
     /// machine lacks headroom to run heavy work.
     func runIfNeeded() async {
         guard !UserDefaults.standard.bool(forKey: Self.userDefaultsKey) else {
-            log("ConversationSummaryBackfillService: already complete (v1), skipping")
+            log("ConversationSummaryBackfillService: already complete (v2), skipping")
             return
         }
 
@@ -56,6 +57,39 @@ actor ConversationSummaryBackfillService {
             try await backfillLoop(startTime: startTime)
         } catch {
             logError("ConversationSummaryBackfillService: backfill loop failed, will retry next launch", error: error)
+        }
+    }
+
+    /// Mark the historical backfill as incomplete. Used when launch recovery
+    /// turns stale `recording` rows into finished conversations after a prior
+    /// empty scan, or when live summarization defers work.
+    func markBackfillNeeded(reason: String) {
+        UserDefaults.standard.set(false, forKey: Self.userDefaultsKey)
+        log("ConversationSummaryBackfillService: marked backfill needed (\(reason))")
+    }
+
+    /// Summarize one just-finished session immediately instead of waiting for
+    /// the historical backfill lifecycle. Safe to call repeatedly: rows that
+    /// already have a title or overview are ignored.
+    func summarizeSessionIfNeeded(_ sessionId: Int64, reason: String) async {
+        guard await MainActor.run(body: { BatteryAwareScheduler.shared.allowHeavyWork }) else {
+            markBackfillNeeded(reason: "live summary deferred for session \(sessionId): heavy work not allowed")
+            log("ConversationSummaryBackfillService: live summary deferred for session \(sessionId) — heavy work not allowed (\(reason))")
+            return
+        }
+
+        do {
+            guard let row = try await fetchSession(id: sessionId, onlyIfNeedsSummary: true) else {
+                log("ConversationSummaryBackfillService: live summary skipped for session \(sessionId) — already summarized or missing (\(reason))")
+                return
+            }
+            let outcome = try await process(row: row, mode: "live \(reason)")
+            if case .deferred = outcome {
+                markBackfillNeeded(reason: "live summary deferred for session \(sessionId)")
+            }
+        } catch {
+            markBackfillNeeded(reason: "live summary error for session \(sessionId)")
+            logError("ConversationSummaryBackfillService: live summary failed for session \(sessionId)", error: error)
         }
     }
 
@@ -80,42 +114,63 @@ actor ConversationSummaryBackfillService {
 
             consecutiveEmpty = 0
 
-            let sessionId = row.id
-            let transcript = row.transcript
-
-            guard transcript.count >= Self.minTranscriptLength else {
-                log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), skipping with placeholder")
-                // Write a sentinel so it won't be re-selected on the next run.
-                try await writeBackPlaceholder(sessionId: sessionId)
+            let outcome = try await process(row: row, mode: "backfill")
+            switch outcome {
+            case .summarized:
+                totalProcessed += 1
+                // Throttle: give the LLM server a brief breather.
+                try await Task.sleep(nanoseconds: Self.throttleNanoseconds)
+            case .placeholder:
                 continue
+            case .deferred:
+                // Do not spin forever on the same row if the local LLM is
+                // offline or returned unparsable JSON. Leave it eligible and
+                // retry on the next launch/manual trigger.
+                log("ConversationSummaryBackfillService: deferred after LLM/parse failure; will retry later")
+                return
             }
-
-            log("ConversationSummaryBackfillService: summarizing session \(sessionId) (\(transcript.count) chars)")
-
-            guard let structured = await callLLM(transcript: transcript, sessionId: sessionId) else {
-                // LLM call failed or parse error — skip this row without marking
-                // it done so the next launch retries it.
-                log("ConversationSummaryBackfillService: skipping session \(sessionId) due to LLM/parse failure")
-                continue
-            }
-
-            try await writeBack(sessionId: sessionId, structured: structured)
-            totalProcessed += 1
-
-            log("ConversationSummaryBackfillService: session \(sessionId) → \"\(structured.title)\"")
-
-            // Notify the conversations list so the row updates without a manual refresh.
-            await MainActor.run {
-                NotificationCenter.default.post(name: .conversationsListNeedsRefresh, object: nil)
-            }
-
-            // Throttle: give the LLM server a brief breather.
-            try await Task.sleep(nanoseconds: Self.throttleNanoseconds)
         }
 
         let elapsed = Date().timeIntervalSince(startTime)
         UserDefaults.standard.set(true, forKey: Self.userDefaultsKey)
         log(String(format: "ConversationSummaryBackfillService: complete — %d rows in %.1fs", totalProcessed, elapsed))
+    }
+
+    private enum ProcessOutcome {
+        case summarized
+        case placeholder
+        case deferred
+    }
+
+    private func process(row: PendingSession, mode: String) async throws -> ProcessOutcome {
+        let sessionId = row.id
+        let transcript = row.transcript
+
+        guard transcript.count >= Self.minTranscriptLength else {
+            log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), writing placeholder (\(mode))")
+            // Write a sentinel so it won't be re-selected on the next run.
+            try await writeBackPlaceholder(sessionId: sessionId)
+            await notifyConversationListNeedsRefresh()
+            return .placeholder
+        }
+
+        log("ConversationSummaryBackfillService: summarizing session \(sessionId) (\(transcript.count) chars, \(mode))")
+
+        guard let structured = await callLLM(transcript: transcript, sessionId: sessionId) else {
+            log("ConversationSummaryBackfillService: session \(sessionId) summary deferred due to LLM/parse failure (\(mode))")
+            return .deferred
+        }
+
+        try await writeBack(sessionId: sessionId, structured: structured)
+        log("ConversationSummaryBackfillService: session \(sessionId) → \"\(structured.title)\" (\(mode))")
+        await notifyConversationListNeedsRefresh()
+        return .summarized
+    }
+
+    private func notifyConversationListNeedsRefresh() async {
+        await MainActor.run {
+            NotificationCenter.default.post(name: .conversationsListNeedsRefresh, object: nil)
+        }
     }
 
     // MARK: - Database helpers
@@ -151,7 +206,29 @@ actor ConversationSummaryBackfillService {
             return nil
         }
 
-        // Step 2: assemble transcript from segments, stripping WhisperKit tokens.
+        return try await fetchSession(id: sessionId, onlyIfNeedsSummary: false)
+    }
+
+    private func fetchSession(id sessionId: Int64, onlyIfNeedsSummary: Bool) async throws -> PendingSession? {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw TranscriptionStorageError.databaseNotInitialized
+        }
+
+        if onlyIfNeedsSummary {
+            let needsSummarySQL = """
+                SELECT COUNT(*) FROM transcription_sessions
+                 WHERE id = ?
+                   AND finishedAt IS NOT NULL
+                   AND (title IS NULL OR title = '')
+                   AND (overview IS NULL OR overview = '')
+                """
+            let needsSummary = try await dbQueue.read { db in
+                try Int.fetchOne(db, sql: needsSummarySQL, arguments: [sessionId]) ?? 0
+            }
+            guard needsSummary > 0 else { return nil }
+        }
+
+        // Assemble transcript from segments, stripping WhisperKit tokens.
         let segmentSQL = """
             SELECT text FROM transcription_segments
              WHERE sessionId = ?
