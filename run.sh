@@ -22,6 +22,9 @@ Options (via environment variables):
   IR_PYTHON_API_URL="..."  Python backend URL (subscriptions, payments, etc; default: https://api.omi.me)
   IR_SIGN_IDENTITY="..."  Code signing identity (auto-detected if not set)
   IR_ENABLE_LOCAL_AUTOMATION=1  Enable agent-swift automation bridge
+  IR_ENABLE_APPLE_SIGNIN=1  Opt into Sign in with Apple entitlement (requires profile)
+  IR_PROVISIONING_PROFILE=/path/to/profile.provisionprofile
+                            Profile to embed when IR_ENABLE_APPLE_SIGNIN=1
 
 Required files:
   Backend-Rust/.env         Environment variables (copy from ../.env.example)
@@ -77,6 +80,30 @@ unset TOOLCHAINS
 SCRIPT_START_TIME=$(date +%s.%N)
 STEP_START_TIME=$SCRIPT_START_TIME
 
+TEMP_FILES=()
+BACKEND_PID=""
+AUTH_PID=""
+TUNNEL_PID=""
+
+cleanup() {
+    if [ -n "${TUNNEL_PID:-}" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        echo "Stopping tunnel (PID: $TUNNEL_PID)..."
+        kill "$TUNNEL_PID" 2>/dev/null || true
+    fi
+    if [ -n "${AUTH_PID:-}" ] && kill -0 "$AUTH_PID" 2>/dev/null; then
+        echo "Stopping auth service (PID: $AUTH_PID)..."
+        kill "$AUTH_PID" 2>/dev/null || true
+    fi
+    if [ -n "${BACKEND_PID:-}" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+        echo "Stopping backend (PID: $BACKEND_PID)..."
+        kill "$BACKEND_PID" 2>/dev/null || true
+    fi
+    if [ "${#TEMP_FILES[@]}" -gt 0 ]; then
+        rm -f "${TEMP_FILES[@]}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 step() {
     local now=$(date +%s.%N)
     local step_elapsed=$(echo "$now - $STEP_START_TIME" | bc)
@@ -92,6 +119,264 @@ substep() {
     local now=$(date +%s.%N)
     local total_elapsed=$(echo "$now - $SCRIPT_START_TIME" | bc)
     printf "[%6.1fs]   ├─ %s\n" "$total_elapsed" "$1"
+}
+
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+make_temp_file() {
+    local var_name="$1"
+    local template="$2"
+    local file
+    file="$(mktemp "${TMPDIR:-/tmp}/${template}.XXXXXX")" || exit 1
+    TEMP_FILES+=("$file")
+    printf -v "$var_name" '%s' "$file"
+}
+
+plist_set_string() {
+    local plist_path="$1"
+    local key="$2"
+    local value="$3"
+    /usr/libexec/PlistBuddy -c "Set :$key $value" "$plist_path" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :$key string $value" "$plist_path"
+}
+
+make_local_dev_entitlements() {
+    local source="$1"
+    local dest="$2"
+    cp "$source" "$dest"
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.applesignin" "$dest" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.application-identifier" "$dest" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.team-identifier" "$dest" 2>/dev/null || true
+}
+
+make_apple_signin_entitlements() {
+    local source="$1"
+    local dest="$2"
+    local application_identifier="$3"
+    local team_id="$4"
+
+    cp "$source" "$dest"
+    plist_set_string "$dest" "com.apple.application-identifier" "$application_identifier"
+    plist_set_string "$dest" "com.apple.developer.team-identifier" "$team_id"
+}
+
+resolve_apple_signin_profile() {
+    if [ -n "${IR_PROVISIONING_PROFILE:-}" ]; then
+        printf '%s\n' "$IR_PROVISIONING_PROFILE"
+    elif [ -f "Desktop/embedded-dev.provisionprofile" ]; then
+        printf '%s\n' "Desktop/embedded-dev.provisionprofile"
+    elif [ -f "Desktop/embedded.provisionprofile" ]; then
+        printf '%s\n' "Desktop/embedded.provisionprofile"
+    fi
+    return 0
+}
+
+apple_signin_profile_error() {
+    echo ""
+    echo "ERROR: IR_ENABLE_APPLE_SIGNIN=1 requires a provisioning profile."
+    echo "       Set IR_PROVISIONING_PROFILE=/path/to/profile.provisionprofile"
+    echo "       or add Desktop/embedded-dev.provisionprofile."
+    echo ""
+    echo "       For normal local development, unset IR_ENABLE_APPLE_SIGNIN;"
+    echo "       ./run.sh --yolo will sign with local/dev entitlements instead."
+    echo ""
+}
+
+resolve_sign_identity() {
+    if [ -n "$SIGN_IDENTITY" ]; then
+        return 0
+    fi
+
+    # For dev builds: prefer Apple Development (matches Mac Development provisioning profile,
+    # required for native Sign In with Apple). Fall back to Developer ID if unavailable.
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/')
+    if [ -z "$SIGN_IDENTITY" ]; then
+        SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+}
+
+resolve_sign_identity_team_id() {
+    local identity="$1"
+    local line=""
+    local identity_hash=""
+    local identity_name=""
+    local team_id=""
+
+    while IFS= read -r line; do
+        identity_hash=$(printf '%s\n' "$line" | awk '{print $2}')
+        identity_name=$(printf '%s\n' "$line" | sed -n 's/.*"\(.*\)".*/\1/p')
+        if [ "$identity" = "$identity_hash" ] || [ "$identity" = "$identity_name" ]; then
+            team_id=$(printf '%s\n' "$identity_name" | sed -n 's/.*(\([A-Z0-9][A-Z0-9]*\)).*/\1/p')
+            if [ -n "$team_id" ]; then
+                printf '%s\n' "$team_id"
+                return 0
+            fi
+        fi
+    done < <(security find-identity -v -p codesigning 2>/dev/null || true)
+
+    printf '%s\n' "$identity" | sed -n 's/.*(\([A-Z0-9][A-Z0-9]*\)).*/\1/p'
+}
+
+sign_identity_error() {
+    echo ""
+    echo "ERROR: No signing identity found. Ad-hoc signing causes macOS to reset"
+    echo "       Screen Recording permissions for ALL Omi apps (including prod/beta)."
+    echo ""
+    echo "  Fix: Install an Apple Development certificate in Keychain Access,"
+    echo "       or set IR_SIGN_IDENTITY to a valid identity:"
+    echo "       IR_SIGN_IDENTITY=\"Apple Development: you@example.com\" ./run.sh"
+    echo ""
+}
+
+validate_apple_signin_profile() {
+    local profile_path="$1"
+    local profile_plist=""
+    local profile_decode_error=""
+    local profile_validation_info=""
+    local identity_team_id=""
+    local tab=""
+    local key=""
+    local value=""
+
+    make_temp_file profile_plist "omi-dev-profile"
+    make_temp_file profile_decode_error "omi-dev-profile-decode-error"
+    make_temp_file profile_validation_info "omi-dev-profile-info"
+
+    identity_team_id=$(resolve_sign_identity_team_id "$SIGN_IDENTITY")
+    if [ -z "$identity_team_id" ]; then
+        echo "ERROR: IR_ENABLE_APPLE_SIGNIN=1 could not determine the signing identity team ID for: $SIGN_IDENTITY"
+        exit 1
+    fi
+
+    if ! security cms -D -i "$profile_path" > "$profile_plist" 2>"$profile_decode_error"; then
+        echo "ERROR: IR_ENABLE_APPLE_SIGNIN=1 but provisioning profile could not be decoded with security cms -D: $profile_path"
+        if [ -s "$profile_decode_error" ]; then
+            sed 's/^/       /' "$profile_decode_error"
+        fi
+        exit 1
+    fi
+
+    if ! python3 - "$profile_path" "$profile_plist" "$BUNDLE_ID" "$identity_team_id" > "$profile_validation_info" <<'PY'
+import plistlib
+import sys
+
+profile_path, plist_path, bundle_id, identity_team_id = sys.argv[1:5]
+
+
+def fail(message):
+    print(f"ERROR: IR_ENABLE_APPLE_SIGNIN=1 {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def normalized_string_list(value):
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str) and item]
+    return []
+
+
+def csv(values):
+    return ", ".join(values) if values else "<none>"
+
+
+def bundle_matches_profile_pattern(pattern, actual_bundle_id):
+    if pattern == actual_bundle_id:
+        return True
+    if "*" not in pattern:
+        return False
+    # Apple wildcard App IDs are suffix wildcards, e.g. TEAMID.* or TEAMID.com.example.*.
+    # Treat other wildcard placements as invalid rather than over-matching.
+    if pattern == "*":
+        return True
+    if not pattern.endswith("*"):
+        return False
+    prefix = pattern[:-1]
+    return actual_bundle_id.startswith(prefix) and len(actual_bundle_id) > len(prefix)
+
+try:
+    with open(plist_path, "rb") as fh:
+        profile = plistlib.load(fh)
+except Exception as exc:
+    fail(f"profile decoded from {profile_path!r} is not a valid plist: {exc}")
+
+team_ids = normalized_string_list(profile.get("TeamIdentifier"))
+if not team_ids:
+    fail("profile is missing a valid TeamIdentifier array")
+team_ids = list(dict.fromkeys(team_ids))
+
+entitlements = profile.get("Entitlements")
+if not isinstance(entitlements, dict):
+    fail("profile is missing an Entitlements dictionary")
+
+application_identifier = (
+    entitlements.get("com.apple.application-identifier")
+    or entitlements.get("application-identifier")
+)
+if not isinstance(application_identifier, str) or "." not in application_identifier:
+    fail("profile is missing a valid Entitlements application identifier")
+
+application_team_id, bundle_pattern = application_identifier.split(".", 1)
+team_identifier_entitlement = entitlements.get("com.apple.developer.team-identifier")
+apple_signin_values = normalized_string_list(entitlements.get("com.apple.developer.applesignin"))
+
+if identity_team_id not in team_ids:
+    fail(
+        "profile TeamIdentifier entries "
+        f"({csv(team_ids)}) do not include signing identity team ({identity_team_id})"
+    )
+if application_team_id != identity_team_id:
+    fail(
+        "profile application identifier team "
+        f"({application_team_id}) does not match signing identity team ({identity_team_id})"
+    )
+if application_team_id not in team_ids:
+    fail(
+        "profile application identifier team "
+        f"({application_team_id}) is not present in TeamIdentifier ({csv(team_ids)})"
+    )
+if isinstance(team_identifier_entitlement, str) and team_identifier_entitlement != identity_team_id:
+    fail(
+        "profile com.apple.developer.team-identifier "
+        f"({team_identifier_entitlement}) does not match signing identity team ({identity_team_id})"
+    )
+if "Default" not in apple_signin_values:
+    fail(
+        "profile Entitlements must include com.apple.developer.applesignin with Default "
+        f"(got {csv(apple_signin_values)})"
+    )
+if not bundle_matches_profile_pattern(bundle_pattern, bundle_id):
+    fail(
+        "profile application identifier "
+        f"({application_identifier}) does not match bundle id ({bundle_id})"
+    )
+
+print(f"PROFILE_TEAM_ID\t{identity_team_id}")
+print(f"PROFILE_APPLICATION_IDENTIFIER\t{application_identifier}")
+print(f"SIGNED_APPLICATION_IDENTIFIER\t{identity_team_id}.{bundle_id}")
+PY
+    then
+        exit 1
+    fi
+
+    tab=$(printf '\t')
+    while IFS="$tab" read -r key value; do
+        case "$key" in
+            PROFILE_TEAM_ID) APPLE_SIGNIN_PROFILE_TEAM_ID="$value" ;;
+            PROFILE_APPLICATION_IDENTIFIER) APPLE_SIGNIN_PROFILE_APP_IDENTIFIER="$value" ;;
+            SIGNED_APPLICATION_IDENTIFIER) APPLE_SIGNIN_SIGNED_APP_IDENTIFIER="$value" ;;
+        esac
+    done < "$profile_validation_info"
+
+    if [ -z "$APPLE_SIGNIN_PROFILE_TEAM_ID" ] || [ -z "$APPLE_SIGNIN_SIGNED_APP_IDENTIFIER" ]; then
+        echo "ERROR: IR_ENABLE_APPLE_SIGNIN=1 failed to extract required entitlements from: $profile_path"
+        exit 1
+    fi
 }
 
 # App configuration
@@ -125,6 +410,19 @@ APP_DESKTOP_PATH="$HOME/Desktop/$APP_NAME.app"
 APP_DOWNLOADS_PATH="$HOME/Downloads/$APP_NAME.app"
 SIGN_IDENTITY="${IR_SIGN_IDENTITY:-}"
 URL_SCHEME="${IR_URL_SCHEME:-$EXPECTED_URL_SCHEME}"
+ENABLE_APPLE_SIGNIN=false
+is_truthy "${IR_ENABLE_APPLE_SIGNIN:-0}" && ENABLE_APPLE_SIGNIN=true
+APPLE_SIGNIN_PROFILE_SOURCE=""
+APPLE_SIGNIN_PROFILE_TEAM_ID=""
+APPLE_SIGNIN_PROFILE_APP_IDENTIFIER=""
+APPLE_SIGNIN_SIGNED_APP_IDENTIFIER=""
+if [ "$ENABLE_APPLE_SIGNIN" = true ]; then
+    APPLE_SIGNIN_PROFILE_SOURCE="$(resolve_apple_signin_profile)"
+    if [ -z "$APPLE_SIGNIN_PROFILE_SOURCE" ] || [ ! -f "$APPLE_SIGNIN_PROFILE_SOURCE" ]; then
+        apple_signin_profile_error
+        exit 1
+    fi
+fi
 
 if [ "$BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]; then
     echo "ERROR: APP_NAME '$APP_NAME' must use bundle ID '$EXPECTED_BUNDLE_ID' (got '$BUNDLE_ID')"
@@ -135,6 +433,18 @@ if [ "$URL_SCHEME" != "$EXPECTED_URL_SCHEME" ]; then
     echo "ERROR: APP_NAME '$APP_NAME' must use URL scheme '$EXPECTED_URL_SCHEME' (got '$URL_SCHEME')"
     exit 1
 fi
+
+# Resolve signing identity before expensive backend/build/bundle work so opt-in
+# provisioning profile issues fail fast.
+resolve_sign_identity
+if [ -z "$SIGN_IDENTITY" ]; then
+    sign_identity_error
+    exit 1
+fi
+if [ "$ENABLE_APPLE_SIGNIN" = true ]; then
+    validate_apple_signin_profile "$APPLE_SIGNIN_PROFILE_SOURCE"
+fi
+
 AUTOMATION_ARGS=()
 if [ "${IR_ENABLE_LOCAL_AUTOMATION:-0}" = "1" ]; then
     AUTOMATION_PORT="${IR_AUTOMATION_PORT:-47777}"
@@ -144,28 +454,8 @@ fi
 # Backend configuration (Rust)
 BACKEND_DIR="$(cd "$(dirname "$0")/Backend-Rust" && pwd)"
 AUTH_DIR="$(cd "$(dirname "$0")/Auth-Python" && pwd)"
-BACKEND_PID=""
-AUTH_PID=""
-TUNNEL_PID=""
 TUNNEL_URL="${TUNNEL_URL:-}"
 AUTH_PORT="${AUTH_PORT:-10200}"
-
-# Cleanup function to stop backend, auth, and tunnel on exit
-cleanup() {
-    if [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        echo "Stopping tunnel (PID: $TUNNEL_PID)..."
-        kill "$TUNNEL_PID" 2>/dev/null || true
-    fi
-    if [ -n "$AUTH_PID" ] && kill -0 "$AUTH_PID" 2>/dev/null; then
-        echo "Stopping auth service (PID: $AUTH_PID)..."
-        kill "$AUTH_PID" 2>/dev/null || true
-    fi
-    if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
-        echo "Stopping backend (PID: $BACKEND_PID)..."
-        kill "$BACKEND_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
 
 AUTH_DEBUG_LOG=/private/tmp/auth-debug.log
 rm -f $AUTH_DEBUG_LOG
@@ -568,19 +858,14 @@ cp -f omi_icon.icns "$APP_BUNDLE/Contents/Resources/OmiIcon.icns" 2>/dev/null ||
 substep "Creating PkgInfo"
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
-# Embed provisioning profile (required for Sign In with Apple entitlement).
-# Named bundles skip this — the profile is bundle-specific to com.omi.desktop-dev,
-# embedding it in a different bundle ID causes RBSRequestErrorDomain Code=5.
-if [ "$IS_NAMED_BUNDLE" = false ]; then
-    if [ -f "Desktop/embedded-dev.provisionprofile" ]; then
-        substep "Embedding dev provisioning profile"
-        cp "Desktop/embedded-dev.provisionprofile" "$APP_BUNDLE/Contents/embedded.provisionprofile"
-    elif [ -f "Desktop/embedded.provisionprofile" ]; then
-        substep "Embedding provisioning profile"
-        cp "Desktop/embedded.provisionprofile" "$APP_BUNDLE/Contents/embedded.provisionprofile"
-    fi
+# Embed provisioning profile only when restricted Sign in with Apple is requested.
+# Default local/dev builds intentionally avoid restricted Apple capabilities so
+# clone-and-run works without a paid team provisioning profile.
+if [ "$ENABLE_APPLE_SIGNIN" = true ]; then
+    substep "Embedding provisioning profile for Sign in with Apple: $APPLE_SIGNIN_PROFILE_SOURCE"
+    cp "$APPLE_SIGNIN_PROFILE_SOURCE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
 else
-    substep "Named bundle ($BUNDLE_ID) — skipping provisioning profile"
+    substep "Local/dev signing — skipping provisioning profile and restricted Apple entitlements"
 fi
 
 auth_debug "BEFORE signing: $(defaults read "$BUNDLE_ID" auth_isSignedIn 2>&1 || true)"
@@ -592,18 +877,9 @@ chmod -R u+w "$APP_BUNDLE"
 xattr -cr "$APP_BUNDLE"
 
 step "Signing app with hardened runtime..."
-# Auto-detect a stable signing identity so TCC permissions persist across rebuilds.
+# A stable signing identity is resolved before expensive backend/build/bundle work.
 # Ad-hoc signing (--sign -) generates a new CDHash each build, causing macOS to
 # reset Screen Recording, Accessibility, and Notification permissions every time.
-if [ -z "$SIGN_IDENTITY" ]; then
-    # For dev builds: prefer Apple Development (matches Mac Development provisioning profile,
-    # required for native Sign In with Apple). Fall back to Developer ID if unavailable.
-    SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/')
-    if [ -z "$SIGN_IDENTITY" ]; then
-        SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
-    fi
-fi
-
 if [ -n "$SIGN_IDENTITY" ]; then
     substep "Using identity: $SIGN_IDENTITY"
     # Sparkle/CSSwiftProtobuf removed from Package.swift — no sign blocks needed.
@@ -624,50 +900,25 @@ if [ -n "$SIGN_IDENTITY" ]; then
         codesign --force --options runtime --entitlements Desktop/Node.entitlements --sign "$SIGN_IDENTITY" "$NODE_BIN"
     fi
 
-    # If local signing identity doesn't match embedded profile team, macOS rejects
-    # restricted entitlements (notably com.apple.developer.applesignin) and launch
-    # fails with RBS/launchd spawn errors. Fallback to a local dev entitlements set.
-    #
-    # Named bundles always use fallback — they have no provisioning profile, so
-    # com.apple.developer.applesignin would cause launchd to reject the launch.
-    EFFECTIVE_ENTITLEMENTS="Desktop/Omi.entitlements"
+    # Local/dev is the default: strip restricted Sign in with Apple so macOS
+    # does not reject clone-and-run builds that lack a matching profile.
+    EFFECTIVE_ENTITLEMENTS=""
     PROFILE_PATH="$APP_BUNDLE/Contents/embedded.provisionprofile"
-    USE_FALLBACK_ENTITLEMENTS=false
+    make_temp_file EFFECTIVE_ENTITLEMENTS "omi-local-dev-entitlements"
+    make_local_dev_entitlements "Desktop/Omi.entitlements" "$EFFECTIVE_ENTITLEMENTS"
 
-    if [ "$IS_NAMED_BUNDLE" = true ]; then
-        substep "Named bundle — stripping applesignin entitlement"
-        USE_FALLBACK_ENTITLEMENTS=true
-    elif [ -f "$PROFILE_PATH" ]; then
-        IDENTITY_TEAM_ID=$(echo "$SIGN_IDENTITY" | sed -n 's/.*(\([A-Z0-9]*\)).*/\1/p')
-        PROFILE_TEAM_ID=""
-        PROFILE_TEAM_ID=$(security cms -D -i "$PROFILE_PATH" > /tmp/omi-dev-profile.plist 2>/dev/null && \
-            /usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" /tmp/omi-dev-profile.plist 2>/dev/null || true)
-        if [ -z "$PROFILE_TEAM_ID" ]; then
-            substep "Could not extract profile team ID (security cms failed); using local entitlements fallback"
-            USE_FALLBACK_ENTITLEMENTS=true
-        elif [ "$PROFILE_TEAM_ID" != "$IDENTITY_TEAM_ID" ]; then
-            substep "Profile team ($PROFILE_TEAM_ID) != identity team ($IDENTITY_TEAM_ID); using local entitlements fallback"
-            USE_FALLBACK_ENTITLEMENTS=true
-        fi
-    fi
-
-    if [ "$USE_FALLBACK_ENTITLEMENTS" = true ]; then
-        cp Desktop/Omi.entitlements /tmp/omi-local-dev.entitlements
-        /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.applesignin" /tmp/omi-local-dev.entitlements 2>/dev/null || true
+    if [ "$ENABLE_APPLE_SIGNIN" = true ]; then
+        make_temp_file EFFECTIVE_ENTITLEMENTS "omi-apple-signin-entitlements"
+        make_apple_signin_entitlements "Desktop/Omi.entitlements" "$EFFECTIVE_ENTITLEMENTS" "$APPLE_SIGNIN_SIGNED_APP_IDENTIFIER" "$APPLE_SIGNIN_PROFILE_TEAM_ID"
+        substep "Using Sign in with Apple entitlements matched to $APPLE_SIGNIN_PROFILE_APP_IDENTIFIER"
+    else
         rm -f "$PROFILE_PATH"
-        EFFECTIVE_ENTITLEMENTS="/tmp/omi-local-dev.entitlements"
+        substep "Using local/dev entitlements (com.apple.developer.applesignin removed; set IR_ENABLE_APPLE_SIGNIN=1 to opt in)"
     fi
     substep "Signing app bundle"
     codesign --force --options runtime --entitlements "$EFFECTIVE_ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 else
-    echo ""
-    echo "ERROR: No signing identity found. Ad-hoc signing causes macOS to reset"
-    echo "       Screen Recording permissions for ALL Omi apps (including prod/beta)."
-    echo ""
-    echo "  Fix: Install an Apple Development certificate in Keychain Access,"
-    echo "       or set IR_SIGN_IDENTITY to a valid identity:"
-    echo "       IR_SIGN_IDENTITY=\"Apple Development: you@example.com\" ./run.sh"
-    echo ""
+    sign_identity_error
     exit 1
 fi
 

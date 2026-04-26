@@ -82,6 +82,17 @@ service — none of them are used.
 On first launch the app will ask for Screen Recording and Microphone permissions
 (macOS TCC). Grant both; the app cannot function without them.
 
+Local `run.sh` builds deliberately sign with dev/local entitlements only. Restricted
+Apple capabilities such as Sign in with Apple are omitted by default so a fresh
+clone can launch without a provisioning profile. To test that restricted mode,
+provide a matching profile explicitly:
+
+```bash
+IR_ENABLE_APPLE_SIGNIN=1 \
+IR_PROVISIONING_PROFILE=/path/to/profile.provisionprofile \
+./run.sh --yolo
+```
+
 ### Compile-check only (no launch)
 
 ```bash
