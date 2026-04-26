@@ -61,14 +61,21 @@ pub async fn run() -> Result<()> {
         Arc::new(activity::inflight::MemoryInflightRegistry::new());
     let resource_sampler: Arc<dyn activity::ResourceSampler> =
         Arc::new(activity::resources::SystemResourceSampler::new());
-    let processing_gate: Arc<dyn activity::ProcessingGate> =
-        Arc::new(activity::gate::AlwaysAllowedGate);
-    // Consensus-fix C4: leave a single, grep-able boot breadcrumb so anyone
-    // staring at the Activity tab can confirm we are still on the stub.
-    tracing::warn!(
-        component = "activity.gate",
-        "AlwaysAllowedGate active — real ProcessingGate not yet wired (issue #32)"
-    );
+    // Issue #32: real `ProcessingGate` implementation. Swift owns the OS
+    // signal observation and POSTs `GateState` updates to
+    // `/v1/activity/_internal/gate-state`. Until that first POST arrives,
+    // `current()` returns `Blocked { reason: Unwired, ... }` so the UI is
+    // honest about the brief startup window.
+    //
+    // Single backing Arc upcast into both the read-side (`ProcessingGate`)
+    // and the write-side (`WritableProcessingGate`) so the snapshot reader
+    // and the gate-state POST handler share the same RwLock<GateState>
+    // store. The trait split prevents a future `set()`-less gate from
+    // being silently wired into the write path.
+    let bridged_gate: Arc<activity::BridgedProcessingGate> =
+        Arc::new(activity::BridgedProcessingGate::new());
+    let processing_gate: Arc<dyn activity::ProcessingGate> = bridged_gate.clone();
+    let processing_gate_writer: Arc<dyn activity::WritableProcessingGate> = bridged_gate;
     let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
     // === /activity:A ===
 
@@ -81,6 +88,7 @@ pub async fn run() -> Result<()> {
         inflight,
         resource_sampler,
         processing_gate,
+        processing_gate_writer,
         pause_tx,
         // === /activity:A ===
     };

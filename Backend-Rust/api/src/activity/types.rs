@@ -108,10 +108,10 @@ pub enum BlockReason {
     Locked,
     /// User manually paused via the Activity tab.
     ManualPause,
-    /// The real `ProcessingGate` (issue #32) hasn't shipped yet —
-    /// `AlwaysAllowedGate` reports this so the UI can be honest about
-    /// the placeholder ("Activity gate not yet wired") instead of
-    /// falsely claiming `Allowed`. Removed when #32 lands.
+    /// Initial state before the first gate-state report from Swift
+    /// arrives. Should only be observed during the brief boot window
+    /// (~3s — one `ProcessingGateReporter` poll cycle). External POSTs
+    /// of this variant are rejected by `BridgedProcessingGate::set`.
     Unwired,
 }
 

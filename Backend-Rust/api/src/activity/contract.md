@@ -28,10 +28,12 @@ GET  /v1/activity/snapshot                  → 200 ActivitySnapshot
 POST /v1/activity/pause                     → 200 { "paused_until": "<iso8601>" }
 POST /v1/activity/resume                    → 204
 POST /v1/activity/_internal/inflight        → 204    (loopback only)
+POST /v1/activity/_internal/gate-state      → 204    (loopback only, issue #32)
 ```
 
-The `_internal/inflight` route is Swift→Rust loopback. Stream A SHOULD reject
-non-loopback peer addresses defensively in addition to bearer auth.
+The `_internal/*` routes are Swift→Rust loopback. The daemon binds to
+`127.0.0.1` only (`lib.rs`), so loopback is enforced by the listener; bearer
+auth still applies via the `authed` middleware.
 
 ---
 
@@ -154,6 +156,30 @@ the serde layer — `target` and `id` form a typed sum (`PauseTargetId`) so
 // Clearing the slot:
 { "kind": "transcribe", "in_flight": null }
 ```
+
+### `GateState` POST (Swift → Rust loopback, issue #32)
+
+The Swift `ProcessingGateReporter` polls OS signals (CGEvent idle seconds,
+screen lock state, power source / low-power-mode, thermal pressure) every
+~3s and POSTs the resulting `GateState` here when (and only when) the value
+changes. Body shape is exactly `GateState` — see above for both variants.
+
+```json
+// POST /v1/activity/_internal/gate-state
+// (Allowed)
+{ "state": "allowed", "since": "2026-04-26T14:25:00.000Z" }
+
+// (Blocked — every Blocked POST must include reason + waiting_for.)
+{ "state": "blocked",
+  "reason": "device_active",
+  "since": "2026-04-26T14:25:00.000Z",
+  "waiting_for": { "type": "idle_for", "duration_secs": 120 } }
+```
+
+`BridgedProcessingGate` (the production `ProcessingGate` impl) seeds itself
+with `Blocked { reason: "unwired", waiting_for: { "type": "manual" } }` on
+daemon startup and overwrites that on the first POST. The `unwired` window
+is typically ~3s.
 
 ---
 
