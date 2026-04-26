@@ -84,6 +84,22 @@ pub fn open_read_write_pool(path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
+/// Test-only in-memory pool. Used by `tests/activity_endpoints.rs` (Stream I)
+/// to construct an `AppState` without touching the on-disk Omi DB. Gated
+/// behind `activity_test_wiring` so it never compiles into release builds.
+#[cfg(any(test, feature = "activity_test_wiring"))]
+pub fn open_in_memory_pool() -> Result<SqlitePool> {
+    let manager = SqliteConnectionManager::memory();
+    let pool = Pool::builder()
+        .max_size(1)
+        .build(manager)
+        .context("building r2d2 in-memory pool")?;
+    let conn = pool.get().context("checking out initial in-memory connection")?;
+    conn.query_row("SELECT 1", [], |_| Ok(()))
+        .context("smoke-testing in-memory connection")?;
+    Ok(pool)
+}
+
 /// Helper: run a closure on a blocking thread with a pooled connection.
 /// Most rusqlite calls are blocking; we offload to the tokio blocking pool
 /// so the async runtime stays responsive. Works for both read and write

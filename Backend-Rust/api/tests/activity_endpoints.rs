@@ -80,7 +80,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
-use tower::ServiceExt; // brings `oneshot` onto Router
+use tower::util::ServiceExt; // brings `oneshot` onto Router
 
 use infinite_recall_api::activity::traits::{
     InflightRegistry, PauseStore, ProcessingGate, ResourceSampler,
@@ -232,13 +232,18 @@ fn make_state(
 ) -> AppState {
     let pool = infinite_recall_api::db::open_in_memory_pool()
         .expect("in-memory pool — Stream A should expose a test helper");
+    let write_pool = infinite_recall_api::db::open_in_memory_pool()
+        .expect("in-memory write pool");
+    let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
     AppState {
         pool,
+        write_pool,
         token: TEST_TOKEN.to_string(),
         pause_store,
         inflight,
         resource_sampler: sampler,
         processing_gate: gate,
+        pause_tx,
     }
 }
 
@@ -271,7 +276,6 @@ async fn json_body(resp: axum::response::Response) -> Value {
 /// §Verification step 6: snapshot returns the full shape with every field
 /// present and correctly typed.
 #[tokio::test]
-#[ignore = "stream-A: needs route handlers wired"]
 async fn snapshot_returns_200_with_full_shape() {
     let app = make_default_app();
     let (k, v) = auth_header();
@@ -349,7 +353,6 @@ async fn snapshot_returns_200_with_full_shape() {
 /// §Verification step 7: POST pause writes the row and returns
 /// `{paused_until: iso8601}`.
 #[tokio::test]
-#[ignore = "stream-A: needs pause handler wired (B's impl unnecessary — uses MemPauseStore)"]
 async fn pause_returns_paused_until() {
     let app = make_default_app();
     let (k, v) = auth_header();
@@ -377,7 +380,6 @@ async fn pause_returns_paused_until() {
 
 /// After a pause, the kind row in the snapshot reflects `paused_until`.
 #[tokio::test]
-#[ignore = "stream-A"]
 async fn paused_kind_visible_in_snapshot() {
     // Single AppState shared across the two requests so the pause persists.
     let pause_store: Arc<dyn PauseStore> = Arc::new(MemPauseStore::new());
@@ -430,7 +432,6 @@ async fn paused_kind_visible_in_snapshot() {
 /// Uses Stream B's `SqlPauseStore` directly — both lifecycles point at the
 /// same SQLite file path.
 #[tokio::test]
-#[ignore = "stream-B: needs SqlPauseStore + paused_work migration"]
 async fn pause_persists_across_restart() {
     use infinite_recall_api::activity::pause_store::SqlPauseStore;
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -461,7 +462,6 @@ async fn pause_persists_across_restart() {
 
 /// POST resume clears the pause row.
 #[tokio::test]
-#[ignore = "stream-A"]
 async fn resume_clears_pause() {
     let pause_store: Arc<dyn PauseStore> = Arc::new(MemPauseStore::new());
     let state = make_state(
@@ -493,7 +493,6 @@ async fn resume_clears_pause() {
 
 /// `_internal/inflight` updates the registry; subsequent snapshot reflects it.
 #[tokio::test]
-#[ignore = "stream-A + stream-D"]
 async fn inflight_loopback_round_trip() {
     let inflight: Arc<dyn InflightRegistry> = Arc::new(MemInflight::new());
     let state = make_state(
@@ -563,7 +562,6 @@ async fn inflight_loopback_round_trip() {
 
 /// Auth: missing bearer → 401.
 #[tokio::test]
-#[ignore = "stream-A: needs activity routes mounted under require_bearer"]
 async fn missing_bearer_returns_401() {
     let app = make_default_app();
     let req = Request::builder()
@@ -578,7 +576,6 @@ async fn missing_bearer_returns_401() {
 /// Bad pause body → 400 (or 422). Stream A picks the exact code; we accept
 /// any 4xx that signals client error.
 #[tokio::test]
-#[ignore = "stream-A"]
 async fn pause_request_validation() {
     let app = make_default_app();
     let (k, v) = auth_header();
