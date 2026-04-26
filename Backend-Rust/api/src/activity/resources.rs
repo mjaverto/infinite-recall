@@ -901,6 +901,53 @@ mod tests {
     }
 
     #[test]
+    fn malformed_powermode_value_returns_none() {
+        // Issue #49 hardening: future-proofing — if Apple ever ships
+        // `powermode High` (string instead of u32), we must not lie.
+        assert_eq!(parse_low_power_safe(" powermode  High\n"), None);
+        assert_eq!(parse_low_power_safe("powermode\n"), None);
+        assert_eq!(parse_low_power_safe("powermode -1\n"), None);
+    }
+
+    #[test]
+    fn malformed_powermode_falls_through_to_legacy() {
+        // If Apple ships a transitional pmset where `powermode` is garbage but
+        // legacy `lowpowermode` still emits, we must honour the legacy value.
+        assert_eq!(
+            parse_low_power_safe("powermode garbage\nlowpowermode 1\n"),
+            Some(true),
+        );
+        assert_eq!(
+            parse_low_power_safe("lowpowermode 1\npowermode garbage\n"),
+            Some(true),
+        );
+    }
+
+    /// Issue #49: real `pmset -g` output captured on macOS 26.3 (build 25D125),
+    /// M-series, AC power, LPM off. `powermode 0` must parse as Some(false).
+    #[test]
+    fn parses_real_mac26_pmset_g_fixture() {
+        const FIXTURE: &str = r#"System-wide power settings:
+Currently in use:
+ standby              1
+ Sleep On Power Button 1
+ SleepServices        0
+ hibernatefile        /var/vm/sleepimage
+ powernap             0
+ networkoversleep     0
+ disksleep            0
+ sleep                0
+ hibernatemode        3
+ ttyskeepawake        1
+ displaysleep         30
+ tcpkeepalive         1
+ powermode            0
+ womp                 1
+"#;
+        assert_eq!(parse_low_power_safe(FIXTURE), Some(false));
+    }
+
+    #[test]
     fn maps_thermal_levels() {
         assert!(matches!(map_thermal_level(0), ThermalState::Nominal));
         assert!(matches!(map_thermal_level(20), ThermalState::Fair));
