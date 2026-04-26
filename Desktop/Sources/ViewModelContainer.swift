@@ -112,6 +112,11 @@ class ViewModelContainer: ObservableObject {
 
             // Start screen activity sync to backend (Firestore + Pinecone)
             await ScreenActivitySyncService.shared.start()
+
+            // Start local-integration outbox drain so any pending webhook /
+            // filesystem deliveries left from a previous session begin
+            // retrying immediately on launch.
+            await LocalIntegrationDrainService.shared.start()
         }
 
         isLoading = false
