@@ -147,7 +147,7 @@ final class FloatingBarVoicePlaybackService: NSObject, AVAudioPlayerDelegate {
   private func resolvePlaybackMode() -> PlaybackMode {
     // TTS is now proxied through the backend — no client-side API key needed.
     // Fall back to system voice only if the backend URL is not configured.
-    guard getenv("OMI_API_URL") != nil else {
+    guard getenv("IR_API_URL") != nil else {
       return .systemFallback
     }
     let voiceID = ShortcutSettings.shared.selectedVoiceID
@@ -247,7 +247,7 @@ final class FloatingBarVoicePlaybackService: NSObject, AVAudioPlayerDelegate {
 
     // Without the backend URL the service falls back to the system voice, which
     // wouldn't demo the ElevenLabs voice anyway.
-    guard getenv("OMI_API_URL") != nil else {
+    guard getenv("IR_API_URL") != nil else {
       enqueueSystemSpeech(phrase)
       return
     }

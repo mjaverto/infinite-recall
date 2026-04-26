@@ -33,12 +33,12 @@ xcrun swift build -c debug --package-path Desktop
 **Full build + sign + launch:**
 
 ```bash
-OMI_APP_NAME="Infinite Recall" \
-OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
+IR_APP_NAME="Infinite Recall" \
+IR_SKIP_BACKEND=1 IR_SKIP_AUTH=1 IR_SKIP_TUNNEL=1 IR_SKIP_PYTHON=1 \
 ./run.sh --yolo
 ```
 
-The `OMI_SKIP_*` flags disable all inherited Omi cloud services. They must always
+The `IR_SKIP_*` flags disable all inherited Omi cloud services. They must always
 be set when building locally.
 
 **Backend-Rust (Cargo workspace — daemon + CLI):**

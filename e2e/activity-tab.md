@@ -29,8 +29,8 @@ TOKEN="$(cat "$HOME/Library/Application Support/InfiniteRecall/api-token.txt")"
 PORT=7331   # default; check INFINITE_RECALL_BIND if overridden
 
 # 4. Build + launch the Swift app
-OMI_APP_NAME="Infinite Recall" \
-  OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
+IR_APP_NAME="Infinite Recall" \
+  IR_SKIP_BACKEND=1 IR_SKIP_AUTH=1 IR_SKIP_TUNNEL=1 IR_SKIP_PYTHON=1 \
   ./run.sh --yolo
 ```
 

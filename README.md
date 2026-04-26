@@ -65,13 +65,13 @@ are pending merge.
 ### Build and launch
 
 ```bash
-OMI_APP_NAME="Infinite Recall" \
-OMI_SKIP_BACKEND=1 OMI_SKIP_AUTH=1 OMI_SKIP_TUNNEL=1 OMI_SKIP_PYTHON=1 \
+IR_APP_NAME="Infinite Recall" \
+IR_SKIP_BACKEND=1 IR_SKIP_AUTH=1 IR_SKIP_TUNNEL=1 IR_SKIP_PYTHON=1 \
 ./run.sh --yolo
 ```
 
-`OMI_APP_NAME` controls the `.app` bundle name so it does not collide with any
-existing Omi install. The `OMI_SKIP_*` flags disable every inherited Omi cloud
+`IR_APP_NAME` controls the `.app` bundle name so it does not collide with any
+existing Omi install. The `IR_SKIP_*` flags disable every inherited Omi cloud
 service — none of them are used.
 
 > **Note on `--yolo`:** The `--yolo` shortcut was inherited from Omi and its

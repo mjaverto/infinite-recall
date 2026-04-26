@@ -22,8 +22,8 @@ import {
   summarizeInput,
   appendAudit,
   __resetAuditWarnedForTest,
-  OMI_TOOLS,
-  OMI_TOOL_TIMEOUT_MS,
+  IR_TOOLS,
+  IR_TOOL_TIMEOUT_MS,
   __connectOmiPipeForTest,
   __callSwiftToolForTest,
   __omiPendingCallsForTest,
@@ -684,7 +684,7 @@ test("classifyBash: blocks repeated backslash-newline line continuations", () =>
 //
 // The PR body and the code at index.ts promise the audit appender "never
 // throws" and emits exactly one stderr warning per process on disk-full /
-// ENOTDIR / EACCES. Unit-pin that guarantee by pointing OMI_PI_AUDIT_LOG at
+// ENOTDIR / EACCES. Unit-pin that guarantee by pointing IR_PI_AUDIT_LOG at
 // a path whose parent is a file (mkdir recursive fails with ENOTDIR) and
 // asserting no throw + one-shot stderr warning.
 // ---------------------------------------------------------------------------
@@ -696,9 +696,9 @@ test("appendAudit: fail-safe when audit path is unwritable", async () => {
   const blockerFile = `/tmp/omi-audit-blocker-${process.pid}-${Date.now()}`;
   await writeFile(blockerFile, "x", "utf-8");
 
-  const originalPath = process.env.OMI_PI_AUDIT_LOG;
+  const originalPath = process.env.IR_PI_AUDIT_LOG;
   const originalWrite = process.stderr.write.bind(process.stderr);
-  process.env.OMI_PI_AUDIT_LOG = `${blockerFile}/audit.log`;
+  process.env.IR_PI_AUDIT_LOG = `${blockerFile}/audit.log`;
   __resetAuditWarnedForTest();
 
   const stderrCalls: string[] = [];
@@ -744,9 +744,9 @@ test("appendAudit: fail-safe when audit path is unwritable", async () => {
     (process.stderr as unknown as { write: typeof originalWrite }).write =
       originalWrite;
     if (originalPath === undefined) {
-      delete process.env.OMI_PI_AUDIT_LOG;
+      delete process.env.IR_PI_AUDIT_LOG;
     } else {
-      process.env.OMI_PI_AUDIT_LOG = originalPath;
+      process.env.IR_PI_AUDIT_LOG = originalPath;
     }
     __resetAuditWarnedForTest();
     try {
@@ -927,12 +927,12 @@ function createMockBridge(): { server: Server; sockPath: string } {
   return { server, sockPath };
 }
 
-test("OMI_TOOLS: exactly 14 tools defined via defineTool()", () => {
-  assert.equal(OMI_TOOLS.length, 14);
+test("IR_TOOLS: exactly 14 tools defined via defineTool()", () => {
+  assert.equal(IR_TOOLS.length, 14);
 });
 
-test("OMI_TOOLS: all tools have name, label, description, parameters, execute", () => {
-  for (const tool of OMI_TOOLS) {
+test("IR_TOOLS: all tools have name, label, description, parameters, execute", () => {
+  for (const tool of IR_TOOLS) {
     assert.ok(tool.name, `tool missing name`);
     assert.ok(tool.label, `${tool.name} missing label`);
     assert.ok(tool.description, `${tool.name} missing description`);
@@ -942,13 +942,13 @@ test("OMI_TOOLS: all tools have name, label, description, parameters, execute", 
   }
 });
 
-test("OMI_TOOLS: unique tool names", () => {
-  const names = OMI_TOOLS.map(t => t.name);
+test("IR_TOOLS: unique tool names", () => {
+  const names = IR_TOOLS.map(t => t.name);
   assert.equal(new Set(names).size, names.length, "duplicate tool names");
 });
 
-test("OMI_TOOLS: all have promptSnippet for system prompt injection", () => {
-  for (const tool of OMI_TOOLS) {
+test("IR_TOOLS: all have promptSnippet for system prompt injection", () => {
+  for (const tool of IR_TOOLS) {
     assert.ok(tool.promptSnippet, `${tool.name} missing promptSnippet`);
   }
 });
@@ -957,8 +957,8 @@ test("OMI_TOOLS: all have promptSnippet for system prompt injection", () => {
 // TypeBox schema shape validation per tool
 // ---------------------------------------------------------------------------
 
-test("OMI_TOOLS: TypeBox schemas have additionalProperties=false", () => {
-  for (const tool of OMI_TOOLS) {
+test("IR_TOOLS: TypeBox schemas have additionalProperties=false", () => {
+  for (const tool of IR_TOOLS) {
     assert.equal(
       (tool.parameters as any).additionalProperties,
       false,
@@ -967,7 +967,7 @@ test("OMI_TOOLS: TypeBox schemas have additionalProperties=false", () => {
   }
 });
 
-test("OMI_TOOLS: required fields match expected per tool", () => {
+test("IR_TOOLS: required fields match expected per tool", () => {
   const expected: Record<string, string[]> = {
     execute_sql: ["query"],
     semantic_search: ["query"],
@@ -984,7 +984,7 @@ test("OMI_TOOLS: required fields match expected per tool", () => {
     update_action_item: ["action_item_id"],
     capture_screen: [],
   };
-  for (const tool of OMI_TOOLS) {
+  for (const tool of IR_TOOLS) {
     const req = (tool.parameters as any).required ?? [];
     assert.deepEqual(
       req.sort(),
@@ -994,8 +994,8 @@ test("OMI_TOOLS: required fields match expected per tool", () => {
   }
 });
 
-test("OMI_TOOLS: all declared properties have TypeBox type metadata", () => {
-  for (const tool of OMI_TOOLS) {
+test("IR_TOOLS: all declared properties have TypeBox type metadata", () => {
+  for (const tool of IR_TOOLS) {
     const props = (tool.parameters as any).properties;
     assert.ok(props, `${tool.name} missing properties`);
     for (const [key, schema] of Object.entries(props)) {
@@ -1008,15 +1008,15 @@ test("OMI_TOOLS: all declared properties have TypeBox type metadata", () => {
   }
 });
 
-test("OMI_TOOLS: execute_sql has 'query' as Type.String", () => {
-  const tool = OMI_TOOLS.find(t => t.name === "execute_sql")!;
+test("IR_TOOLS: execute_sql has 'query' as Type.String", () => {
+  const tool = IR_TOOLS.find(t => t.name === "execute_sql")!;
   const queryProp = (tool.parameters as any).properties.query;
   assert.equal(queryProp.type, "string");
   assert.ok(queryProp.description);
 });
 
-test("OMI_TOOLS: semantic_search optional fields exist and are not required", () => {
-  const tool = OMI_TOOLS.find(t => t.name === "semantic_search")!;
+test("IR_TOOLS: semantic_search optional fields exist and are not required", () => {
+  const tool = IR_TOOLS.find(t => t.name === "semantic_search")!;
   const props = (tool.parameters as any).properties;
   const required = (tool.parameters as any).required ?? [];
   // Verify optional properties exist in the schema
@@ -1034,8 +1034,8 @@ test("OMI_TOOLS: semantic_search optional fields exist and are not required", ()
 // promptGuidelines tests
 // ---------------------------------------------------------------------------
 
-test("OMI_TOOLS: execute_sql has promptGuidelines", () => {
-  const tool = OMI_TOOLS.find(t => t.name === "execute_sql")!;
+test("IR_TOOLS: execute_sql has promptGuidelines", () => {
+  const tool = IR_TOOLS.find(t => t.name === "execute_sql")!;
   assert.ok(tool.promptGuidelines, "execute_sql missing promptGuidelines");
   assert.ok(tool.promptGuidelines!.length >= 1, "execute_sql should have at least 1 guideline");
   assert.ok(
@@ -1044,14 +1044,14 @@ test("OMI_TOOLS: execute_sql has promptGuidelines", () => {
   );
 });
 
-test("OMI_TOOLS: semantic_search has promptGuidelines", () => {
-  const tool = OMI_TOOLS.find(t => t.name === "semantic_search")!;
+test("IR_TOOLS: semantic_search has promptGuidelines", () => {
+  const tool = IR_TOOLS.find(t => t.name === "semantic_search")!;
   assert.ok(tool.promptGuidelines, "semantic_search missing promptGuidelines");
   assert.ok(tool.promptGuidelines!.length >= 1);
 });
 
-test("OMI_TOOL_TIMEOUT_MS: is 30 seconds", () => {
-  assert.equal(OMI_TOOL_TIMEOUT_MS, 30_000);
+test("IR_TOOL_TIMEOUT_MS: is 30 seconds", () => {
+  assert.equal(IR_TOOL_TIMEOUT_MS, 30_000);
 });
 
 test("callSwiftTool: returns error when not connected", async () => {

@@ -45,13 +45,13 @@ class AuthService {
     private var appleSignInDelegate: AppleSignInDelegate?
 
     // API Configuration
-    // Auth backend URL — must be set via OMI_AUTH_URL env var (in .env)
+    // Auth backend URL — must be set via IR_AUTH_URL env var (in .env)
     private let apiBaseURL: String = {
-        if let envURL = getenv("OMI_AUTH_URL") {
+        if let envURL = getenv("IR_AUTH_URL") {
             let url = String(cString: envURL)
             if !url.isEmpty { return url.hasSuffix("/") ? url : url + "/" }
         }
-        NSLog("OMI AUTH: OMI_AUTH_URL not set — OAuth sign-in will fail")
+        NSLog("OMI AUTH: IR_AUTH_URL not set — OAuth sign-in will fail")
         return ""
     }()
     private var redirectURI: String {

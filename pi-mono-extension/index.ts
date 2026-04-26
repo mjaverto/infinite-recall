@@ -296,10 +296,10 @@ export function classifyFileWrite(filePath: string): DenyDecision | null {
 }
 
 /** Classify a whole tool_call event by dispatching on toolName.
- *  When OMI_YOLO_MODE=1, all tool calls are allowed (no denylist).
+ *  When IR_YOLO_MODE=1, all tool calls are allowed (no denylist).
  *  Yolo mode is gated by the adapter — only forwarded from dev builds. */
 export function inspectToolCall(event: ToolCallEvent): DenyDecision | null {
-  if (process.env.OMI_YOLO_MODE === "1") {
+  if (process.env.IR_YOLO_MODE === "1") {
     process.stderr.write(`[omi-provider] YOLO bypass: ${event.toolName}\n`);
     return null;
   }
@@ -377,10 +377,10 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + "…";
 }
 
-/** Resolve the audit log path. Overridable via OMI_PI_AUDIT_LOG for tests. */
+/** Resolve the audit log path. Overridable via IR_PI_AUDIT_LOG for tests. */
 function auditLogPath(): string {
   return (
-    process.env.OMI_PI_AUDIT_LOG ||
+    process.env.IR_PI_AUDIT_LOG ||
     join(process.env.HOME || homedir(), ".omi", "pi-mono-audit.log")
   );
 }
@@ -415,7 +415,7 @@ export async function appendAudit(entry: AuditEntry): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Omi tools — forwarded to Swift via Unix socket (OMI_BRIDGE_PIPE)
+// Omi tools — forwarded to Swift via Unix socket (IR_BRIDGE_PIPE)
 // ---------------------------------------------------------------------------
 
 let omiPipeConnection: Socket | null = null;
@@ -473,8 +473,8 @@ function callSwiftTool(name: string, input: Record<string, unknown>, signal?: Ab
   return new Promise<string>((resolve) => {
     const timer = setTimeout(() => {
       omiPendingCalls.delete(callId);
-      resolve(`Error: tool '${name}' timed out after ${OMI_TOOL_TIMEOUT_MS / 1000}s`);
-    }, OMI_TOOL_TIMEOUT_MS);
+      resolve(`Error: tool '${name}' timed out after ${IR_TOOL_TIMEOUT_MS / 1000}s`);
+    }, IR_TOOL_TIMEOUT_MS);
     const cleanup = () => {
       clearTimeout(timer);
       omiPendingCalls.delete(callId);
@@ -492,7 +492,7 @@ function callSwiftTool(name: string, input: Record<string, unknown>, signal?: Ab
   });
 }
 
-export const OMI_TOOL_TIMEOUT_MS = 30_000;
+export const IR_TOOL_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Omi tool definitions — pi-mono defineTool() with TypeBox schemas
@@ -525,7 +525,7 @@ function omiTool<T extends Parameters<typeof Type.Object>[0]>(spec: {
   });
 }
 
-export const OMI_TOOLS = [
+export const IR_TOOLS = [
   omiTool({
     name: "execute_sql",
     label: "Execute SQL",
@@ -705,9 +705,9 @@ export const OMI_TOOLS = [
 ];
 
 async function registerOmiTools(pi: ExtensionAPI): Promise<void> {
-  const pipePath = process.env.OMI_BRIDGE_PIPE;
+  const pipePath = process.env.IR_BRIDGE_PIPE;
   if (!pipePath) {
-    process.stderr.write("[omi-tools] OMI_BRIDGE_PIPE not set — Omi tools unavailable\n");
+    process.stderr.write("[omi-tools] IR_BRIDGE_PIPE not set — Omi tools unavailable\n");
     return;
   }
   try {
@@ -716,10 +716,10 @@ async function registerOmiTools(pi: ExtensionAPI): Promise<void> {
     process.stderr.write(`[omi-tools] Failed to connect: ${err instanceof Error ? err.message : err}\n`);
     return;
   }
-  for (const tool of OMI_TOOLS) {
+  for (const tool of IR_TOOLS) {
     pi.registerTool(tool);
   }
-  process.stderr.write(`[omi-tools] Registered ${OMI_TOOLS.length} Omi tools\n`);
+  process.stderr.write(`[omi-tools] Registered ${IR_TOOLS.length} Omi tools\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +727,8 @@ async function registerOmiTools(pi: ExtensionAPI): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export default function omiProvider(pi: ExtensionAPI): void {
-  const baseUrl = process.env.OMI_API_BASE_URL || "https://api.omi.me/v2";
-  const apiKey = process.env.OMI_API_KEY || "";
+  const baseUrl = process.env.IR_API_BASE_URL || "https://api.omi.me/v2";
+  const apiKey = process.env.IR_API_KEY || "";
 
   pi.registerProvider("omi", {
     api: "openai-completions",
@@ -807,7 +807,7 @@ export default function omiProvider(pi: ExtensionAPI): void {
   });
 
   // Register Omi-specific tools (execute_sql, semantic_search, etc.)
-  // These forward to Swift via the OMI_BRIDGE_PIPE Unix socket.
+  // These forward to Swift via the IR_BRIDGE_PIPE Unix socket.
   void registerOmiTools(pi);
 }
 
