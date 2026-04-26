@@ -1236,7 +1236,6 @@ struct ServerMemory: Codable, Identifiable {
   let conversationId: String?
   let reviewed: Bool
   let userReview: Bool?
-  var visibility: String
   let manuallyAdded: Bool
   let scoring: String?
   let source: String?
@@ -1260,7 +1259,7 @@ struct ServerMemory: Codable, Identifiable {
   let headline: String?
 
   enum CodingKeys: String, CodingKey {
-    case id, content, category, reviewed, visibility, scoring, source, confidence, tags, reasoning,
+    case id, content, category, reviewed, scoring, source, confidence, tags, reasoning,
       headline
     case createdAt = "created_at"
     case updatedAt = "updated_at"
@@ -1286,7 +1285,6 @@ struct ServerMemory: Codable, Identifiable {
     conversationId = try container.decodeIfPresent(String.self, forKey: .conversationId)
     reviewed = try container.decodeIfPresent(Bool.self, forKey: .reviewed) ?? false
     userReview = try container.decodeIfPresent(Bool.self, forKey: .userReview)
-    visibility = try container.decodeIfPresent(String.self, forKey: .visibility) ?? "private"
     manuallyAdded = try container.decodeIfPresent(Bool.self, forKey: .manuallyAdded) ?? false
     scoring = try container.decodeIfPresent(String.self, forKey: .scoring)
     source = try container.decodeIfPresent(String.self, forKey: .source)
@@ -1301,10 +1299,6 @@ struct ServerMemory: Codable, Identifiable {
     inputDeviceName = try container.decodeIfPresent(String.self, forKey: .inputDeviceName)
     windowTitle = try container.decodeIfPresent(String.self, forKey: .windowTitle)
     headline = try container.decodeIfPresent(String.self, forKey: .headline)
-  }
-
-  var isPublic: Bool {
-    visibility == "public"
   }
 
   /// Confidence as percentage string
@@ -1440,7 +1434,6 @@ extension APIClient {
   /// Creates a new memory (manual or extracted)
   func createMemory(
     content: String,
-    visibility: String = "private",
     category: MemoryCategory? = nil,
     confidence: Double? = nil,
     sourceApp: String? = nil,
@@ -1454,7 +1447,6 @@ extension APIClient {
   ) async throws -> CreateMemoryResponse {
     struct CreateRequest: Encodable {
       let content: String
-      let visibility: String
       let category: String?
       let confidence: Double?
       let sourceApp: String?
@@ -1467,7 +1459,7 @@ extension APIClient {
       let headline: String?
 
       enum CodingKeys: String, CodingKey {
-        case content, visibility, category, confidence, tags, reasoning, source, headline
+        case content, category, confidence, tags, reasoning, source, headline
         case sourceApp = "source_app"
         case contextSummary = "context_summary"
         case currentActivity = "current_activity"
@@ -1476,7 +1468,6 @@ extension APIClient {
     }
     let body = CreateRequest(
       content: content,
-      visibility: visibility,
       category: category?.rawValue,
       confidence: confidence,
       sourceApp: sourceApp,
@@ -1527,15 +1518,6 @@ extension APIClient {
     let _: MemoryStatusResponse = try await patch("v3/memories/\(id)", body: body)
   }
 
-  /// Updates a memory's visibility
-  func updateMemoryVisibility(id: String, visibility: String) async throws {
-    struct VisibilityRequest: Encodable {
-      let value: String
-    }
-    let body = VisibilityRequest(value: visibility)
-    let _: MemoryStatusResponse = try await patch("v3/memories/\(id)/visibility", body: body)
-  }
-
   /// Updates memory read/dismissed status
   func updateMemoryReadStatus(id: String, isRead: Bool? = nil, isDismissed: Bool? = nil)
     async throws -> ServerMemory
@@ -1556,15 +1538,6 @@ extension APIClient {
   /// Marks all memories as read
   func markAllMemoriesRead() async throws {
     let _: MemoryStatusResponse = try await post("v3/memories/mark-all-read", body: EmptyBody())
-  }
-
-  /// Updates visibility of all memories
-  func updateAllMemoriesVisibility(visibility: String) async throws {
-    struct VisibilityRequest: Encodable {
-      let value: String
-    }
-    let body = VisibilityRequest(value: visibility)
-    let _: MemoryStatusResponse = try await patch("v3/memories/visibility", body: body)
   }
 
   /// Deletes all memories
@@ -1624,14 +1597,11 @@ struct CreateMemoryResponse: Codable {
 /// batch creation, so we intentionally don't send it).
 struct MemoryBatchItem: Encodable {
   let content: String
-  let visibility: String
   let tags: [String]
   let headline: String?
 
-  init(content: String, visibility: String = "private", tags: [String] = [], headline: String? = nil)
-  {
+  init(content: String, tags: [String] = [], headline: String? = nil) {
     self.content = content
-    self.visibility = visibility
     self.tags = tags
     self.headline = headline
   }

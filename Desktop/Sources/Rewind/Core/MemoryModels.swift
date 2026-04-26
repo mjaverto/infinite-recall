@@ -16,7 +16,6 @@ struct MemoryRecord: Codable, FetchableRecord, PersistableRecord, Identifiable {
     var content: String
     var category: String                // system, interesting, manual
     var tagsJson: String?               // JSON array: ["tips"], ["focus", "focused"]
-    var visibility: String
     var reviewed: Bool
     var userReview: Bool?
     var manuallyAdded: Bool
@@ -55,7 +54,6 @@ struct MemoryRecord: Codable, FetchableRecord, PersistableRecord, Identifiable {
         content: String,
         category: String = "system",
         tagsJson: String? = nil,
-        visibility: String = "private",
         reviewed: Bool = false,
         userReview: Bool? = nil,
         manuallyAdded: Bool = false,
@@ -83,7 +81,6 @@ struct MemoryRecord: Codable, FetchableRecord, PersistableRecord, Identifiable {
         self.content = content
         self.category = category
         self.tagsJson = tagsJson
-        self.visibility = visibility
         self.reviewed = reviewed
         self.userReview = userReview
         self.manuallyAdded = manuallyAdded
@@ -182,7 +179,6 @@ extension MemoryRecord {
             content: memory.content,
             category: memory.category.rawValue,
             tagsJson: tagsJson,
-            visibility: memory.visibility,
             reviewed: memory.reviewed,
             userReview: memory.userReview,
             manuallyAdded: memory.manuallyAdded,
@@ -215,7 +211,6 @@ extension MemoryRecord {
         // Update core fields
         self.content = memory.content
         self.category = memory.category.rawValue
-        self.visibility = memory.visibility
         self.reviewed = memory.reviewed
         self.userReview = memory.userReview
         self.manuallyAdded = memory.manuallyAdded
@@ -284,7 +279,6 @@ extension MemoryRecord {
             conversationId: conversationId,
             reviewed: reviewed,
             userReview: userReview,
-            visibility: visibility,
             manuallyAdded: manuallyAdded,
             scoring: scoring,
             source: source,
@@ -316,7 +310,6 @@ extension ServerMemory {
         conversationId: String?,
         reviewed: Bool,
         userReview: Bool?,
-        visibility: String,
         manuallyAdded: Bool,
         scoring: String?,
         source: String?,
@@ -340,7 +333,6 @@ extension ServerMemory {
         self.conversationId = conversationId
         self.reviewed = reviewed
         self.userReview = userReview
-        self.visibility = visibility
         self.manuallyAdded = manuallyAdded
         self.scoring = scoring
         self.source = source

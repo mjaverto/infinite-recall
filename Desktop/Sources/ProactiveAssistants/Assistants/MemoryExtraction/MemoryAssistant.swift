@@ -261,7 +261,6 @@ actor MemoryAssistant: ProactiveAssistant {
 
             let response = try await APIClient.shared.createMemory(
                 content: memory.content,
-                visibility: "private",
                 category: category,
                 confidence: memory.confidence,
                 sourceApp: memory.sourceApp,

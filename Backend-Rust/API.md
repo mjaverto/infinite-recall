@@ -397,7 +397,6 @@ excluded.
       "content": "Michael prefers morning standup before 9 AM.",
       "category": "preference",
       "tags": "[\"work\",\"schedule\"]",
-      "visibility": "private",
       "source": "conversation",
       "source_app": null,
       "conversation_id": "42",
@@ -420,7 +419,6 @@ excluded.
 | `content` | string | Full memory text |
 | `category` | string | Category label assigned by the extraction LLM |
 | `tags` | string \| null | JSON-encoded string array stored in `tagsJson` column |
-| `visibility` | string | `"private"` or other visibility value |
 | `source` | string \| null | Extraction source (e.g., `"conversation"`) |
 | `source_app` | string \| null | App name if memory came from screen activity |
 | `conversation_id` | string \| null | Linked conversation row ID, as a string |

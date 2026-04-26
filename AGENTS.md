@@ -199,8 +199,7 @@ Example response (abbreviated):
       "source": "desktop",
       "source_app": "iTerm2",
       "tags": "[\"focus\",\"focused\",\"app:iTerm2\"]",
-      "updated_at": "2026-04-26 11:40:08.170",
-      "visibility": "private"
+      "updated_at": "2026-04-26 11:40:08.170"
     }
   ],
   "offset": 0

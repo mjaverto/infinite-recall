@@ -186,9 +186,6 @@ class MemoriesViewModel: ObservableObject {
   @Published var linkedConversation: ServerConversation? = nil
   @Published var isLoadingConversation = false
 
-  // Visibility toggle state
-  @Published var isTogglingVisibility = false
-
   // MARK: - Cached Properties (avoid recomputation on every render)
 
   /// Cached filtered and sorted memories - only recomputed when inputs change
@@ -829,63 +826,7 @@ class MemoriesViewModel: ObservableObject {
     }
   }
 
-  func toggleVisibility(_ memory: ServerMemory) async {
-    isTogglingVisibility = true
-    let newVisibility = memory.isPublic ? "private" : "public"
-    do {
-      try await APIClient.shared.updateMemoryVisibility(id: memory.id, visibility: newVisibility)
-
-      // Sync to local SQLite cache so auto-refresh doesn't revert the change
-      try await MemoryStorage.shared.updateVisibilityByBackendId(
-        memory.id, visibility: newVisibility)
-
-      // Update memory in place
-      if let index = memories.firstIndex(where: { $0.id == memory.id }) {
-        memories[index].visibility = newVisibility
-      }
-      // Update selectedMemory if it's the same memory (reassign to trigger SwiftUI update)
-      if var selected = selectedMemory, selected.id == memory.id {
-        selected.visibility = newVisibility
-        selectedMemory = selected
-      }
-    } catch {
-      logError("Failed to update memory visibility", error: error)
-    }
-    isTogglingVisibility = false
-  }
-
   // MARK: - Bulk Operations
-
-  func makeAllMemoriesPrivate() async {
-    isBulkOperationInProgress = true
-    do {
-      try await APIClient.shared.updateAllMemoriesVisibility(visibility: "private")
-      // Update all in SQLite so auto-refresh doesn't revert
-      for memory in memories {
-        try? await MemoryStorage.shared.updateVisibilityByBackendId(
-          memory.id, visibility: "private")
-      }
-      await loadMemories()
-    } catch {
-      logError("Failed to make all memories private", error: error)
-    }
-    isBulkOperationInProgress = false
-  }
-
-  func makeAllMemoriesPublic() async {
-    isBulkOperationInProgress = true
-    do {
-      try await APIClient.shared.updateAllMemoriesVisibility(visibility: "public")
-      // Update all in SQLite so auto-refresh doesn't revert
-      for memory in memories {
-        try? await MemoryStorage.shared.updateVisibilityByBackendId(memory.id, visibility: "public")
-      }
-      await loadMemories()
-    } catch {
-      logError("Failed to make all memories public", error: error)
-    }
-    isBulkOperationInProgress = false
-  }
 
   func deleteAllMemories() async {
     isBulkOperationInProgress = true
@@ -1378,60 +1319,6 @@ struct MemoriesPage: View {
 
   private var managementMenuPopover: some View {
     VStack(alignment: .leading, spacing: 0) {
-      // Visibility section
-      Text("Visibility")
-        .scaledFont(size: 11, weight: .medium)
-        .foregroundColor(OmiColors.textTertiary)
-        .padding(.horizontal, 12)
-        .padding(.top, 12)
-        .padding(.bottom, 6)
-
-      Button {
-        showManagementMenu = false
-        Task { await viewModel.makeAllMemoriesPrivate() }
-      } label: {
-        HStack(spacing: 10) {
-          Image(systemName: "lock")
-            .scaledFont(size: 13)
-            .frame(width: 20)
-          Text("Make All Private")
-            .scaledFont(size: 13)
-          Spacer()
-        }
-        .foregroundColor(OmiColors.textPrimary)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .disabled(viewModel.memories.isEmpty || viewModel.isBulkOperationInProgress)
-      .opacity(viewModel.memories.isEmpty || viewModel.isBulkOperationInProgress ? 0.5 : 1)
-
-      Button {
-        showManagementMenu = false
-        Task { await viewModel.makeAllMemoriesPublic() }
-      } label: {
-        HStack(spacing: 10) {
-          Image(systemName: "globe")
-            .scaledFont(size: 13)
-            .frame(width: 20)
-          Text("Make All Public")
-            .scaledFont(size: 13)
-          Spacer()
-        }
-        .foregroundColor(OmiColors.textPrimary)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .disabled(viewModel.memories.isEmpty || viewModel.isBulkOperationInProgress)
-      .opacity(viewModel.memories.isEmpty || viewModel.isBulkOperationInProgress ? 0.5 : 1)
-
-      Divider()
-        .padding(.vertical, 8)
-        .padding(.horizontal, 12)
-
       // Danger section
       Button {
         showManagementMenu = false
@@ -1971,7 +1858,7 @@ struct MemoryDetailSheet: View {
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 20) {
-        // Header with tags, visibility toggle, delete, and dismiss
+        // Header with tags, delete, and dismiss
         HStack(spacing: 8) {
           if memory.isTip {
             tagBadge("Tips", "lightbulb.fill", OmiColors.textSecondary)
@@ -1985,29 +1872,6 @@ struct MemoryDetailSheet: View {
           }
 
           Spacer()
-
-          // Public toggle
-          HStack(spacing: 6) {
-            Text("Public")
-              .scaledFont(size: 13)
-              .foregroundColor(OmiColors.textSecondary)
-            if viewModel.isTogglingVisibility {
-              ProgressView()
-                .scaleEffect(0.7)
-            } else {
-              Toggle(
-                "",
-                isOn: Binding(
-                  get: { memory.isPublic },
-                  set: { _ in
-                    Task { await viewModel.toggleVisibility(memory) }
-                  }
-                )
-              )
-              .toggleStyle(.switch)
-              .labelsHidden()
-            }
-          }
 
           // Delete icon
           Button {

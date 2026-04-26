@@ -875,7 +875,6 @@ actor FocusAssistant: ProactiveAssistant {
 
             let response = try await APIClient.shared.createMemory(
                 content: content,
-                visibility: "private",
                 category: .system,
                 tags: tags,
                 source: "desktop",

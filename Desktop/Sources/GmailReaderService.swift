@@ -859,7 +859,6 @@ actor GmailReaderService {
     do {
       _ = try await APIClient.shared.createMemory(
         content: content,
-        visibility: "private",
         tags: ["gmail", "email"],
         source: "gmail",
         windowTitle: "Gmail — \(dateStr)",

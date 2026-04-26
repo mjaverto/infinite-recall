@@ -562,18 +562,6 @@ actor MemoryStorage {
         }
     }
 
-    /// Update visibility by backend ID
-    func updateVisibilityByBackendId(_ backendId: String, visibility: String) async throws {
-        let db = try await ensureInitialized()
-
-        try await db.write { database in
-            try database.execute(
-                sql: "UPDATE memories SET visibility = ?, updatedAt = ? WHERE backendId = ?",
-                arguments: [visibility, Date(), backendId]
-            )
-        }
-    }
-
     /// Update read status by backend ID
     func updateReadStatusByBackendId(_ backendId: String, isRead: Bool) async throws {
         let db = try await ensureInitialized()
