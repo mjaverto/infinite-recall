@@ -74,6 +74,14 @@ actor RewindIndexer {
             await EmbeddingBackfillService.shared.runIfNeeded()
         }
 
+        // Generate structured summaries (title/overview/emoji/category) for
+        // finished conversations that were recorded before the local extraction
+        // pipeline was wired.  Idempotent; guarded by
+        // UserDefaults flag "conversationSummaryBackfillCompleted_v1".
+        Task(priority: .background) {
+            await ConversationSummaryBackfillService.shared.runIfNeeded()
+        }
+
         // Reduce ocrDataJson float precision for existing rows (one-time migration)
         Task(priority: .background) {
             await RewindDatabase.shared.reduceOCRDataPrecisionIfNeeded()
