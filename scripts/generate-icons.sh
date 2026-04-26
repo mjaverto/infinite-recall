@@ -60,6 +60,13 @@ rsvg-convert -w 16 -h 16 "${MENU_SVG}" -o "${MENU_DIR}/MenuBarIcon.png"
 rsvg-convert -w 32 -h 32 "${MENU_SVG}" -o "${MENU_DIR}/MenuBarIcon@2x.png"
 rsvg-convert -w 48 -h 48 "${MENU_SVG}" -o "${MENU_DIR}/MenuBarIcon@3x.png"
 
+# Also write a top-level MenuBarIcon.png in Resources/ — this is what
+# OmiApp.swift actually loads via Bundle.resourceBundle.url(forResource:
+# "MenuBarIcon", withExtension: "png"). Without this, the Swift code reads
+# a stale PNG (or falls back to the SF Symbol). Render at 32px for crisp
+# HiDPI; Swift scales it down to 16px tall at runtime.
+rsvg-convert -w 32 -h 32 "${MENU_SVG}" -o "Desktop/Sources/Resources/MenuBarIcon.png"
+
 cat > "${MENU_DIR}/Contents.json" <<'JSON'
 {
   "images" : [
