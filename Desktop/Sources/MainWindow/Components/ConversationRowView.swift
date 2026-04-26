@@ -39,41 +39,13 @@ struct ConversationRowView: View {
   }
 
   /// True when the recording finished but the LLM has not yet produced a
-  /// title/overview. Pure UI inference from existing `ServerConversation`
-  /// fields — no model changes, no DB queries. Used to render the
-  /// `SummaryPendingBadge` and the pending preview line in place of the
-  /// "Untitled Conversation" fallback.
-  ///
-  /// Conditions (all must hold):
-  ///   - status == .completed (finished, not actively recording)
-  ///   - structured.overview is empty/whitespace
-  ///   - we have evidence the session contains audio: either cached preview
-  ///     segments on AppState OR (finishedAt - startedAt) > ~10s
+  /// title/overview. Delegates to the shared
+  /// `ServerConversation.isSummaryPending(cachedPreview:)` extension so the
+  /// list and detail views never diverge (PR #30 review).
   var isSummaryPending: Bool {
-    guard conversation.status == .completed else { return false }
-    let overview = conversation.structured.overview
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard overview.isEmpty else { return false }
-    return hasTranscriptOrDuration
-  }
-
-  /// Evidence the conversation actually contains audio worth summarizing.
-  /// Either we have a cached preview snippet on AppState (segments existed
-  /// when the previews were built) OR the recorded duration is longer than
-  /// a brief tap (~10s).
-  private var hasTranscriptOrDuration: Bool {
-    if let cached = appState.conversationPreviews[conversation.id],
-      !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    {
-      return true
-    }
-    if !conversation.transcriptSegments.isEmpty {
-      return true
-    }
-    if let start = conversation.startedAt, let end = conversation.finishedAt {
-      return end.timeIntervalSince(start) > 10
-    }
-    return false
+    conversation.isSummaryPending(
+      cachedPreview: appState.conversationPreviews[conversation.id]
+    )
   }
 
   private static let timeFormatter: DateFormatter = {

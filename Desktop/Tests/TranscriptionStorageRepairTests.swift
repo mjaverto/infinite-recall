@@ -12,7 +12,7 @@ import GRDB
 ///   UPDATE transcription_sessions
 ///      SET conversationStatus = 'completed', updatedAt = ?
 ///    WHERE finishedAt IS NOT NULL
-///      AND conversationStatus = 'in_progress'
+///      AND conversationStatus IN ('in_progress', 'merging', 'processing')
 ///      AND status != 'recording'
 ///
 /// Source of truth: `TranscriptionStorage.repairFinishedInProgressSessions`.
@@ -26,7 +26,7 @@ final class TranscriptionStorageRepairTests: XCTestCase {
            SET conversationStatus = 'completed',
                updatedAt = ?
          WHERE finishedAt IS NOT NULL
-           AND conversationStatus = 'in_progress'
+           AND conversationStatus IN ('in_progress', 'merging', 'processing')
            AND status != 'recording'
         """
 
@@ -184,6 +184,42 @@ final class TranscriptionStorageRepairTests: XCTestCase {
             return db.changesCount
         }
         XCTAssertEqual(changed, 0, "Repair must be idempotent on the second run")
+    }
+
+    /// Stuck in 'merging': finished but the conversation merge step never
+    /// completed (e.g. crash mid-merge). Must flip to 'completed'.
+    func testRepairFlipsFinishedMergingToCompleted() throws {
+        let queue = try makeQueue()
+        let id = try insertRow(
+            queue,
+            finishedAt: Date(),
+            status: "completed",
+            conversationStatus: "merging"
+        )
+
+        try queue.write { db in
+            try db.execute(sql: Self.repairSQL, arguments: [Date()])
+        }
+
+        XCTAssertEqual(try conversationStatus(queue, id: id), "completed")
+    }
+
+    /// Stuck in 'processing': finished but conversation processing never
+    /// completed. Must flip to 'completed'.
+    func testRepairFlipsFinishedProcessingToCompleted() throws {
+        let queue = try makeQueue()
+        let id = try insertRow(
+            queue,
+            finishedAt: Date(),
+            status: "completed",
+            conversationStatus: "processing"
+        )
+
+        try queue.write { db in
+            try db.execute(sql: Self.repairSQL, arguments: [Date()])
+        }
+
+        XCTAssertEqual(try conversationStatus(queue, id: id), "completed")
     }
 
     /// Mixed dataset: ensures the repair flips ONLY the rows the contract

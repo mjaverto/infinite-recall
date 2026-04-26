@@ -118,4 +118,68 @@ final class ConversationSummaryBackfillServiceTests: XCTestCase {
         }
         XCTAssertNotNil(svc)
     }
+
+    // MARK: - Autonomous LLM path: recordAICall invariant
+    //
+    // The autonomous summarize drain MUST NOT bump
+    // `IdleAIController.shared.lastAICall`. If it did, Memory Saver's idle
+    // threshold would never elapse during a long drain and the local LLM
+    // would stay pinned in RAM. We verify this by exercising the LLM client
+    // directly: `chat()` calls `recordAICall()` BEFORE issuing HTTP, so even
+    // when the call fails (no real server) the timestamp advances; whereas
+    // `chatAutonomous()` skips that bump entirely. (See LocalLLMClient.swift.)
+
+    @MainActor
+    func test_chatAutonomous_doesNotBumpLastAICall() async throws {
+        // Capture the current timestamp; a small await ensures any preceding
+        // ticks have settled.
+        let before = await IdleAIController.shared.lastAICall
+        // Tiny sleep so a sentinel timestamp can be detected if mutated.
+        try await Task.sleep(nanoseconds: 10_000_000)  // 10 ms
+        let messages: [LLM.ChatMessage] = [
+            .init(role: .system, content: "test"),
+            .init(role: .user, content: "test"),
+        ]
+        // Call must complete (throw or succeed) without bumping lastAICall.
+        // We don't care if HTTP fails — server may not be running in CI.
+        do {
+            let stream = try await LocalLLMClient.shared.chatAutonomous(
+                messages: messages,
+                stream: false
+            )
+            // Drain a few chunks just in case; timestamp invariant still holds.
+            for try await _ in stream { break }
+        } catch {
+            // ignore — local server availability is irrelevant to this assertion
+        }
+        let after = await IdleAIController.shared.lastAICall
+        XCTAssertEqual(
+            after, before,
+            "chatAutonomous MUST NOT bump IdleAIController.lastAICall (Memory Saver invariant)"
+        )
+    }
+
+    @MainActor
+    func test_chat_doesBumpLastAICall() async throws {
+        let before = await IdleAIController.shared.lastAICall
+        try await Task.sleep(nanoseconds: 10_000_000)  // 10 ms — separation
+        let messages: [LLM.ChatMessage] = [
+            .init(role: .system, content: "test"),
+            .init(role: .user, content: "test"),
+        ]
+        do {
+            let stream = try await LocalLLMClient.shared.chat(
+                messages: messages,
+                stream: false
+            )
+            for try await _ in stream { break }
+        } catch {
+            // ignore — recordAICall fires BEFORE HTTP
+        }
+        let after = await IdleAIController.shared.lastAICall
+        XCTAssertGreaterThan(
+            after, before,
+            "chat() MUST bump IdleAIController.lastAICall so the watchdog auto-restarts the server on next user-initiated chat"
+        )
+    }
 }

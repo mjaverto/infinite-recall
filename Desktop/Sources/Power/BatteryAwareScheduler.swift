@@ -360,17 +360,15 @@ public final class BatteryAwareScheduler: ObservableObject {
       // so their behavior is unchanged.
       //
       // If we just claimed a `.summarize` row but autonomous readiness is
-      // false, fail the row with a transient error so PendingWorkStorage
-      // releases the claim (clears `claimedBy` / `leaseExpiresAt`) and
-      // schedules a backoff retry. The next safe window will pick it up.
+      // false, RELEASE the claim back to `queued` without counting an attempt
+      // or triggering exponential backoff. Readiness loss is not a handler
+      // failure, so it must not burn one of the row's `maxAttempts` budget —
+      // otherwise a few transient lock/unlock cycles could dead-letter a row
+      // that never had a real chance to run. `fail()` is reserved for actual
+      // handler failures.
       if Self.requiresAutonomousReadiness(work.kind), !allowAutonomousAIWork {
         if let storageId = work.storageId {
-          let err = NSError(
-            domain: "BatteryAwareScheduler",
-            code: 100,
-            userInfo: [NSLocalizedDescriptionKey: "Autonomous AI work readiness lost mid-claim; will retry on next safe window."]
-          )
-          try? await PendingWorkStorage.shared.fail(storageId: storageId, error: err)
+          try? await PendingWorkStorage.shared.releaseClaim(storageId: storageId)
         }
         break
       }

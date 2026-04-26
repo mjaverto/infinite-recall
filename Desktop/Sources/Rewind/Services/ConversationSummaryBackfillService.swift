@@ -480,6 +480,22 @@ actor ConversationSummaryBackfillService {
         )
     }
 
+    /// Write the "Summary Unavailable" structured placeholder for sessions
+    /// whose `.summarize` pending-work row exhausted its retry budget. Wired
+    /// up by `PowerWorkBridge`'s dead-letter callback. Distinct from the
+    /// ambient/short-recording placeholders because this represents a
+    /// real failure (LLM persistently unreachable or response unparsable),
+    /// not a property of the audio itself.
+    func writeUnavailablePlaceholder(sessionId: Int64) async throws {
+        try await writePlaceholder(
+            sessionId: sessionId,
+            title: "Summary Unavailable",
+            overview: "We couldn't generate a summary for this recording.",
+            emoji: "⚠️",
+            category: "other"
+        )
+    }
+
     private func writePlaceholder(
         sessionId: Int64,
         title: String,
@@ -610,7 +626,17 @@ actor ConversationSummaryBackfillService {
 
             return SummaryResult(title: title, overview: overview, emoji: emoji, category: category)
         } catch {
-            log("ConversationSummaryBackfillService: session \(sessionId) — JSON parse failed (\(raw.prefix(200))): \(error.localizedDescription)")
+            // Use logError so this surfaces in error telemetry — JSON parse
+            // failure is a real bug class (model regressed prompt format,
+            // truncated response, etc.) not a routine transient. Include the
+            // first 500 chars of the raw response (truncated, never the
+            // transcript) so we can diagnose without leaking conversation
+            // content. PR #30 review.
+            let snippet = String(raw.prefix(500))
+            logError(
+                "ConversationSummaryBackfillService: session \(sessionId) — JSON parse failed; raw response (first 500): \(snippet)",
+                error: error
+            )
             return nil
         }
     }

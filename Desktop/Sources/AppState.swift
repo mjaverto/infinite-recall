@@ -298,30 +298,10 @@ class AppState: ObservableObject {
       }
     }
 
-    // Summary backfill launch hooks (Phase 2 / task-002):
-    //   1. Repair `transcription_sessions` rows that finished but were left
-    //      with `conversationStatus = 'in_progress'` by an old build that
-    //      crashed mid-finalize. Idempotent SQL UPDATE.
-    //   2. Walk finished sessions with transcripts but no title/overview and
-    //      durably enqueue `.summarize` work for each. Drains across safe
-    //      windows once `BatteryAwareScheduler` reports
-    //      `allowAutonomousAIWork`. No relaunch required after this.
-    //
-    // Both calls are async + idempotent and tolerate DB-not-yet-initialized
-    // by retrying lazily inside their own implementations. Fire-and-forget
-    // here so AppState init stays non-blocking.
-    Task { @MainActor in
-      do {
-        let repaired = try await TranscriptionStorage.shared.repairFinishedInProgressSessions()
-        if repaired > 0 {
-          log("AppState: repaired \(repaired) finished-but-in_progress session(s) on launch")
-        }
-      } catch {
-        logError("AppState: repairFinishedInProgressSessions failed", error: error)
-      }
-      await ConversationSummaryBackfillService.shared
-        .enqueueHistoricalSummariesIfNeeded(reason: "launch")
-    }
+    // Summary backfill launch hooks moved into `PowerWorkBridge.start()` so
+    // they run AFTER `BatteryAwareScheduler.shared.start()` is wired up.
+    // Previously this fire-and-forget Task could race the scheduler init and
+    // enqueue summary work before any handler was registered. See PR #30.
   }
 
   /// Initialize Bluetooth manager and subscribe to state changes

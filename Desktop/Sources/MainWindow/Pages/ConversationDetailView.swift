@@ -567,22 +567,12 @@ struct ConversationDetailView: View {
     // MARK: - Summary Pending
 
     /// True when the recording finished but the LLM has not yet produced an
-    /// overview. Pure UI inference from existing fields; mirrors the logic
-    /// in `ConversationRowView.isSummaryPending` so the list and detail
-    /// views agree.
+    /// overview. Delegates to the shared
+    /// `ServerConversation.isSummaryPending(cachedPreview:)` extension so
+    /// the list and detail views never diverge (PR #30 review). Detail view
+    /// passes `nil` for cachedPreview — it doesn't have AppState in scope.
     private var isSummaryPending: Bool {
-        guard displayConversation.status == .completed else { return false }
-        let overview = displayConversation.overview
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard overview.isEmpty else { return false }
-        if !displayConversation.transcriptSegments.isEmpty {
-            return true
-        }
-        if let start = displayConversation.startedAt,
-           let end = displayConversation.finishedAt {
-            return end.timeIntervalSince(start) > 10
-        }
-        return false
+        displayConversation.isSummaryPending(cachedPreview: nil)
     }
 
     /// Banner shown above the (empty) overview section when the recording

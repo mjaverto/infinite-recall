@@ -831,6 +831,44 @@ struct ServerConversation: Codable, Identifiable, Equatable {
   }
 }
 
+// MARK: - Summary pending inference (shared across ConversationRowView /
+// ConversationDetailView so the list and detail views render identical
+// pending-state copy without diverging logic). Pure UI inference from
+// existing `ServerConversation` fields — no model changes, no DB queries.
+extension ServerConversation {
+  /// True when the recording finished but the LLM has not yet produced a
+  /// title/overview.
+  ///
+  /// Conditions (all must hold):
+  ///   - `status == .completed` (finished, not actively recording)
+  ///   - `structured.overview` is empty/whitespace
+  ///   - we have evidence the session contains audio: either a non-empty
+  ///     `cachedPreview` snippet (passed by callers from
+  ///     `appState.conversationPreviews[id]`), OR `transcriptSegments` is
+  ///     non-empty, OR `(finishedAt - startedAt)` is greater than ~10 s.
+  ///
+  /// - Parameter cachedPreview: optional cached preview text from
+  ///   `AppState.conversationPreviews[id]`. Pass `nil` from callers that
+  ///   don't have AppState in scope (e.g. detail view).
+  func isSummaryPending(cachedPreview: String?) -> Bool {
+    guard status == .completed else { return false }
+    let overview = structured.overview
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard overview.isEmpty else { return false }
+    if let cached = cachedPreview,
+       !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return true
+    }
+    if !transcriptSegments.isEmpty {
+      return true
+    }
+    if let start = startedAt, let end = finishedAt {
+      return end.timeIntervalSince(start) > 10
+    }
+    return false
+  }
+}
+
 struct Structured: Codable, Equatable {
   var title: String
   let overview: String

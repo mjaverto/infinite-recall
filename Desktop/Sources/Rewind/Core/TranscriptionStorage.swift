@@ -503,19 +503,24 @@ actor TranscriptionStorage {
         }
     }
 
-    /// Idempotent repair for sessions left in `conversationStatus = 'in_progress'`
-    /// after a crash/quit, where the recording itself is finished but the
-    /// conversation status was never advanced. Without this, the
-    /// Conversations list keeps showing them as "In Progress" forever and the
-    /// summary pipeline considers them ineligible.
+    /// Idempotent repair for sessions left in a non-terminal
+    /// `conversationStatus` after a crash/quit, where the recording itself
+    /// is finished but the conversation status was never advanced. Without
+    /// this, the Conversations list keeps showing them as "In Progress" /
+    /// "Processing" / "Merging" forever and the summary pipeline considers
+    /// them ineligible.
     ///
     /// Runs the SQL semantics required by the contract
-    /// (`TranscriptionStorageRepairContract.repairFinishedInProgressSessions`):
+    /// (`TranscriptionStorageRepairContract.repairFinishedInProgressSessions`).
+    /// The legacy clause only matched `conversationStatus = 'in_progress'`,
+    /// but `LocalConversationStatus` also includes `processing` and
+    /// `merging` — both of which can be "frozen" by a crash in the same
+    /// way. Expand the WHERE to cover all three non-terminal statuses:
     ///
     ///     UPDATE transcription_sessions
     ///        SET conversationStatus = 'completed', updatedAt = ?
     ///      WHERE finishedAt IS NOT NULL
-    ///        AND conversationStatus = 'in_progress'
+    ///        AND conversationStatus IN ('in_progress', 'merging', 'processing')
     ///        AND status != 'recording';
     ///
     /// - Returns: number of rows updated. Idempotent: subsequent calls return 0.
@@ -533,7 +538,7 @@ actor TranscriptionStorage {
                        SET conversationStatus = 'completed',
                            updatedAt = ?
                      WHERE finishedAt IS NOT NULL
-                       AND conversationStatus = 'in_progress'
+                       AND conversationStatus IN ('in_progress', 'merging', 'processing')
                        AND status != 'recording'
                     """,
                 arguments: [now]
@@ -542,7 +547,7 @@ actor TranscriptionStorage {
         }
 
         if changed > 0 {
-            log("TranscriptionStorage: Repaired \(changed) finished/in_progress session(s) → completed")
+            log("TranscriptionStorage: Repaired \(changed) finished non-terminal session(s) → completed")
         }
         return changed
     }

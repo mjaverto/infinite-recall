@@ -212,6 +212,50 @@ actor PendingWorkStorage {
         log("PendingWorkStorage: ack id=\(storageId)")
     }
 
+    // MARK: - Release claim (readiness loss)
+
+    /// Release a previously-claimed item back to `queued` WITHOUT counting an
+    /// attempt and WITHOUT bumping the exponential backoff. Used when readiness
+    /// (e.g. autonomous-AI gate) is lost AFTER claiming a row but BEFORE the
+    /// handler ran — semantically the item never failed, so it shouldn't burn
+    /// an attempt or be subject to per-failure backoff.
+    ///
+    /// Reschedules `scheduledFor` 30 s in the future so we don't immediately
+    /// re-claim it on the very next loop tick.
+    public func releaseClaim(storageId: Int64) async throws {
+        let db = try await ensureInitialized()
+        let now = Date()
+        let later = now.addingTimeInterval(30)
+        try await db.write { database in
+            try database.execute(sql: """
+                UPDATE pending_work
+                SET status        = 'queued',
+                    claimedAt     = NULL,
+                    claimedBy     = NULL,
+                    leaseExpiresAt = NULL,
+                    scheduledFor  = ?,
+                    updatedAt     = ?
+                WHERE id = ? AND status = 'claimed'
+            """, arguments: [later, now, storageId])
+        }
+        log("PendingWorkStorage: released claim id=\(storageId) (no attempt counted)")
+    }
+
+    // MARK: - Dead-letter callback
+
+    /// Optional callback invoked from `fail()` when an item transitions to
+    /// `dead`. Wired up by `PowerWorkBridge.start()` to write a "Summary
+    /// Unavailable" placeholder for `.summarize` work whose attempts are
+    /// exhausted, so the UI doesn't render an indefinitely-pending row.
+    ///
+    /// Sendable so it can be invoked across actor boundaries from inside the
+    /// `fail()` hot path.
+    public var deadLetterCallback: (@Sendable (_ workType: String, _ payload: Data) async -> Void)?
+
+    public func setDeadLetterCallback(_ cb: (@Sendable (_ workType: String, _ payload: Data) async -> Void)?) {
+        self.deadLetterCallback = cb
+    }
+
     // MARK: - Fail
 
     /// Record a handler failure. Transitions to `failed` (with backoff) or `dead`
@@ -221,14 +265,20 @@ actor PendingWorkStorage {
         let errorMsg = String(error.localizedDescription.prefix(2048))
         let now = Date()
 
-        // Fetch current attempts + maxAttempts to compute backoff.
-        let (attempts, maxAttempts): (Int, Int) = try await db.read { database in
+        // Fetch current attempts + maxAttempts + workType + payload so we can
+        // notify the dead-letter callback if this transition lands in `dead`.
+        let (attempts, maxAttempts, workType, payload): (Int, Int, String, Data) = try await db.read { database in
             guard let row = try Row.fetchOne(database, sql: """
-                SELECT attempts, maxAttempts FROM pending_work WHERE id = ?
+                SELECT attempts, maxAttempts, workType, payload FROM pending_work WHERE id = ?
             """, arguments: [storageId]) else {
-                return (0, 8)
+                return (0, 8, "", Data())
             }
-            return (row["attempts"] ?? 0, row["maxAttempts"] ?? 8)
+            return (
+                row["attempts"] ?? 0,
+                row["maxAttempts"] ?? 8,
+                row["workType"] ?? "",
+                row["payload"] ?? Data()
+            )
         }
 
         let newAttempts = attempts + 1
@@ -268,6 +318,12 @@ actor PendingWorkStorage {
 
         if newStatus == PendingWorkStatus.dead.rawValue {
             log("PendingWorkStorage: dead-lettered id=\(storageId) after \(newAttempts) attempts")
+            // Fire the dead-letter callback after the SQL transition completes.
+            // PowerWorkBridge wires this up to write a "Summary Unavailable"
+            // placeholder for .summarize work and post a list-refresh notification.
+            if let cb = self.deadLetterCallback, !workType.isEmpty {
+                await cb(workType, payload)
+            }
         } else {
             log("PendingWorkStorage: fail id=\(storageId) attempt \(newAttempts)/\(maxAttempts), retry in \(Int(backoffSeconds))s")
         }
