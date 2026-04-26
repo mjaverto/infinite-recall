@@ -18,6 +18,9 @@ DerivedData/
 **/google-credentials.json
 .claude/settings.json
 
+# Apple signing assets
+*.provisionprofile
+
 # macOS
 .DS_Store
 *.swp
