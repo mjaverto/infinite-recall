@@ -20,6 +20,7 @@
 //! separate file (`activity.db`) so it never collides with the Swift
 //! app's writes.
 
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,7 +32,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
 use super::traits::{PauseStore, PauseStoreError};
-use super::types::PauseTarget;
+use super::types::PauseTargetId;
 
 /// Inline migration source. Kept in lockstep with
 /// `Backend-Rust/api/migrations/0001_paused_work.sql` so the binary can
@@ -93,13 +94,6 @@ impl SqlPauseStore {
     }
 }
 
-fn target_str(target: PauseTarget) -> &'static str {
-    match target {
-        PauseTarget::Kind => "kind",
-        PauseTarget::Capture => "capture",
-    }
-}
-
 fn now_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,9 +108,9 @@ fn from_unix_secs(secs: i64) -> DateTime<Utc> {
 }
 
 impl PauseStore for SqlPauseStore {
-    fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>> {
+    fn paused_until(&self, target: &PauseTargetId) -> Option<DateTime<Utc>> {
         let conn = self.pool.get().ok()?;
-        let t = target_str(target);
+        let (t, id) = target.as_storage_pair();
         let now = now_unix_secs();
 
         let row: rusqlite::Result<i64> = conn.query_row(
@@ -145,13 +139,12 @@ impl PauseStore for SqlPauseStore {
 
     fn pause(
         &self,
-        target: PauseTarget,
-        id: &str,
-        minutes: u32,
+        target: &PauseTargetId,
+        minutes: NonZeroU32,
     ) -> Result<DateTime<Utc>, PauseStoreError> {
-        let resume_at_secs = now_unix_secs().saturating_add(i64::from(minutes) * 60);
+        let resume_at_secs = now_unix_secs().saturating_add(i64::from(minutes.get()) * 60);
         let resume_at = from_unix_secs(resume_at_secs);
-        let t = target_str(target);
+        let (t, id) = target.as_storage_pair();
         let conn = self.pool.get().map_err(|e| {
             tracing::error!(error = %e, "pause: pool checkout failed");
             PauseStoreError::from(e)
@@ -168,8 +161,8 @@ impl PauseStore for SqlPauseStore {
         Ok(resume_at)
     }
 
-    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError> {
-        let t = target_str(target);
+    fn resume(&self, target: &PauseTargetId) -> Result<bool, PauseStoreError> {
+        let (t, id) = target.as_storage_pair();
         let conn = self.pool.get().map_err(|e| {
             tracing::error!(error = %e, "resume: pool checkout failed");
             PauseStoreError::from(e)
@@ -190,8 +183,19 @@ impl PauseStore for SqlPauseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::types::{CaptureKind, WorkKind};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
+
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("test minutes must be non-zero")
+    }
+    const KIND_OCR: PauseTargetId = PauseTargetId::Kind(WorkKind::Ocr);
+    const KIND_TRANSCRIBE: PauseTargetId = PauseTargetId::Kind(WorkKind::Transcribe);
+    const KIND_SUMMARIZE: PauseTargetId = PauseTargetId::Kind(WorkKind::Summarize);
+    const KIND_EXTRACT_MEMORY: PauseTargetId = PauseTargetId::Kind(WorkKind::ExtractMemory);
+    const CAPTURE_AUDIO: PauseTargetId = PauseTargetId::Capture(CaptureKind::Audio);
+    const CAPTURE_SCREEN: PauseTargetId = PauseTargetId::Capture(CaptureKind::Screen);
 
     /// Each test gets its own shared-cache in-memory DB by salting the
     /// URI with a unique counter — otherwise tests would alias rows.
@@ -212,9 +216,9 @@ mod tests {
     #[test]
     fn pause_then_read_back_returns_resume_time() {
         let store = fresh_store();
-        let returned = store.pause(PauseTarget::Kind, "ocr", 15).expect("pause ok");
+        let returned = store.pause(&KIND_OCR, nz(15)).expect("pause ok");
         let observed = store
-            .paused_until(PauseTarget::Kind, "ocr")
+            .paused_until(&KIND_OCR)
             .expect("paused row should be returned");
         // Compare to the second — `pause` and `paused_until` both round to seconds.
         assert_eq!(observed.timestamp(), returned.timestamp());
@@ -227,9 +231,7 @@ mod tests {
     #[test]
     fn unpaused_target_returns_none() {
         let store = fresh_store();
-        assert!(store
-            .paused_until(PauseTarget::Capture, "audio")
-            .is_none());
+        assert!(store.paused_until(&CAPTURE_AUDIO).is_none());
     }
 
     #[test]
@@ -245,9 +247,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(store
-            .paused_until(PauseTarget::Kind, "transcribe")
-            .is_none());
+        assert!(store.paused_until(&KIND_TRANSCRIBE).is_none());
 
         // Opportunistic GC should have removed the row.
         let conn = store.pool.get().unwrap();
@@ -264,27 +264,23 @@ mod tests {
     #[test]
     fn pause_then_resume_clears_row() {
         let store = fresh_store();
-        store.pause(PauseTarget::Kind, "summarize", 30).expect("pause ok");
-        assert!(store
-            .paused_until(PauseTarget::Kind, "summarize")
-            .is_some());
+        store.pause(&KIND_SUMMARIZE, nz(30)).expect("pause ok");
+        assert!(store.paused_until(&KIND_SUMMARIZE).is_some());
 
-        let was_paused = store.resume(PauseTarget::Kind, "summarize").expect("resume ok");
+        let was_paused = store.resume(&KIND_SUMMARIZE).expect("resume ok");
         assert!(was_paused, "resume should report row was deleted");
-        assert!(store
-            .paused_until(PauseTarget::Kind, "summarize")
-            .is_none());
+        assert!(store.paused_until(&KIND_SUMMARIZE).is_none());
     }
 
     #[test]
     fn pause_overwrite_extends_resume_time() {
         let store = fresh_store();
-        let short = store.pause(PauseTarget::Capture, "screen", 1).expect("pause ok");
-        let longer = store.pause(PauseTarget::Capture, "screen", 60).expect("pause ok");
+        let short = store.pause(&CAPTURE_SCREEN, nz(1)).expect("pause ok");
+        let longer = store.pause(&CAPTURE_SCREEN, nz(60)).expect("pause ok");
         assert!(longer.timestamp() > short.timestamp());
 
         let observed = store
-            .paused_until(PauseTarget::Capture, "screen")
+            .paused_until(&CAPTURE_SCREEN)
             .expect("row should still exist after overwrite");
         assert_eq!(observed.timestamp(), longer.timestamp());
 
@@ -300,28 +296,32 @@ mod tests {
     fn resume_on_unpaused_target_is_noop() {
         let store = fresh_store();
         // Should not panic or error; should report no row was deleted.
-        let was_paused = store.resume(PauseTarget::Kind, "extract_memory").expect("resume ok");
+        let was_paused = store.resume(&KIND_EXTRACT_MEMORY).expect("resume ok");
         assert!(!was_paused, "resume of un-paused target should report false");
-        assert!(store
-            .paused_until(PauseTarget::Kind, "extract_memory")
-            .is_none());
+        assert!(store.paused_until(&KIND_EXTRACT_MEMORY).is_none());
     }
 
     #[test]
     fn kind_and_capture_targets_are_independent() {
-        let store = fresh_store();
-        store.pause(PauseTarget::Kind, "audio", 10).expect("pause ok");
-        // Same id, different target — must be a separate row.
-        assert!(store
-            .paused_until(PauseTarget::Capture, "audio")
-            .is_none());
-        assert!(store.paused_until(PauseTarget::Kind, "audio").is_some());
+        // Issue #34: previously this test paused a `Kind`/`"audio"` combo
+        // (which was illegal-but-representable). Post-#34 the type system
+        // forbids that, so we exercise independence with two legal
+        // targets that share NOTHING in common (Capture::Audio vs the
+        // analogous Kind::Ocr — same row count check, different keys).
+        store_independence_check(&fresh_store());
+
+        fn store_independence_check(store: &SqlPauseStore) {
+            store.pause(&KIND_OCR, nz(10)).expect("pause ok");
+            // Same row count check, different target — must be a separate row.
+            assert!(store.paused_until(&CAPTURE_AUDIO).is_none());
+            assert!(store.paused_until(&KIND_OCR).is_some());
+        }
     }
 
     #[test]
     fn concurrent_reads_are_safe() {
         let store = fresh_store();
-        store.pause(PauseTarget::Kind, "ocr", 5).expect("pause ok");
+        store.pause(&KIND_OCR, nz(5)).expect("pause ok");
         let store_arc = Arc::new(store);
 
         let handles: Vec<_> = (0..8)
@@ -329,7 +329,7 @@ mod tests {
                 let s = Arc::clone(&store_arc);
                 thread::spawn(move || {
                     for _ in 0..50 {
-                        let r = s.paused_until(PauseTarget::Kind, "ocr");
+                        let r = s.paused_until(&KIND_OCR);
                         assert!(r.is_some(), "concurrent reader saw missing row");
                     }
                 })
@@ -348,7 +348,7 @@ mod tests {
                 let s = Arc::clone(&store);
                 thread::spawn(move || {
                     for _ in 0..20 {
-                        s.pause(PauseTarget::Kind, "ocr", i + 1).expect("pause ok");
+                        s.pause(&KIND_OCR, nz(i + 1)).expect("pause ok");
                     }
                 })
             })

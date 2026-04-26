@@ -88,7 +88,7 @@ Field names are snake_case on the wire. Swift mirrors live in
 |---|---|
 | `KindRow.kind` / `WorkKind` | `transcribe`, `ocr`, `summarize`, `extract_memory`, `extract_action_items` |
 | `CaptureRow.kind` / `CaptureKind` | `audio`, `screen` |
-| `PauseRequest.target` / `ResumeRequest.target` / `PauseTarget` | `kind`, `capture` |
+| `PauseRequest.target` / `ResumeRequest.target` / `PauseTargetId` | `kind`, `capture` (with typed `id` payload — see below) |
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
 | `GateState.reason` / `GateReason` | `idle`, `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `none` |
 
@@ -104,6 +104,12 @@ Field names are snake_case on the wire. Swift mirrors live in
 
 For `target: "kind"`, `id` is a `WorkKind` snake_case string.
 For `target: "capture"`, `id` is `"audio"` or `"screen"`.
+
+`minutes` MUST be `> 0` (Rust enforces via `NonZeroU32` at the serde layer; a
+zero or negative value is rejected with `400 Bad Request` before any handler
+runs). Any `(target, id)` combo not in the matrix above is also rejected at
+the serde layer — `target` and `id` form a typed sum (`PauseTargetId`) so
+`{"target":"kind","id":"audio"}` is unrepresentable on both sides.
 
 ### `InflightUpdate` (Swift → Rust loopback)
 
@@ -125,9 +131,10 @@ Stream A wires; B/C/D and the idle-gate agent implement.
 
 ```rust
 trait PauseStore : Send + Sync {
-    fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>>;
-    fn pause       (&self, target: PauseTarget, id: &str, minutes: u32) -> DateTime<Utc>;
-    fn resume      (&self, target: PauseTarget, id: &str);
+    fn paused_until(&self, target: &PauseTargetId) -> Option<DateTime<Utc>>;
+    fn pause       (&self, target: &PauseTargetId, minutes: NonZeroU32)
+                       -> Result<DateTime<Utc>, PauseStoreError>;
+    fn resume      (&self, target: &PauseTargetId) -> Result<bool, PauseStoreError>;
 }
 
 trait InflightRegistry : Send + Sync {

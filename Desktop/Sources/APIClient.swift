@@ -5091,16 +5091,15 @@ extension APIClient {
   /// POST /v1/activity/pause — pause a kind or capture for `minutes` minutes.
   /// Returns the absolute resume time the daemon recorded (so UI can render
   /// a countdown that survives across restart).
-  func pauseActivity(target: String, id: String, minutes: Int) async throws -> Date {
+  ///
+  /// Issue #34: takes a typed `PauseTargetId` directly — no string coercion
+  /// at the call site. `PauseRequest.init` throws if `minutes == 0`.
+  func pauseActivity(target: PauseTargetId, minutes: UInt32) async throws -> Date {
     let base = rustBackendURL
     guard !base.isEmpty, let url = URL(string: base + "v1/activity/pause") else {
       throw APIError.invalidResponse
     }
-    let body = PauseRequest(
-      target: PauseTarget(rawValue: target) ?? .kind,
-      id: id,
-      minutes: UInt32(max(0, minutes))
-    )
+    let body = try PauseRequest(target: target, minutes: minutes)
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -5126,15 +5125,14 @@ extension APIClient {
   }
 
   /// POST /v1/activity/resume — clear an active pause. 204 on success.
-  func resumeActivity(target: String, id: String) async throws {
+  ///
+  /// Issue #34: takes a typed `PauseTargetId` directly.
+  func resumeActivity(target: PauseTargetId) async throws {
     let base = rustBackendURL
     guard !base.isEmpty, let url = URL(string: base + "v1/activity/resume") else {
       throw APIError.invalidResponse
     }
-    let body = ResumeRequest(
-      target: PauseTarget(rawValue: target) ?? .kind,
-      id: id
-    )
+    let body = ResumeRequest(target: target)
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -5155,7 +5153,7 @@ extension APIClient {
   /// POST /v1/activity/_internal/inflight — Swift→Rust loopback, called by
   /// Stream G's drain-loop wrapper to publish in-flight item labels into the
   /// snapshot. `inFlight = nil` clears the slot.
-  func reportInFlight(kind: String, inFlight: InFlight?) async throws {
+  func reportInFlight(kind: WorkKind, inFlight: InFlight?) async throws {
     let base = rustBackendURL
     guard !base.isEmpty, let url = URL(string: base + "v1/activity/_internal/inflight") else {
       throw APIError.invalidResponse

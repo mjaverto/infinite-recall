@@ -4,6 +4,8 @@
 //! generated from. **Do not change a field name without updating both
 //! `contract.md` and `Desktop/Sources/Activity/ActivityModels.swift`.**
 
+use std::num::NonZeroU32;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -26,12 +28,57 @@ pub enum CaptureKind {
     Screen,
 }
 
-/// What `Pause`/`Resume` requests target.
+/// What `Pause`/`Resume` requests target. The variant payload carries the
+/// concrete typed id, so illegal `(target, id)` combinations are
+/// unrepresentable (issue #34): you cannot construct
+/// `PauseTargetId::Kind("audio")` because `"audio"` is not a `WorkKind`.
+///
+/// Wire shape (preserved for backwards compatibility with the pre-#34
+/// `(target, id)` body):
+/// ```json
+/// { "target": "kind",    "id": "transcribe" }
+/// { "target": "capture", "id": "audio" }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PauseTarget {
-    Kind,
-    Capture,
+#[serde(tag = "target", content = "id", rename_all = "snake_case")]
+pub enum PauseTargetId {
+    Kind(WorkKind),
+    Capture(CaptureKind),
+}
+
+impl PauseTargetId {
+    /// Storage-layer projection: `("kind"|"capture", snake_case_id)`.
+    /// Used by `SqlPauseStore` to keep the on-disk schema unchanged
+    /// across the #34 refactor.
+    pub fn as_storage_pair(&self) -> (&'static str, &'static str) {
+        match self {
+            PauseTargetId::Kind(k) => ("kind", k.as_str()),
+            PauseTargetId::Capture(c) => ("capture", c.as_str()),
+        }
+    }
+}
+
+impl WorkKind {
+    /// snake_case wire/storage id (matches `#[serde(rename_all)]`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkKind::Transcribe => "transcribe",
+            WorkKind::Ocr => "ocr",
+            WorkKind::Summarize => "summarize",
+            WorkKind::ExtractMemory => "extract_memory",
+            WorkKind::ExtractActionItems => "extract_action_items",
+        }
+    }
+}
+
+impl CaptureKind {
+    /// snake_case wire/storage id (matches `#[serde(rename_all)]`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CaptureKind::Audio => "audio",
+            CaptureKind::Screen => "screen",
+        }
+    }
 }
 
 /// macOS thermal pressure (mirrors `NSProcessInfo.ThermalState`).
@@ -145,27 +192,69 @@ pub struct ActivitySnapshot {
 }
 
 /// POST /v1/activity/pause body.
+///
+/// Issue #34: the `(target, id)` pair is now a typed `PauseTargetId` sum
+/// type — `serde(flatten)` keeps the wire shape `{target, id, minutes}`
+/// identical, but illegal combinations like `target=kind, id="audio"`
+/// no longer deserialize. `NonZeroU32` likewise rejects `minutes: 0` at
+/// the serde layer, so the route handler no longer needs a manual check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PauseRequest {
-    pub target: PauseTarget,
-    /// Either a `WorkKind` snake_case string (when `target=kind`) or
-    /// `"audio"` / `"screen"` (when `target=capture`).
-    pub id: String,
-    pub minutes: u32,
+    #[serde(flatten)]
+    pub target: PauseTargetId,
+    pub minutes: NonZeroU32,
 }
 
 /// POST /v1/activity/resume body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeRequest {
-    pub target: PauseTarget,
-    pub id: String,
+    #[serde(flatten)]
+    pub target: PauseTargetId,
 }
 
 /// POST /v1/activity/_internal/inflight body (Swift → Rust loopback).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InflightUpdate {
-    /// `WorkKind` snake_case string.
-    pub kind: String,
+    pub kind: WorkKind,
     /// `None` clears the slot.
     pub in_flight: Option<InFlight>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR #39 review: guard against future drift between `WorkKind::as_str()`
+    /// and the snake_case derivation `serde(rename_all = "snake_case")` uses
+    /// on the wire. If a contributor adds a `WorkKind` variant and forgets
+    /// to extend `as_str()`, this test will fail.
+    #[test]
+    fn workkind_as_str_matches_serde() {
+        for k in [
+            WorkKind::Transcribe,
+            WorkKind::Ocr,
+            WorkKind::Summarize,
+            WorkKind::ExtractMemory,
+            WorkKind::ExtractActionItems,
+        ] {
+            assert_eq!(
+                serde_json::to_value(k).unwrap(),
+                serde_json::Value::String(k.as_str().to_string()),
+                "WorkKind::{:?} as_str() drifted from serde rename",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn capturekind_as_str_matches_serde() {
+        for c in [CaptureKind::Audio, CaptureKind::Screen] {
+            assert_eq!(
+                serde_json::to_value(c).unwrap(),
+                serde_json::Value::String(c.as_str().to_string()),
+                "CaptureKind::{:?} as_str() drifted from serde rename",
+                c
+            );
+        }
+    }
 }

@@ -12,10 +12,12 @@
 //   3. Optional fields are honoured in both directions (nullability,
 //      omission of `waiting_for`, `gpu_system_percent`, etc).
 //   4. Every `GateReason` enum value decodes from its snake_case wire form.
-//   5. Every `WorkKind`, `CaptureKind`, `ThermalState`, `PauseTarget`
+//   5. Every `WorkKind`, `CaptureKind`, `ThermalState`, `PauseTargetId`
 //      enum value decodes from its snake_case wire form.
 //   6. Request bodies (`PauseRequest`, `ResumeRequest`, `InflightUpdate`)
 //      encode to the wire shape Stream A expects.
+//   7. Issue #34: `PauseTargetId` sum type makes illegal `(target,id)`
+//      pairs unrepresentable; `PauseRequest.init` rejects `minutes == 0`.
 
 import XCTest
 @testable import Omi_Computer
@@ -329,20 +331,99 @@ final class ActivityModelsTests: XCTestCase {
         }
     }
 
-    func testPauseTargetEveryEnumValueRoundTrips() throws {
-        for (wire, expected) in [("kind", PauseTarget.kind), ("capture", .capture)] {
+    // Issue #34: `PauseTargetId` is a typed sum — every legal combination
+    // round-trips, every illegal combination fails to decode.
+
+    func testPauseTargetIdEveryKindRoundTrips() throws {
+        let cases: [(String, WorkKind)] = [
+            ("transcribe",            .transcribe),
+            ("ocr",                   .ocr),
+            ("summarize",             .summarize),
+            ("extract_memory",        .extractMemory),
+            ("extract_action_items",  .extractActionItems),
+        ]
+        for (wireId, expected) in cases {
             let json = """
-            { "target": "\(wire)", "id": "ocr", "minutes": 15 }
+            { "target": "kind", "id": "\(wireId)", "minutes": 15 }
             """
-            let req = try Self.makeDecoder().decode(PauseRequest.self, from: json.data(using: .utf8)!)
-            XCTAssertEqual(req.target, expected)
+            let req = try Self.makeDecoder()
+                .decode(PauseRequest.self, from: json.data(using: .utf8)!)
+            XCTAssertEqual(req.target, .kind(expected))
+            XCTAssertEqual(req.minutes, 15)
+
+            // Re-encoded body must round-trip through the same wire shape.
+            let data = try Self.makeEncoder().encode(req)
+            let s = String(data: data, encoding: .utf8) ?? ""
+            XCTAssertTrue(s.contains("\"target\":\"kind\""), "got: \(s)")
+            XCTAssertTrue(s.contains("\"id\":\"\(wireId)\""), "got: \(s)")
+            XCTAssertTrue(s.contains("\"minutes\":15"), "got: \(s)")
+        }
+    }
+
+    func testPauseTargetIdEveryCaptureRoundTrips() throws {
+        for (wireId, expected) in [("audio", CaptureKind.audio), ("screen", .screen)] {
+            let json = """
+            { "target": "capture", "id": "\(wireId)", "minutes": 5 }
+            """
+            let req = try Self.makeDecoder()
+                .decode(PauseRequest.self, from: json.data(using: .utf8)!)
+            XCTAssertEqual(req.target, .capture(expected))
+
+            let data = try Self.makeEncoder().encode(req)
+            let s = String(data: data, encoding: .utf8) ?? ""
+            XCTAssertTrue(s.contains("\"target\":\"capture\""), "got: \(s)")
+            XCTAssertTrue(s.contains("\"id\":\"\(wireId)\""), "got: \(s)")
+        }
+    }
+
+    func testPauseRequestRejectsKindWithCaptureId() {
+        // `kind`+`"audio"` is unrepresentable — WorkKind has no `audio`.
+        let json = """
+        { "target": "kind", "id": "audio", "minutes": 5 }
+        """
+        XCTAssertThrowsError(
+            try Self.makeDecoder().decode(PauseRequest.self, from: json.data(using: .utf8)!)
+        )
+    }
+
+    func testPauseRequestRejectsCaptureWithKindId() {
+        let json = """
+        { "target": "capture", "id": "ocr", "minutes": 5 }
+        """
+        XCTAssertThrowsError(
+            try Self.makeDecoder().decode(PauseRequest.self, from: json.data(using: .utf8)!)
+        )
+    }
+
+    func testPauseRequestRejectsUnknownTarget() {
+        let json = """
+        { "target": "nope", "id": "ocr", "minutes": 5 }
+        """
+        XCTAssertThrowsError(
+            try Self.makeDecoder().decode(PauseRequest.self, from: json.data(using: .utf8)!)
+        )
+    }
+
+    func testPauseRequestRejectsZeroMinutesInDecode() {
+        // Mirrors Rust's `NonZeroU32` reject at the deserialize layer.
+        let json = """
+        { "target": "kind", "id": "ocr", "minutes": 0 }
+        """
+        XCTAssertThrowsError(
+            try Self.makeDecoder().decode(PauseRequest.self, from: json.data(using: .utf8)!)
+        )
+    }
+
+    func testPauseRequestInitThrowsForZeroMinutes() {
+        XCTAssertThrowsError(try PauseRequest(target: .kind(.ocr), minutes: 0)) { err in
+            XCTAssertEqual(err as? PauseRequestError, .zeroMinutes)
         }
     }
 
     // MARK: - Request bodies serialise to wire shape Stream A expects
 
     func testPauseRequestEncodesSnakeCase() throws {
-        let req = PauseRequest(target: .kind, id: "ocr", minutes: 15)
+        let req = try PauseRequest(target: .kind(.ocr), minutes: 15)
         let data = try Self.makeEncoder().encode(req)
         let str = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(str.contains("\"target\":\"kind\""), "got: \(str)")
@@ -351,11 +432,37 @@ final class ActivityModelsTests: XCTestCase {
     }
 
     func testResumeRequestEncodesSnakeCase() throws {
-        let req = ResumeRequest(target: .capture, id: "audio")
+        let req = ResumeRequest(target: .capture(.audio))
         let data = try Self.makeEncoder().encode(req)
         let str = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(str.contains("\"target\":\"capture\""), "got: \(str)")
         XCTAssertTrue(str.contains("\"id\":\"audio\""),       "got: \(str)")
+    }
+
+    func testResumeRequestRoundTripsForEveryVariant() throws {
+        let kindCases: [(String, WorkKind)] = [
+            ("transcribe", .transcribe),
+            ("ocr", .ocr),
+            ("summarize", .summarize),
+            ("extract_memory", .extractMemory),
+            ("extract_action_items", .extractActionItems),
+        ]
+        for (wireId, kind) in kindCases {
+            let json = """
+            { "target": "kind", "id": "\(wireId)" }
+            """
+            let req = try Self.makeDecoder()
+                .decode(ResumeRequest.self, from: json.data(using: .utf8)!)
+            XCTAssertEqual(req.target, .kind(kind))
+        }
+        for (wireId, cap) in [("audio", CaptureKind.audio), ("screen", .screen)] {
+            let json = """
+            { "target": "capture", "id": "\(wireId)" }
+            """
+            let req = try Self.makeDecoder()
+                .decode(ResumeRequest.self, from: json.data(using: .utf8)!)
+            XCTAssertEqual(req.target, .capture(cap))
+        }
     }
 
     func testInflightUpdateEncodesNullClearing() throws {
@@ -366,7 +473,7 @@ final class ActivityModelsTests: XCTestCase {
         // We assert Swift's actual behaviour here so a future encoder swap
         // (e.g. to one that emits explicit nulls) is a deliberate change with
         // a failing test as the heads-up.
-        let cleared = InflightUpdate(kind: "transcribe", inFlight: nil)
+        let cleared = InflightUpdate(kind: .transcribe, inFlight: nil)
         let data = try Self.makeEncoder().encode(cleared)
         let str = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(str.contains("\"kind\":\"transcribe\""), "got: \(str)")
@@ -378,14 +485,14 @@ final class ActivityModelsTests: XCTestCase {
 
         // Round-trip: the receiver must decode this back to nil.
         let decoded = try Self.makeDecoder().decode(InflightUpdate.self, from: data)
-        XCTAssertEqual(decoded.kind, "transcribe")
+        XCTAssertEqual(decoded.kind, .transcribe)
         XCTAssertNil(decoded.inFlight)
     }
 
     func testInflightUpdateEncodesPopulated() throws {
         let date = Self.isoFractional.date(from: "2026-04-26T14:22:03.812Z")!
         let upd = InflightUpdate(
-            kind: "transcribe",
+            kind: .transcribe,
             inFlight: InFlight(label: "Transcribing 14:22:01→14:25:00 (en)", startedAt: date)
         )
         let data = try Self.makeEncoder().encode(upd)

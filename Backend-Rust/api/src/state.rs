@@ -8,10 +8,13 @@ use crate::db::SqlitePool;
 /// Notification payload broadcast when a pause/resume is applied so other
 /// subsystems (e.g. the Swift `CapturePauseGate` poller) can refresh
 /// without waiting for their next poll tick.
+///
+/// Issue #34: `target` is now a typed `PauseTargetId` carrying both the
+/// kind/capture discriminator and its concrete payload, so subscribers
+/// no longer have to redo string→variant parsing on every change.
 #[derive(Debug, Clone)]
 pub struct PauseChange {
-    pub target: crate::activity::PauseTarget,
-    pub id: String,
+    pub target: crate::activity::PauseTargetId,
     /// `None` = resumed/cleared. `Some(t)` = paused until `t`.
     pub paused_until: Option<chrono::DateTime<chrono::Utc>>,
 }

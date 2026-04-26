@@ -25,9 +25,61 @@ public enum CaptureKind: String, Codable, CaseIterable, Hashable {
     case screen
 }
 
-public enum PauseTarget: String, Codable, Hashable {
-    case kind
-    case capture
+/// Issue #34: typed sum mirror of Rust's `PauseTargetId`. The variant
+/// payload carries the typed id (`WorkKind` or `CaptureKind`) so an
+/// illegal combination — e.g. `kind` + `"audio"` — is unrepresentable
+/// in Swift the same way it is in Rust.
+///
+/// Wire shape preserved (the pre-#34 `(target, id)` body):
+/// ```
+/// { "target": "kind",    "id": "transcribe" }
+/// { "target": "capture", "id": "audio" }
+/// ```
+public enum PauseTargetId: Codable, Hashable {
+    case kind(WorkKind)
+    case capture(CaptureKind)
+
+    enum CodingKeys: String, CodingKey {
+        case target
+        case id
+    }
+
+    /// Wire-format discriminator matching Rust's `serde(rename_all="snake_case")`.
+    private enum TargetTag: String, Codable {
+        case kind
+        case capture
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let tag = try c.decode(TargetTag.self, forKey: .target)
+        switch tag {
+        case .kind:
+            let work = try c.decode(WorkKind.self, forKey: .id)
+            self = .kind(work)
+        case .capture:
+            let cap = try c.decode(CaptureKind.self, forKey: .id)
+            self = .capture(cap)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .kind(let k):
+            try c.encode(TargetTag.kind, forKey: .target)
+            try c.encode(k, forKey: .id)
+        case .capture(let cap):
+            try c.encode(TargetTag.capture, forKey: .target)
+            try c.encode(cap, forKey: .id)
+        }
+    }
+}
+
+/// Validation error surfaced by `PauseRequest.init`. `minutes == 0` is
+/// the only condition; mirror's the Rust `NonZeroU32` deserialize check.
+public enum PauseRequestError: Error, Equatable {
+    case zeroMinutes
 }
 
 public enum ThermalState: String, Codable, Hashable {
@@ -234,30 +286,71 @@ public struct ActivitySnapshot: Codable, Hashable {
 
 // MARK: - Request bodies
 
+/// POST /v1/activity/pause body. Issue #34: `target` is a typed sum so
+/// `kind`+`"audio"` is unrepresentable; `minutes > 0` is checked in `init`
+/// to mirror Rust's `NonZeroU32`. The wire shape stays
+/// `{target, id, minutes}` because `PauseTargetId.encode(to:)` flattens
+/// its two keys directly into the request body.
 public struct PauseRequest: Codable {
-    public let target: PauseTarget
-    public let id: String
+    public let target: PauseTargetId
     public let minutes: UInt32
 
-    public init(target: PauseTarget, id: String, minutes: UInt32) {
+    /// Throwing init enforces the `minutes > 0` invariant up front so
+    /// the Rust daemon never sees a zero-minute pause.
+    public init(target: PauseTargetId, minutes: UInt32) throws {
+        guard minutes > 0 else { throw PauseRequestError.zeroMinutes }
         self.target = target
-        self.id = id
         self.minutes = minutes
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case minutes
+    }
+
+    public init(from decoder: Decoder) throws {
+        // Decode the flattened target/id pair from the same container, then
+        // pull `minutes` from the keyed view.
+        self.target = try PauseTargetId(from: decoder)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let mins = try c.decode(UInt32.self, forKey: .minutes)
+        guard mins > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .minutes,
+                in: c,
+                debugDescription: "minutes must be > 0 (mirrors Rust NonZeroU32)"
+            )
+        }
+        self.minutes = mins
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        // Flatten target/id into the same encoder container as `minutes`.
+        try target.encode(to: encoder)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(minutes, forKey: .minutes)
     }
 }
 
+/// POST /v1/activity/resume body. Wire shape `{target, id}` — `target` is
+/// a typed sum after #34.
 public struct ResumeRequest: Codable {
-    public let target: PauseTarget
-    public let id: String
+    public let target: PauseTargetId
 
-    public init(target: PauseTarget, id: String) {
+    public init(target: PauseTargetId) {
         self.target = target
-        self.id = id
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.target = try PauseTargetId(from: decoder)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try target.encode(to: encoder)
     }
 }
 
 public struct InflightUpdate: Codable {
-    public let kind: String
+    public let kind: WorkKind
     public let inFlight: InFlight?
 
     enum CodingKeys: String, CodingKey {
@@ -265,7 +358,7 @@ public struct InflightUpdate: Codable {
         case inFlight = "in_flight"
     }
 
-    public init(kind: String, inFlight: InFlight?) {
+    public init(kind: WorkKind, inFlight: InFlight?) {
         self.kind = kind
         self.inFlight = inFlight
     }

@@ -371,7 +371,7 @@ struct ActivityPage: View {
         let isPaused = (row.pausedUntil ?? .distantPast) > tick
         if isPaused {
             Button("Resume") {
-                Task { await service.resume(target: .kind, id: row.kind.rawValue) }
+                Task { await service.resume(target: .kind(row.kind)) }
             }
             .buttonStyle(.borderless)
             .scaledFont(size: 12, weight: .medium)
@@ -447,7 +447,7 @@ struct ActivityPage: View {
             Spacer()
             if isPaused {
                 Button("Resume") {
-                    Task { await service.resume(target: .capture, id: row.kind.rawValue) }
+                    Task { await service.resume(target: .capture(row.kind)) }
                 }
                 .buttonStyle(.borderless)
                 .scaledFont(size: 12, weight: .medium)

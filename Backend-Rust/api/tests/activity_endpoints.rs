@@ -74,6 +74,7 @@
 // =====================================================================
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::body::{to_bytes, Body};
@@ -86,11 +87,15 @@ use infinite_recall_api::activity::traits::{
     InflightRegistry, PauseStore, PauseStoreError, ProcessingGate, ResourceSampler,
 };
 use infinite_recall_api::activity::types::{
-    GateReason, GateState, InFlight, PauseTarget, ProcessBreakdown,
+    CaptureKind, GateReason, GateState, InFlight, PauseTargetId, ProcessBreakdown,
     ResourceSample, ThermalState, WorkKind,
 };
 use infinite_recall_api::routes;
 use infinite_recall_api::state::AppState;
+
+fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).expect("test minutes must be non-zero")
+}
 
 // ---------------------------------------------------------------------
 // Stub implementations
@@ -99,8 +104,11 @@ use infinite_recall_api::state::AppState;
 /// Minimal in-memory `PauseStore` used when Stream B's SQLite impl is not
 /// the unit under test. For persistence test, use Stream B's `SqlPauseStore`
 /// directly (see `pause_persists_across_restart`).
+///
+/// Issue #34: keys are `PauseTargetId` directly — no string `id` column,
+/// no risk of `Kind`+`"audio"` slipping through.
 struct MemPauseStore {
-    inner: Mutex<HashMap<(PauseTarget, String), DateTime<Utc>>>,
+    inner: Mutex<HashMap<PauseTargetId, DateTime<Utc>>>,
 }
 
 impl MemPauseStore {
@@ -112,35 +120,22 @@ impl MemPauseStore {
 }
 
 impl PauseStore for MemPauseStore {
-    fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(&(target, id.to_string()))
-            .copied()
+    fn paused_until(&self, target: &PauseTargetId) -> Option<DateTime<Utc>> {
+        self.inner.lock().unwrap().get(target).copied()
     }
 
     fn pause(
         &self,
-        target: PauseTarget,
-        id: &str,
-        minutes: u32,
+        target: &PauseTargetId,
+        minutes: NonZeroU32,
     ) -> Result<DateTime<Utc>, PauseStoreError> {
-        let resume_at = Utc::now() + Duration::minutes(minutes as i64);
-        self.inner
-            .lock()
-            .unwrap()
-            .insert((target, id.to_string()), resume_at);
+        let resume_at = Utc::now() + Duration::minutes(i64::from(minutes.get()));
+        self.inner.lock().unwrap().insert(*target, resume_at);
         Ok(resume_at)
     }
 
-    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError> {
-        let removed = self
-            .inner
-            .lock()
-            .unwrap()
-            .remove(&(target, id.to_string()))
-            .is_some();
+    fn resume(&self, target: &PauseTargetId) -> Result<bool, PauseStoreError> {
+        let removed = self.inner.lock().unwrap().remove(target).is_some();
         Ok(removed)
     }
 }
@@ -449,7 +444,7 @@ async fn pause_persists_across_restart() {
     {
         let store = SqlPauseStore::open(&path).expect("open SqlPauseStore");
         let resume_at = store
-            .pause(PauseTarget::Kind, "ocr", 30)
+            .pause(&PauseTargetId::Kind(WorkKind::Ocr), nz(30))
             .expect("pause should persist");
         assert!(resume_at > Utc::now());
         // store dropped here.
@@ -459,7 +454,7 @@ async fn pause_persists_across_restart() {
     {
         let store = SqlPauseStore::open(&path).expect("re-open SqlPauseStore");
         let pu = store
-            .paused_until(PauseTarget::Kind, "ocr")
+            .paused_until(&PauseTargetId::Kind(WorkKind::Ocr))
             .expect("pause must survive restart");
         let delta = pu - Utc::now();
         assert!(
@@ -484,9 +479,11 @@ async fn resume_clears_pause() {
     let (k, v) = auth_header();
 
     pause_store
-        .pause(PauseTarget::Kind, "ocr", 5)
+        .pause(&PauseTargetId::Kind(WorkKind::Ocr), nz(5))
         .expect("pause ok");
-    assert!(pause_store.paused_until(PauseTarget::Kind, "ocr").is_some());
+    assert!(pause_store
+        .paused_until(&PauseTargetId::Kind(WorkKind::Ocr))
+        .is_some());
 
     let req = Request::builder()
         .method(Method::POST)
@@ -498,7 +495,9 @@ async fn resume_clears_pause() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(
-        pause_store.paused_until(PauseTarget::Kind, "ocr").is_none(),
+        pause_store
+            .paused_until(&PauseTargetId::Kind(WorkKind::Ocr))
+            .is_none(),
         "resume must clear the row"
     );
 }
@@ -652,12 +651,180 @@ async fn enum_round_trip_via_wire() {
         assert_eq!(s, format!("\"{wire}\""));
     }
 
-    // PauseTarget.
-    for (pt, wire) in [
-        (t::PauseTarget::Kind, "kind"),
-        (t::PauseTarget::Capture, "capture"),
+    // Issue #34: `PauseTargetId` is a sum type that serializes via
+    // serde(tag/content) — exercise every variant's wire form.
+    for kind in [
+        t::WorkKind::Transcribe,
+        t::WorkKind::Ocr,
+        t::WorkKind::Summarize,
+        t::WorkKind::ExtractMemory,
+        t::WorkKind::ExtractActionItems,
     ] {
+        let pt = t::PauseTargetId::Kind(kind);
         let s = serde_json::to_string(&pt).unwrap();
-        assert_eq!(s, format!("\"{wire}\""));
+        let expected = format!(r#"{{"target":"kind","id":"{}"}}"#, kind.as_str());
+        assert_eq!(s, expected, "PauseTargetId::Kind({kind:?}) wire shape");
+        let back: t::PauseTargetId = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, pt);
     }
+    for cap in [t::CaptureKind::Audio, t::CaptureKind::Screen] {
+        let pt = t::PauseTargetId::Capture(cap);
+        let s = serde_json::to_string(&pt).unwrap();
+        let expected = format!(r#"{{"target":"capture","id":"{}"}}"#, cap.as_str());
+        assert_eq!(s, expected, "PauseTargetId::Capture({cap:?}) wire shape");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #34 — `PauseRequest` / `ResumeRequest` wire-format coverage
+// ---------------------------------------------------------------------
+
+/// Pause body decodes for every `WorkKind` variant via the typed sum.
+#[tokio::test]
+async fn pause_kind_round_trip_for_every_variant() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    for kind_str in [
+        "transcribe",
+        "ocr",
+        "summarize",
+        "extract_memory",
+        "extract_action_items",
+    ] {
+        let body = json!({"target":"kind","id":kind_str,"minutes":1});
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/activity/pause")
+            .header(&k, v.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "pause kind {kind_str} should be accepted"
+        );
+    }
+}
+
+/// Pause body decodes for every `CaptureKind` variant via the typed sum.
+#[tokio::test]
+async fn pause_capture_round_trip_for_every_variant() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    for cap_str in ["audio", "screen"] {
+        let body = json!({"target":"capture","id":cap_str,"minutes":2});
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/activity/pause")
+            .header(&k, v.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "pause capture {cap_str} should be accepted"
+        );
+    }
+}
+
+/// `minutes: 0` is unrepresentable post-#34 — `NonZeroU32` rejects at the
+/// serde layer, which axum surfaces as a 4xx with no manual guard required.
+#[tokio::test]
+async fn pause_with_zero_minutes_is_4xx_from_serde() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    let body = json!({"target":"kind","id":"ocr","minutes":0});
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/pause")
+        .header(k, v)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "minutes=0 must be rejected by serde; got {}",
+        resp.status()
+    );
+}
+
+/// `target=kind` + an unknown id (or one that belongs to the other variant)
+/// is unrepresentable — serde rejects at decode.
+#[tokio::test]
+async fn pause_with_unknown_target_id_is_4xx_from_serde() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+
+    // `Kind` variant cannot carry a `CaptureKind` id.
+    let cases = [
+        json!({"target":"kind","id":"audio","minutes":5}),
+        json!({"target":"kind","id":"nope","minutes":5}),
+        json!({"target":"capture","id":"ocr","minutes":5}),
+        json!({"target":"capture","id":"nope","minutes":5}),
+        json!({"target":"nope","id":"ocr","minutes":5}),
+    ];
+    for body in cases {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/activity/pause")
+            .header(&k, v.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx for body {body:?}; got {}",
+            resp.status()
+        );
+    }
+}
+
+/// Resume body decodes for both kind and capture targets via the typed sum.
+#[tokio::test]
+async fn resume_round_trip_for_kind_and_capture() {
+    let pause_store: Arc<dyn PauseStore> = Arc::new(MemPauseStore::new());
+    let state = make_state(
+        pause_store.clone(),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+
+    // Seed both a kind and capture pause.
+    pause_store
+        .pause(&PauseTargetId::Kind(WorkKind::Ocr), nz(5))
+        .unwrap();
+    pause_store
+        .pause(&PauseTargetId::Capture(CaptureKind::Audio), nz(5))
+        .unwrap();
+
+    for body in [
+        json!({"target":"kind","id":"ocr"}),
+        json!({"target":"capture","id":"audio"}),
+    ] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/activity/resume")
+            .header(&k, v.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "body: {body}");
+    }
+
+    assert!(pause_store
+        .paused_until(&PauseTargetId::Kind(WorkKind::Ocr))
+        .is_none());
+    assert!(pause_store
+        .paused_until(&PauseTargetId::Capture(CaptureKind::Audio))
+        .is_none());
 }
