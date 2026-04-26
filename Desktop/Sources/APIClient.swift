@@ -4955,3 +4955,182 @@ extension APIClient {
     return try await patch("v1/tools/action-items/\(id)", body: body, customBaseURL: nil)
   }
 }
+
+// === activity:F ===
+// Activity tab — Stream F. Loopback calls to the local Rust daemon for the
+// Activity surface. These BYPASS `isLocalOnlyMode`'s short-circuit because
+// the Rust daemon runs on 127.0.0.1 and is always reachable; we only want
+// to short-circuit *cloud* (api.omi.me) calls. Headers are built inline so
+// `buildHeaders`'s defensive `localOnlyMode` throw doesn't kill us.
+
+extension APIClient {
+
+  /// Build headers for a Rust-daemon call without `buildHeaders`'s
+  /// `localOnlyMode` short-circuit. Auth is best-effort: if no token is
+  /// available we still send the request (Rust daemon may be configured
+  /// without bearer auth in dev).
+  fileprivate func activityHeaders() async -> [String: String] {
+    var headers: [String: String] = [
+      "Content-Type": "application/json",
+      "X-App-Platform": "macos",
+    ]
+    if let testHeader = testAuthHeader {
+      headers["Authorization"] = testHeader
+    } else {
+      let authService = await MainActor.run { AuthService.shared }
+      if let authHeader = try? await authService.getAuthHeader() {
+        headers["Authorization"] = authHeader
+      }
+    }
+    return headers
+  }
+
+  /// Decoder used for Activity responses — matches the existing custom
+  /// ISO8601-with-fractional-seconds decoder defined on `APIClient.init`.
+  fileprivate static func makeActivityDecoder() -> JSONDecoder {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .custom { decoder in
+      let container = try decoder.singleValueContainer()
+      let dateString = try container.decode(String.self)
+
+      let isoWithFractional = ISO8601DateFormatter()
+      isoWithFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      if let date = isoWithFractional.date(from: dateString) {
+        return date
+      }
+      let iso = ISO8601DateFormatter()
+      if let date = iso.date(from: dateString) {
+        return date
+      }
+      throw DecodingError.dataCorruptedError(
+        in: container, debugDescription: "Invalid date format: \(dateString)")
+    }
+    return decoder
+  }
+
+  /// Encoder for Activity request bodies. Dates are emitted as ISO8601 with
+  /// fractional seconds to match the Rust side.
+  fileprivate static func makeActivityEncoder() -> JSONEncoder {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .custom { date, encoder in
+      let iso = ISO8601DateFormatter()
+      iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      var container = encoder.singleValueContainer()
+      try container.encode(iso.string(from: date))
+    }
+    return encoder
+  }
+
+  /// GET /v1/activity/snapshot — full live activity snapshot for the UI.
+  func getActivitySnapshot() async throws -> ActivitySnapshot {
+    let base = rustBackendURL
+    guard !base.isEmpty, let url = URL(string: base + "v1/activity/snapshot") else {
+      throw APIError.invalidResponse
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.allHTTPHeaderFields = await activityHeaders()
+    request.timeoutInterval = 5
+
+    let (data, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+    return try Self.makeActivityDecoder().decode(ActivitySnapshot.self, from: data)
+  }
+
+  /// POST /v1/activity/pause — pause a kind or capture for `minutes` minutes.
+  /// Returns the absolute resume time the daemon recorded (so UI can render
+  /// a countdown that survives across restart).
+  func pauseActivity(target: String, id: String, minutes: Int) async throws -> Date {
+    let base = rustBackendURL
+    guard !base.isEmpty, let url = URL(string: base + "v1/activity/pause") else {
+      throw APIError.invalidResponse
+    }
+    let body = PauseRequest(
+      target: PauseTarget(rawValue: target) ?? .kind,
+      id: id,
+      minutes: UInt32(max(0, minutes))
+    )
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.allHTTPHeaderFields = await activityHeaders()
+    request.httpBody = try Self.makeActivityEncoder().encode(body)
+    request.timeoutInterval = 5
+
+    let (data, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+
+    struct PauseResponse: Decodable {
+      let pausedUntil: Date
+      enum CodingKeys: String, CodingKey { case pausedUntil = "paused_until" }
+    }
+    let decoded = try Self.makeActivityDecoder().decode(PauseResponse.self, from: data)
+    return decoded.pausedUntil
+  }
+
+  /// POST /v1/activity/resume — clear an active pause. 204 on success.
+  func resumeActivity(target: String, id: String) async throws {
+    let base = rustBackendURL
+    guard !base.isEmpty, let url = URL(string: base + "v1/activity/resume") else {
+      throw APIError.invalidResponse
+    }
+    let body = ResumeRequest(
+      target: PauseTarget(rawValue: target) ?? .kind,
+      id: id
+    )
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.allHTTPHeaderFields = await activityHeaders()
+    request.httpBody = try Self.makeActivityEncoder().encode(body)
+    request.timeoutInterval = 5
+
+    let (_, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+  }
+
+  /// POST /v1/activity/_internal/inflight — Swift→Rust loopback, called by
+  /// Stream G's drain-loop wrapper to publish in-flight item labels into the
+  /// snapshot. `inFlight = nil` clears the slot.
+  func reportInFlight(kind: String, inFlight: InFlight?) async throws {
+    let base = rustBackendURL
+    guard !base.isEmpty, let url = URL(string: base + "v1/activity/_internal/inflight") else {
+      throw APIError.invalidResponse
+    }
+    let body = InflightUpdate(kind: kind, inFlight: inFlight)
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.allHTTPHeaderFields = await activityHeaders()
+    request.httpBody = try Self.makeActivityEncoder().encode(body)
+    request.timeoutInterval = 5
+
+    let (_, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+  }
+}
+// === /activity:F ===

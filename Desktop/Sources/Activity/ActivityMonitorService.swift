@@ -1,7 +1,234 @@
-// Activity Tab — Phase 0 stub.
+// Activity Tab — Stream F.
 //
-// TODO: Stream F. `@MainActor ObservableObject` that polls
-// `APIClient.shared.getActivitySnapshot()` on a 1s Timer.publish, suspends
-// on `NSWindow.didResignKey`, resumes on `didBecomeKey`.
+// `ActivityMonitorService` polls the local Rust daemon at 1 Hz while the IR
+// window is key, exposing the latest `ActivitySnapshot` to SwiftUI via
+// `@Published`. Polling is suspended while the window is hidden / not key
+// (per Phase 0 contract: "Hidden window suspends polling. UI MUST NOT poll
+// the Rust daemon while NSWindow.didResignKey").
+//
+// Pause/resume + capture pause/resume are funneled through this service so
+// it can:
+//   1. Optimistically mutate the local snapshot for instant UI feedback
+//      (set/clear `paused_until` on the affected row).
+//   2. Post `ActivityNotifications.pauseChanged` so Stream H's
+//      `CapturePauseGate` (and live capture services) can react without
+//      polling.
+//
+// Owner: Stream F.
 
+import AppKit
+import Combine
 import Foundation
+
+@MainActor
+public final class ActivityMonitorService: ObservableObject {
+    public static let shared = ActivityMonitorService()
+
+    @Published public private(set) var snapshot: ActivitySnapshot?
+    @Published public private(set) var lastError: String?
+
+    private var timer: Timer?
+    private var isStarted: Bool = false
+    private var isFetching: Bool = false
+    private var keyObserver: NSObjectProtocol?
+    private var resignObserver: NSObjectProtocol?
+
+    private init() {}
+
+    deinit {
+        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        timer?.invalidate()
+    }
+
+    // MARK: - Lifecycle
+
+    /// Begin polling. Idempotent. Wires up window-key observers so polling
+    /// suspends when the IR window is hidden/inactive.
+    public func start() {
+        guard !isStarted else { return }
+        isStarted = true
+
+        keyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleBecameKey()
+            }
+        }
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleResignedKey()
+            }
+        }
+
+        // If a window is already key at start time, begin polling immediately
+        // (no 1s delay before the first sample).
+        if NSApp?.keyWindow != nil {
+            startTimerIfNeeded(immediateFetch: true)
+        }
+    }
+
+    /// Stop polling and tear down observers.
+    public func stop() {
+        isStarted = false
+        timer?.invalidate()
+        timer = nil
+        if let keyObserver {
+            NotificationCenter.default.removeObserver(keyObserver)
+            self.keyObserver = nil
+        }
+        if let resignObserver {
+            NotificationCenter.default.removeObserver(resignObserver)
+            self.resignObserver = nil
+        }
+    }
+
+    // MARK: - Public actions
+
+    /// Pause a `WorkKind` row for `minutes` minutes. Optimistically updates
+    /// the local snapshot and posts `pauseChanged`.
+    public func pauseKind(_ kind: WorkKind, minutes: Int) async {
+        await pause(target: .kind, id: kind.rawValue, minutes: minutes)
+    }
+
+    /// Pause a capture row (audio/screen) for `minutes` minutes. UI is
+    /// expected to have already shown the confirm sheet for `audio`.
+    public func pauseCapture(_ capture: CaptureKind, minutes: Int) async {
+        await pause(target: .capture, id: capture.rawValue, minutes: minutes)
+    }
+
+    /// Resume a previously paused row.
+    public func resume(target: PauseTarget, id: String) async {
+        do {
+            try await APIClient.shared.resumeActivity(target: target.rawValue, id: id)
+            applyOptimisticPause(target: target, id: id, until: nil)
+            postPauseChanged()
+            await fetchOnce()
+        } catch {
+            lastError = "resume failed: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Private
+
+    private func pause(target: PauseTarget, id: String, minutes: Int) async {
+        do {
+            let until = try await APIClient.shared.pauseActivity(
+                target: target.rawValue,
+                id: id,
+                minutes: minutes
+            )
+            applyOptimisticPause(target: target, id: id, until: until)
+            postPauseChanged()
+            await fetchOnce()
+        } catch {
+            lastError = "pause failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func handleBecameKey() {
+        guard isStarted else { return }
+        startTimerIfNeeded(immediateFetch: true)
+    }
+
+    private func handleResignedKey() {
+        guard isStarted else { return }
+        // If another IR window is still key, keep polling.
+        if NSApp?.keyWindow != nil { return }
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func startTimerIfNeeded(immediateFetch: Bool) {
+        if timer != nil {
+            if immediateFetch { Task { await self.fetchOnce() } }
+            return
+        }
+        let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.fetchOnce()
+            }
+        }
+        // Ensure the timer fires while menus / drags hold the run loop.
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        if immediateFetch {
+            Task { await self.fetchOnce() }
+        }
+    }
+
+    private func fetchOnce() async {
+        guard !isFetching else { return }
+        isFetching = true
+        defer { isFetching = false }
+        do {
+            let snap = try await APIClient.shared.getActivitySnapshot()
+            self.snapshot = snap
+            self.lastError = nil
+        } catch {
+            self.lastError = "snapshot failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Mutate `snapshot` in place to set/clear `paused_until` on the affected
+    /// row. Caller passes `until = nil` to clear (resume). No-op if there is
+    /// no current snapshot or the id doesn't resolve to a known kind/capture.
+    private func applyOptimisticPause(target: PauseTarget, id: String, until: Date?) {
+        guard let current = snapshot else { return }
+
+        switch target {
+        case .kind:
+            guard let kind = WorkKind(rawValue: id) else { return }
+            let updatedKinds = current.kinds.map { row -> KindRow in
+                guard row.kind == kind else { return row }
+                return KindRow(
+                    kind: row.kind,
+                    inFlight: row.inFlight,
+                    queued: row.queued,
+                    failed: row.failed,
+                    lastDoneAt: row.lastDoneAt,
+                    pausedUntil: until
+                )
+            }
+            self.snapshot = ActivitySnapshot(
+                kinds: updatedKinds,
+                capture: current.capture,
+                resources: current.resources,
+                processingGate: current.processingGate,
+                generatedAt: current.generatedAt
+            )
+
+        case .capture:
+            guard let cap = CaptureKind(rawValue: id) else { return }
+            let updatedCapture = current.capture.map { row -> CaptureRow in
+                guard row.kind == cap else { return row }
+                return CaptureRow(
+                    kind: row.kind,
+                    running: row.running,
+                    pausedUntil: until
+                )
+            }
+            self.snapshot = ActivitySnapshot(
+                kinds: current.kinds,
+                capture: updatedCapture,
+                resources: current.resources,
+                processingGate: current.processingGate,
+                generatedAt: current.generatedAt
+            )
+        }
+    }
+
+    private func postPauseChanged() {
+        NotificationCenter.default.post(
+            name: ActivityNotifications.pauseChanged,
+            object: nil
+        )
+    }
+}
