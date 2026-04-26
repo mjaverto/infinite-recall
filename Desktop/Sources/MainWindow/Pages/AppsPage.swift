@@ -222,6 +222,11 @@ struct AppsPage: View {
                                 )
                             }
 
+                            // My Apps — local integrations (webhook + filesystem)
+                            // managed via LocalIntegrationStorage. Empty state
+                            // lives inside the section, so no outer guard.
+                            MyAppsSection()
+
                             // Integrations section (external_integration capability)
                             if !appProvider.integrationApps.isEmpty {
                                 AppGridSection(

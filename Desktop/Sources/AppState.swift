@@ -2556,6 +2556,15 @@ class AppState: ObservableObject {
         await loadConversations()
       }
 
+      // Local integrations: enqueue webhook/filesystem dispatches for this
+      // memory. This only writes outbox rows; the drain service does the
+      // actual sending in the background.
+      if memoryId != "?" {
+        Task {
+          await LocalIntegrationDispatcher.shared.enqueueDispatch(conversationId: memoryId)
+        }
+      }
+
     case "speaker_label_suggestion":
       let speakerId = event.raw["speaker_id"] as? Int ?? 0
       let personId = event.raw["person_id"] as? String
