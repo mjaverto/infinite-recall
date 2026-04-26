@@ -5,6 +5,7 @@
 //! `recall` CLI) can depend on shared building blocks like
 //! [`token::token_path`] without re-implementing them.
 
+pub mod activity;
 pub mod auth;
 pub mod db;
 pub mod error;

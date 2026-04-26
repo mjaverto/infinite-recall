@@ -13,6 +13,7 @@ use crate::auth::require_bearer;
 use crate::state::AppState;
 
 mod action_items;
+mod activity;
 mod conversations;
 mod health;
 mod memories;
