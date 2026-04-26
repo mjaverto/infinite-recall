@@ -516,25 +516,34 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     // BrowserExtensionSetup, etc.) continue to compile until that surface is
     // refactored.
 
+    // TODO: remove with bridge UI surfaces in follow-up — only retained because Settings page binds to chatBridgeMode
     enum BridgeMode: String {
         case omiAI = "agentSDK"     // Legacy, auto-migrated to piMono
         case userClaude = "claudeCode"
         case piMono = "piMono"
     }
+    // TODO: remove with bridge UI surfaces in follow-up
     @AppStorage("chatBridgeMode") var bridgeMode: String = BridgeMode.piMono.rawValue
 
+    // TODO: remove with bridge UI surfaces in follow-up — bound by ChatPage auth sheet
     /// Whether the agent bridge requires authentication (shown as sheet in UI). Always false in the local-first fork.
     @Published var isClaudeAuthRequired = false
+    // TODO: remove with bridge UI surfaces in follow-up
     /// Auth methods previously returned by agent bridge.
     @Published var claudeAuthMethods: [[String: Any]] = []
+    // TODO: remove with bridge UI surfaces in follow-up
     /// OAuth URL previously sent by bridge when auth was needed.
     @Published var claudeAuthUrl: String?
+    // TODO: remove with bridge UI surfaces in follow-up — read by SettingsPage Claude-account row
     /// Whether the user has a cached Claude OAuth token. Always false now.
     @Published var isClaudeConnected = false
+    // TODO: remove with bridge UI surfaces in follow-up
     /// Cumulative tokens used in the current session via Omi account (legacy).
     @Published var sessionTokensUsed: Int = 0
+    // TODO: remove with bridge UI surfaces in follow-up
     /// Cumulative USD cost spent using the Omi account (legacy, never updated now).
     @AppStorage("omiAICumulativeCostUsd") var omiAICumulativeCostUsd: Double = 0.0
+    // TODO: remove with bridge UI surfaces in follow-up — bound by ChatPage threshold alert
     /// Set to true when the $50 Omi account usage threshold was reached (legacy).
     @Published var showOmiThresholdAlert = false
 
@@ -693,16 +702,19 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     /// prompt context for that path, but DO NOT call ensureBridgeStarted —
     /// it would set errorMessage to "AI components missing" on every launch
     /// and surface a banner in the home-screen chat.
+    // TODO: rename / remove with bridge UI surfaces in follow-up — only the prompt-context warm-up is still load-bearing; the "bridge" half of the name is dead
     func warmupBridge() async {
         await preparePromptContextIfNeeded()
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up — only retained for FloatingControlBar's session-invalidation call
     /// Drop a cached ACP session so the next query recreates it with fresh prompt context.
     /// No-op in the local-first fork — agent bridge has been removed.
     func invalidateAgentSession(sessionKey: String) async {
         // intentional no-op
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up — bound by BrowserExtensionSetup
     /// Test that the Playwright Chrome extension is connected and working.
     /// No-op in the local-first fork — the bridge that hosted the test was removed.
     func testPlaywrightConnection() async throws -> Bool {
@@ -718,6 +730,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         await loadSchemaIfNeeded()
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up — bound by SettingsPage bridge-mode picker and ChatPage auth sheet
     /// Switch between bridge modes. Stub in the local-first fork — no bridge to switch.
     /// We still update `bridgeMode` so the @AppStorage-backed Settings UI reflects user intent.
     func switchBridgeMode(to mode: BridgeMode) async {
@@ -726,16 +739,19 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         log("ChatProvider: switchBridgeMode → \(resolvedMode.rawValue) (no-op — agent bridge removed)")
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up
     /// Start Claude OAuth authentication. No-op in the local-first fork.
     func startClaudeAuth() {
         isClaudeAuthRequired = false
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up — bound by SettingsPage Claude-account row
     /// Check whether a cached Claude OAuth token exists. Always reports disconnected.
     func checkClaudeConnectionStatus() {
         isClaudeConnected = false
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up
     /// Disconnect from Claude. No-op in the local-first fork.
     func disconnectClaude() async {
         isClaudeConnected = false
@@ -1438,6 +1454,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         return prompt
     }
 
+    // TODO: remove with bridge UI surfaces in follow-up — bound by ChatLabView; whole feature is bridge-dependent
     /// Run a single question through the agent bridge for Chat Lab evaluation.
     /// Disabled in the local-first fork — agent bridge has been removed.
     func labRunQuestion(question: String, systemPrompt: String, sessionKey: String) async -> String {
