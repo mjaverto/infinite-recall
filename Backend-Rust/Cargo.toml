@@ -2,8 +2,7 @@
 resolver = "2"
 members = [
     "api",
-    # "cli" — added in Task #3 (B-reads). Workspace declared here so the CLI
-    # crate can join without further manifest edits.
+    "cli",
 ]
 
 [workspace.package]

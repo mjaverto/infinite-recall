@@ -1,0 +1,32 @@
+[package]
+name = "recall-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI client for the Infinite Recall local API (the `recall` binary)"
+
+[[bin]]
+name = "recall"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the daemon's shared on-disk token loader so the CLI and the daemon
+# never disagree about where the token lives. See `infinite_recall_api::token`.
+infinite-recall-api = { path = "../api" }
+
+# CLI parsing.
+clap = { version = "4", features = ["derive"] }
+
+# Blocking HTTP — the CLI is sequential and one-shot, so we deliberately
+# avoid pulling in tokio just to call a couple of localhost endpoints.
+# rustls-tls keeps the build self-contained (no system OpenSSL dep).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# JSON I/O.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error plumbing.
+anyhow = "1"
+
+# For optional date validation / display in scores.
+chrono = { version = "0.4", features = ["serde"] }
