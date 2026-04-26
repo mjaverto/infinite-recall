@@ -43,3 +43,7 @@ hex = "0.4"
 
 # CLI args / env
 dirs = "5"
+
+# === activity:stream-C resource sampler ===
+# macOS process-tree CPU/RSS sampler used by Activity Tab.
+libproc = "0.14"
