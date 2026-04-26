@@ -11,6 +11,7 @@
 //! - `resources`    — Stream C: `SystemResourceSampler` impl
 //! - `inflight`     — Stream D: `MemoryInflightRegistry` impl
 
+pub mod gate;
 pub mod inflight;
 pub mod pause_store;
 pub mod resources;

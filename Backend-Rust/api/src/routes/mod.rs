@@ -46,6 +46,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/people/:id", get(people::get_one))
         .route("/v1/search", get(search::search))
         .route("/v1/scores", get(scores::scores))
+        // === activity:A ===
+        .route("/v1/activity/snapshot", get(activity::snapshot))
+        .route("/v1/activity/pause", post(activity::pause))
+        .route("/v1/activity/resume", post(activity::resume))
+        .route("/v1/activity/_internal/inflight", post(activity::inflight))
+        // === /activity:A ===
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
