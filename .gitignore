@@ -87,6 +87,7 @@ linkedin-*.md
 # Node.js projects
 **/node_modules/
 **/dist/
+**/coverage/
 demo/out/
 
 # (CLAUDE.md is intentionally committed in this fork — project-level docs)
