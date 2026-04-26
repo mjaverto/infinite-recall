@@ -79,9 +79,13 @@ actor TranscriptionStorage {
                 throw TranscriptionStorageError.sessionNotFound
             }
 
-            record.finishedAt = Date()
-            record.status = .pendingUpload
-            record.updatedAt = Date()
+            let now = Date()
+            record.finishedAt = now
+            // Local-first fork: there is no remote upload/processing backend.
+            // A finished recording is complete locally and ready for summary generation.
+            record.status = .completed
+            record.conversationStatus = .completed
+            record.updatedAt = now
             try record.update(database)
         }
 
@@ -108,6 +112,7 @@ actor TranscriptionStorage {
             }
 
             record.status = .completed
+            record.conversationStatus = .completed
             record.backendId = backendId
             record.backendSynced = true
             record.updatedAt = Date()
@@ -496,6 +501,69 @@ actor TranscriptionStorage {
                 arguments: [sessionId]
             ) ?? 0
         }
+    }
+
+    /// Recover sessions left in `recording` after an app crash/quit. In the
+    /// local-first fork there is no remote backend retry to reconcile these, so
+    /// old recording rows with transcript/audio must be closed locally; otherwise
+    /// they remain forever in-progress and never qualify for summary backfill.
+    /// Returns the number of rows closed.
+    @discardableResult
+    func recoverStaleRecordingSessions(olderThan maxAge: TimeInterval = 120) async throws -> Int {
+        let db = try await ensureInitialized()
+        let cutoff = Date().addingTimeInterval(-maxAge)
+
+        let rows = try await db.read { database in
+            try Row.fetchAll(
+                database,
+                sql: """
+                    SELECT s.id,
+                           s.startedAt,
+                           COALESCE(MAX(seg.endTime), 1.0) AS maxEnd
+                      FROM transcription_sessions s
+                      LEFT JOIN transcription_segments seg ON seg.sessionId = s.id
+                     WHERE s.status = 'recording'
+                       AND s.finishedAt IS NULL
+                       AND s.createdAt < ?
+                       AND (
+                            EXISTS (SELECT 1 FROM transcription_segments ts WHERE ts.sessionId = s.id)
+                         OR EXISTS (SELECT 1 FROM audio_chunks ac WHERE ac.transcriptionSessionId = s.id)
+                       )
+                     GROUP BY s.id
+                    """,
+                arguments: [cutoff]
+            )
+        }
+
+        var recovered = 0
+        for row in rows {
+            guard let id: Int64 = row["id"], let startedAt: Date = row["startedAt"] else { continue }
+            let rawMaxEnd: Double = row["maxEnd"] ?? 1.0
+            let maxEnd = max(rawMaxEnd, 1.0)
+            let finishedAt = startedAt.addingTimeInterval(maxEnd)
+            let changed = try await db.write { database -> Int in
+                try database.execute(
+                    sql: """
+                        UPDATE transcription_sessions
+                           SET finishedAt = ?,
+                               status = 'completed',
+                               conversationStatus = 'completed',
+                               updatedAt = ?
+                         WHERE id = ?
+                           AND status = 'recording'
+                           AND finishedAt IS NULL
+                        """,
+                    arguments: [finishedAt, Date(), id]
+                )
+                return database.changesCount
+            }
+            recovered += changed
+        }
+
+        if recovered > 0 {
+            log("TranscriptionStorage: Recovered \(recovered) stale recording session(s)")
+        }
+        return recovered
     }
 
     /// Retrospectively delete sessions that produced no segments AND no

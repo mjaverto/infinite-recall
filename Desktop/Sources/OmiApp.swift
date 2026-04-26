@@ -313,8 +313,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if purged > 0 {
           log("Conversations: Purged \(purged) empty session(s) on launch")
         }
+
+        let recovered = try await TranscriptionStorage.shared.recoverStaleRecordingSessions()
+        if recovered > 0 {
+          log("Conversations: Recovered \(recovered) stale recording session(s) on launch")
+          await ConversationSummaryBackfillService.shared.markBackfillNeeded(
+            reason: "recovered stale recording sessions")
+          await ConversationSummaryBackfillService.shared.runIfNeeded()
+        }
       } catch {
-        logError("Conversations: purgeEmptySessions failed", error: error)
+        logError("Conversations: launch cleanup/recovery failed", error: error)
       }
     }
 

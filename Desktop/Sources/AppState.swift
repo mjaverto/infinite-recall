@@ -1717,6 +1717,10 @@ class AppState: ObservableObject {
         } else {
           try await TranscriptionStorage.shared.finishSession(id: sessionId)
           log("Transcription: Finished DB session \(sessionId) before reconnect")
+          Task(priority: .background) {
+            await ConversationSummaryBackfillService.shared.summarizeSessionIfNeeded(
+              sessionId, reason: "finishConversation")
+          }
         }
       } catch {
         logError("Transcription: Failed to finalize DB session \(sessionId)", error: error)
@@ -1898,6 +1902,10 @@ class AppState: ObservableObject {
           } else {
             try await TranscriptionStorage.shared.finishSession(id: sessionId)
             log("Transcription: Finished DB session \(sessionId)")
+            Task(priority: .background) {
+              await ConversationSummaryBackfillService.shared.summarizeSessionIfNeeded(
+                sessionId, reason: "stopTranscription")
+            }
           }
         } catch {
           logError("Transcription: Failed to finalize DB session \(sessionId)", error: error)
