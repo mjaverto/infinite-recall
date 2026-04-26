@@ -62,7 +62,6 @@ fn render_list(v: &serde_json::Value) {
 fn render_show(v: &serde_json::Value) {
     println!("id:          {}", output::i(v, "id"));
     println!("category:    {}", output::s(v, "category"));
-    println!("visibility:  {}", output::s(v, "visibility"));
     println!("source:      {}", output::s(v, "source"));
     println!("created_at:  {}", output::s(v, "created_at"));
     println!("updated_at:  {}", output::s(v, "updated_at"));

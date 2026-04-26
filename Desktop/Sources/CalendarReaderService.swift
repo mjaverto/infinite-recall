@@ -585,7 +585,6 @@ actor CalendarReaderService {
     do {
       _ = try await APIClient.shared.createMemory(
         content: content,
-        visibility: "private",
         tags: ["calendar", "onboarding", "event"],
         source: "google_calendar",
         headline: event.summary

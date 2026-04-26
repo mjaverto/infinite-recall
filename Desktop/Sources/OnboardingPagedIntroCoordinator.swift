@@ -1224,7 +1224,6 @@ final class OnboardingPagedIntroCoordinator: ObservableObject {
         let chunk = drafts[index..<end].map { draft in
           MemoryBatchItem(
             content: draft.content,
-            visibility: "private",
             tags: draft.tags,
             headline: draft.headline
           )

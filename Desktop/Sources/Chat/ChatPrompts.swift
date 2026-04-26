@@ -996,7 +996,6 @@ struct ChatPrompts {
             "content": "The remembered fact, preference, or personal detail",
             "category": "system | interesting | manual",
             "tagsJson": "JSON array of tag strings (e.g. [\"tip\", \"preference\"])",
-            "visibility": "private | public",
             "reviewed": "Whether a human has reviewed this memory",
             "userReview": "User thumbs-up (true) / thumbs-down (false) / unreviewed (null)",
             "manuallyAdded": "True if user typed this directly rather than AI-extracted",

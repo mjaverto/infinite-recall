@@ -2374,6 +2374,12 @@ actor RewindDatabase {
             """)
         }
 
+        // IR is single-user and local-only, so the inherited Omi `visibility`
+        // column on memories has no sharing surface to act on. Drop it.
+        migrator.registerMigration("dropMemoryVisibility") { db in
+            try db.execute(sql: "ALTER TABLE memories DROP COLUMN visibility")
+        }
+
         try migrator.migrate(queue)
     }
 

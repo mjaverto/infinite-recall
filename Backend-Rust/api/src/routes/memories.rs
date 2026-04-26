@@ -25,7 +25,6 @@ pub struct Memory {
     pub content: String,
     pub category: String,
     pub tags: Option<String>,
-    pub visibility: String,
     pub source: Option<String>,
     pub source_app: Option<String>,
     pub conversation_id: Option<String>,
@@ -36,7 +35,7 @@ pub struct Memory {
     pub updated_at: Option<String>,
 }
 
-const SELECT: &str = "SELECT id, backendId, content, category, tagsJson, visibility,
+const SELECT: &str = "SELECT id, backendId, content, category, tagsJson,
         source, sourceApp, conversationId, confidence, reviewed, manuallyAdded,
         createdAt, updatedAt
      FROM memories WHERE deleted = 0";
@@ -48,15 +47,14 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         content: r.get(2)?,
         category: r.get(3)?,
         tags: r.get(4)?,
-        visibility: r.get(5)?,
-        source: r.get(6)?,
-        source_app: r.get(7)?,
-        conversation_id: r.get(8)?,
-        confidence: r.get(9)?,
-        reviewed: r.get::<_, i64>(10)? != 0,
-        manually_added: r.get::<_, i64>(11)? != 0,
-        created_at: r.get(12)?,
-        updated_at: r.get(13)?,
+        source: r.get(5)?,
+        source_app: r.get(6)?,
+        conversation_id: r.get(7)?,
+        confidence: r.get(8)?,
+        reviewed: r.get::<_, i64>(9)? != 0,
+        manually_added: r.get::<_, i64>(10)? != 0,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
     })
 }
 
