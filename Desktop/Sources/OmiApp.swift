@@ -677,20 +677,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     item.isVisible = true
     // Re-apply the icon to force the system to redraw
     if let button = item.button {
-      if OMIApp.launchMode == .rewind {
-        if let icon = NSImage(
-          systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "omi Rewind")
-        {
-          icon.isTemplate = true
-          button.image = icon
-        }
-      } else if let iconURL = Bundle.resourceBundle.url(
-        forResource: "omi_text_logo", withExtension: "png"),
-        let icon = NSImage(contentsOf: iconURL)
-      {
+      let symbol = OMIApp.launchMode == .rewind ? "clock.arrow.circlepath" : "infinity"
+      if let icon = NSImage(systemSymbolName: symbol, accessibilityDescription: "Infinite Recall") {
         icon.isTemplate = true
-        let aspect = icon.size.width / icon.size.height
-        icon.size = NSSize(width: 16 * aspect, height: 16)
         button.image = icon
       }
     }
@@ -1106,49 +1095,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let controller = SafeModeController.shared
     let state = controller.state
 
-    // Three logical states for the icon:
-    //   - Recording (red dot) — Safe Mode off, audio + screen on
-    //   - Idle (gray) — Safe Mode off, but recording isn't actually running
-    //   - Paused (yellow) — Safe Mode is active
-    let symbolName: String
-    let tint: NSColor?
+    // Infinite Recall fork: always show the infinity brand glyph. macOS
+    // tints it for light/dark via isTemplate. Status (recording / idle /
+    // paused) is communicated via the title suffix only when paused, so
+    // the menu bar isn't a state indicator that hides the brand.
     let titleSuffix: String
-
     if state.isPaused {
-      symbolName = "pause.circle.fill"
-      tint = .systemYellow
       switch state {
       case .pausedFor(_, let until, _):
         let remaining = max(0, Int(until.timeIntervalSinceNow.rounded()))
-        titleSuffix = "Recall · \(SafeModeController.formatStatusBarTitle(remaining))"
+        titleSuffix = " · paused \(SafeModeController.formatStatusBarTitle(remaining))"
       case .pausedIndefinitely:
-        titleSuffix = "Recall · paused"
+        titleSuffix = " · paused"
       case .off:
         titleSuffix = ""
       }
     } else {
-      let audioOn = AssistantSettings.shared.transcriptionEnabled
-      let screenOn = ProactiveAssistantsPlugin.shared.isMonitoring
-      if audioOn || screenOn {
-        symbolName = "circle.fill"
-        tint = .systemRed
-        titleSuffix = ""
-      } else {
-        symbolName = "circle.dotted"
-        tint = .secondaryLabelColor
-        titleSuffix = ""
-      }
+      titleSuffix = ""
     }
 
-    let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-    if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Recall")?
-      .withSymbolConfiguration(config)
-    {
-      img.isTemplate = (tint == nil)  // tint colors require non-template image
+    if let img = NSImage(systemSymbolName: "infinity", accessibilityDescription: "Infinite Recall") {
+      img.isTemplate = true
       button.image = img
-      button.contentTintColor = tint
+      button.contentTintColor = nil
     }
-    button.title = titleSuffix.isEmpty ? "" : " \(titleSuffix)"
+    button.title = titleSuffix
     button.imagePosition = titleSuffix.isEmpty ? .imageOnly : .imageLeft
   }
 
