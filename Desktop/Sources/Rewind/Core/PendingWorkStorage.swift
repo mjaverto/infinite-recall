@@ -370,6 +370,55 @@ actor PendingWorkStorage {
         }
     }
 
+    // MARK: - Maintenance sweep
+
+    /// Reclaim expired leases and GC old `done`/`dead` rows in a single
+    /// transaction, then fire the mutation delegate exactly once. This is the
+    /// only path through which `PendingWorkSweeper` should mutate the table —
+    /// going around the actor would skip the delegate and leave the Activity
+    /// panel stale until the next non-sweeper write.
+    @discardableResult
+    func runMaintenanceSweep(now: Date = Date()) async throws -> (recovered: Int, doneGC: Int, deadGC: Int) {
+        let db = try await ensureInitialized()
+        let result = try await db.write { database -> (Int, Int, Int) in
+            try database.execute(sql: """
+                UPDATE pending_work
+                SET status = CASE
+                        WHEN attempts + 1 >= maxAttempts THEN 'dead'
+                        ELSE 'queued'
+                    END,
+                    attempts      = attempts + 1,
+                    lastError     = COALESCE(lastError || ' ', '') || '[lease expired]',
+                    claimedAt     = NULL,
+                    claimedBy     = NULL,
+                    leaseExpiresAt = NULL,
+                    scheduledFor  = datetime(?, '+30 seconds'),
+                    updatedAt     = ?
+                WHERE status = 'claimed'
+                  AND leaseExpiresAt < ?
+            """, arguments: [now, now, now])
+            let recoveredCount = database.changesCount
+
+            try database.execute(sql: """
+                DELETE FROM pending_work
+                WHERE status = 'done'
+                  AND updatedAt < datetime(?, '-1 day')
+            """, arguments: [now])
+            let doneGCCount = database.changesCount
+
+            try database.execute(sql: """
+                DELETE FROM pending_work
+                WHERE status = 'dead'
+                  AND updatedAt < datetime(?, '-30 days')
+            """, arguments: [now])
+            let deadGCCount = database.changesCount
+
+            return (recoveredCount, doneGCCount, deadGCCount)
+        }
+        notifyDidMutate()
+        return result
+    }
+
     // MARK: - Depth summary
 
     func depthSummary() async throws -> PendingWorkDepth {

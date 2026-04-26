@@ -107,7 +107,7 @@ osascript -e 'tell application "Infinite Recall" to quit'
     `{state: "allowed", since: iso8601}` OR
     `{state: "blocked", reason: <BlockReason>, since: iso8601,
       waiting_for: <WaitCondition>}` where `BlockReason` is one of
-    `device_active|on_battery|thermal|locked|manual_pause` and
+    `device_active|on_battery|thermal|locked|manual_pause|initializing` and
     `WaitCondition` is `{type: "idle_for", duration_secs: u64}` or
     `{type: "ac_power"|"thermal_cooldown"|"unlock"|"manual"}`.
   - `generated_at` — iso8601.

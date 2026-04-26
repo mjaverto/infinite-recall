@@ -124,7 +124,7 @@ and a stringly-typed `waiting_for`.
 | `PauseRequest.target` / `ResumeRequest.target` / `PauseTargetId` | `kind`, `capture` (with typed `id` payload — see below) |
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
 | `GateState` (variant tag on `state`) | `allowed`, `blocked` |
-| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `unwired` |
+| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `initializing` |
 
 ### `PauseRequest` / `ResumeRequest`
 
@@ -177,8 +177,8 @@ changes. Body shape is exactly `GateState` — see above for both variants.
 ```
 
 `BridgedProcessingGate` (the production `ProcessingGate` impl) seeds itself
-with `Blocked { reason: "unwired", waiting_for: { "type": "manual" } }` on
-daemon startup and overwrites that on the first POST. The `unwired` window
+with `Blocked { reason: "initializing", waiting_for: { "type": "manual" } }` on
+daemon startup and overwrites that on the first POST. The `initializing` window
 is typically ~3s.
 
 ---

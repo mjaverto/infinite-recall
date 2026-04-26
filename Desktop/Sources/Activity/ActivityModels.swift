@@ -104,7 +104,7 @@ public enum BlockReason: String, Codable, Hashable, CaseIterable {
     /// arrives. Should only be observed during the brief boot window
     /// (~3s — one `ProcessingGateReporter` poll cycle). External POSTs
     /// of this variant are rejected by the Rust `BridgedProcessingGate`.
-    case unwired
+    case initializing
 }
 
 /// Issue #35: typed mirror of Rust's `WaitCondition`. Replaces the
