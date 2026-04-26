@@ -321,11 +321,12 @@ struct SettingsContentView: View {
   @ObservedObject private var vlmLifecycle = VLMLifecycleManager.shared
   @ObservedObject private var mcpAPI = MCPAPIService.shared
   @ObservedObject private var idleController = IdleAIController.shared
+  @ObservedObject private var localAIInstaller = LocalAIInstaller.shared
 
-  // In-app installer sheet (replaces the prior Terminal-launch flow).
-  @State private var presentingInstallSheet: Bool = false
-  // Vision-tier installer sheet — mirrors the MLX flow but for mlx-vlm.
-  @State private var presentingVLMInstallSheet: Bool = false
+  // MCP API server installer sheet. Model installs (text + vision) render
+  // inline via `LocalAIInstallStrip`; the API install is rare and short, so
+  // it keeps the modal flow.
+  @State private var presentingAPIInstallSheet: Bool = false
   // Transient feedback from the "Test connection" button on the Vision Model card.
   @State private var vlmTestResult: String? = nil
   @State private var vlmTestInFlight: Bool = false
@@ -1981,17 +1982,11 @@ struct SettingsContentView: View {
         // Active model summary line.
         activeModelSummary
 
-        if let progress = mlxLifecycle.modelDownloadProgress {
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Downloading model — \(Int(progress * 100))%")
-              .scaledFont(size: 11)
-              .foregroundColor(OmiColors.textTertiary)
-            ProgressView(value: progress)
-              .progressViewStyle(
-                LinearProgressViewStyle(tint: OmiColors.purplePrimary)
-              )
-          }
-        }
+        // Inline install progress (replaces the prior modal sheet). Only
+        // renders while the text-tier install is running or has failed; the
+        // user can navigate away and progress continues — `LocalAIInstaller`
+        // is a singleton.
+        LocalAIInstallStrip(kind: .mlx)
 
         if let err = mlxLifecycle.lastError, !err.isEmpty {
           Text(err)
@@ -2046,9 +2041,6 @@ struct SettingsContentView: View {
         // Autonomous Work Mode subsection — keep local AI available while idle.
         powerSavingSubsection
       }
-      .sheet(isPresented: $presentingInstallSheet) {
-        LocalAIInstallSheet()
-      }
     }
   }
 
@@ -2085,6 +2077,11 @@ struct SettingsContentView: View {
         // Active-model summary line — mirrors activeModelSummary on the text card.
         activeVisionModelSummary
 
+        // Inline install progress (replaces the prior modal sheet). Mirrors
+        // the text-tier strip; only renders while the vision install is
+        // running or has failed.
+        LocalAIInstallStrip(kind: .vlm)
+
         if let err = vlmLifecycle.lastError, !err.isEmpty {
           Text(err)
             .scaledFont(size: 11)
@@ -2093,15 +2090,20 @@ struct SettingsContentView: View {
         }
 
         // Install button — enabled until the agent + model are both present.
+        // Kicks the singleton installer directly; progress renders inline
+        // via `LocalAIInstallStrip` above, no modal sheet.
         if !vlmLifecycle.agentInstalled || !vlmLifecycle.modelPresent {
           HStack {
-            Button(action: { presentingVLMInstallSheet = true }) {
+            Button(action: {
+              Task { await LocalAIInstaller.shared.startVLMInstall() }
+            }) {
               Text(vlmLifecycle.modelPresent ? "Register Service" : "Install (~5–6 GB)")
                 .scaledFont(size: 12, weight: .semibold)
             }
             .buttonStyle(.borderedProminent)
             .tint(OmiColors.purplePrimary)
             .controlSize(.small)
+            .disabled(localAIInstaller.isRunning)
             Spacer()
           }
         }
@@ -2160,9 +2162,6 @@ struct SettingsContentView: View {
             .foregroundColor(OmiColors.textTertiary)
             .fixedSize(horizontal: false, vertical: true)
         }
-      }
-      .sheet(isPresented: $presentingVLMInstallSheet) {
-        LocalAIInstallSheet(kind: .vlm)
       }
     }
   }
@@ -2261,7 +2260,11 @@ struct SettingsContentView: View {
     )
     .onAppear {
       if visionModelPickerSelection == nil {
-        visionModelPickerSelection = activeVisionModelID
+        // Custom HF id → highlight "Other" row so the user can see which
+        // row produced the active model.
+        visionModelPickerSelection = VisionModelCatalog.option(forId: activeVisionModelID) == nil
+          ? Self.customRowSentinel
+          : activeVisionModelID
       }
       refreshAllVisionModelDiskSizes()
     }
@@ -2445,7 +2448,6 @@ struct SettingsContentView: View {
   private func installVisionModel(_ modelId: String) {
     Task {
       visionModelPickerSelection = modelId
-      presentingVLMInstallSheet = true
       await LocalAIInstaller.shared.startVLMInstall(modelId: modelId)
     }
   }
@@ -2690,7 +2692,12 @@ struct SettingsContentView: View {
     )
     .onAppear {
       if localModelPickerSelection == nil {
-        localModelPickerSelection = activeLocalModelID
+        // If the active id isn't in the curated catalog it's a custom HF
+        // repo — highlight the "Other" row (sentinel) so the user can see
+        // which row sourced the active model.
+        localModelPickerSelection = LocalModelCatalog.option(forId: activeLocalModelID) == nil
+          ? Self.customRowSentinel
+          : activeLocalModelID
       }
       refreshAllLocalModelDiskSizes()
     }
@@ -3058,14 +3065,12 @@ struct SettingsContentView: View {
     return "\(s) GB"
   }
 
-  /// Triggered by an inline row Install button. Routes through the existing
-  /// install sheet so the user gets the same step list + progress bar UX.
+  /// Triggered by an inline row Install button. Kicks off the install on
+  /// the shared singleton; the inline `LocalAIInstallStrip` rendered above
+  /// the picker self-renders progress while the user is free to navigate.
   private func installLocalModel(_ modelId: String) {
     Task {
-      // Fire-and-forget: the sheet itself awaits LocalAIInstaller via
-      // `.task`. We just need to seed the picker selection and present.
       localModelPickerSelection = modelId
-      presentingInstallSheet = true
       await LocalAIInstaller.shared.startMLXInstall(modelId: modelId)
     }
   }
@@ -3404,7 +3409,7 @@ struct SettingsContentView: View {
 
         // Primary action(s).
         if !mcpAPI.isInstalled {
-          Button(action: { presentingInstallSheet = true }) {
+          Button(action: { presentingAPIInstallSheet = true }) {
             HStack {
               Image(systemName: "arrow.down.circle.fill")
               Text("Install MCP API")
@@ -3418,8 +3423,8 @@ struct SettingsContentView: View {
           .help(
             "Builds the local Rust API daemon and registers a launchd agent so it starts at login."
           )
-          .sheet(isPresented: $presentingInstallSheet) {
-            LocalAIInstallSheet()
+          .sheet(isPresented: $presentingAPIInstallSheet) {
+            LocalAIInstallSheet(kind: .api)
           }
         }
 

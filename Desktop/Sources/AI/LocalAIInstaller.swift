@@ -86,6 +86,9 @@ final class LocalAIInstaller: ObservableObject {
   @Published var modelTotalBytes: Int64 = 0
   @Published var isRunning: Bool = false
   @Published var error: String? = nil
+  /// Set when the user clicks Cancel so terminal-state UI can distinguish a
+  /// deliberate cancel (non-zero exit from SIGTERM) from a real crash.
+  @Published private(set) var wasCancelled: Bool = false
 
   // MARK: - Internal
 
@@ -137,10 +140,29 @@ final class LocalAIInstaller: ObservableObject {
       modelId: modelId)
   }
 
+  /// Clear a terminal `.failed` state so inline UI (e.g. `LocalAIInstallStrip`)
+  /// can be dismissed by the user without retrying. Safe to call from the
+  /// main actor; no-op while an install is still in flight.
+  @MainActor
+  func dismissResult() {
+    guard !isRunning else { return }
+    // Clear only the tier whose terminal state is being dismissed — the other
+    // tier's pending id may still be meaningful (e.g. a recent successful
+    // install that the user hasn't acknowledged yet).
+    switch pendingKind {
+    case .mlx: pendingMLXModelId = nil
+    case .vlm: pendingVLMModelId = nil
+    case .api: break
+    }
+    resetState()
+    modelTotalBytes = 0
+  }
+
   /// Terminate the running install. Sends SIGTERM, then SIGKILL after 2s if
   /// the process is still alive.
   func cancel() {
     guard let p = process, p.isRunning else { return }
+    Task { @MainActor in self.wasCancelled = true }
     p.terminate()
     let proc = p
     DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
@@ -153,20 +175,26 @@ final class LocalAIInstaller: ObservableObject {
 
   // MARK: - Implementation
 
-  private enum Kind { case mlx, api, vlm }
+  /// Which sidecar a given install run targets. Published via `pendingKind`
+  /// so inline UI (e.g. `LocalAIInstallStrip`) can scope itself to the right
+  /// settings card without inspecting model-id state.
+  enum Kind { case mlx, api, vlm }
 
   /// Catalog model id to install when `kind == .mlx`. nil means "use the
   /// shell script's hardcoded default" (preserves the original single-model
-  /// install path).
-  private var pendingMLXModelId: String? = nil
+  /// install path). Published so UI (e.g. `LocalAIInstallSheet`) can render
+  /// the actual id being installed instead of falling back to the catalog
+  /// recommendation when the install was kicked off without an explicit id.
+  @Published private(set) var pendingMLXModelId: String? = nil
 
   /// Catalog model id to install when `kind == .vlm`. Mirrors `pendingMLXModelId`
   /// but for the vision tier. nil means use the VLM script's default.
-  private var pendingVLMModelId: String? = nil
+  @Published private(set) var pendingVLMModelId: String? = nil
 
   /// Tracks which kind we're currently running so refresh + env-setup can branch
-  /// without inspecting the extractor closure.
-  private var pendingKind: Kind = .mlx
+  /// without inspecting the extractor closure. Published so per-tier UI strips
+  /// only render for the install they're scoped to.
+  @Published private(set) var pendingKind: Kind = .mlx
 
   private func start(
     extractor: () throws -> URL,
@@ -265,6 +293,7 @@ final class LocalAIInstaller: ObservableObject {
     modelDownloadedBytes = nil
     error = nil
     lineBuffer = ""
+    wasCancelled = false
   }
 
   private func runProcess(scriptURL: URL, kind: Kind) async {
