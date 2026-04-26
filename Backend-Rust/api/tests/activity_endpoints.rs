@@ -87,8 +87,8 @@ use infinite_recall_api::activity::traits::{
     InflightRegistry, PauseStore, PauseStoreError, ProcessingGate, ResourceSampler,
 };
 use infinite_recall_api::activity::types::{
-    CaptureKind, GateReason, GateState, InFlight, PauseTargetId, ProcessBreakdown,
-    ResourceSample, ThermalState, WorkKind,
+    BlockReason, CaptureKind, GateState, InFlight, PauseTargetId, ProcessBreakdown,
+    ResourceSample, ThermalState, WaitCondition, WorkKind,
 };
 use infinite_recall_api::routes;
 use infinite_recall_api::state::AppState;
@@ -200,12 +200,7 @@ struct FakeGate {
 impl FakeGate {
     fn allow() -> Self {
         Self {
-            state: GateState {
-                allowed: true,
-                reason: GateReason::None,
-                since: Utc::now(),
-                waiting_for: None,
-            },
+            state: GateState::Allowed { since: Utc::now() },
         }
     }
 }
@@ -343,14 +338,60 @@ async fn snapshot_returns_200_with_full_shape() {
     assert_eq!(res["low_power"], json!(false));
     assert!(res["process_breakdown"].is_array());
 
-    // `processing_gate` populated by FakeGate::allow.
+    // `processing_gate` populated by FakeGate::allow. Issue #35: wire
+    // shape is now an internally-tagged sum on the `state` field; the
+    // `Allowed` variant carries `state` + `since` only.
     let g = &body["processing_gate"];
-    assert_eq!(g["allowed"], json!(true));
-    assert_eq!(g["reason"], json!("none"));
+    assert_eq!(g["state"], json!("allowed"));
     assert!(g["since"].is_string());
+    assert!(g.get("reason").is_none(), "Allowed must not carry reason");
+    assert!(g.get("waiting_for").is_none(), "Allowed must not carry waiting_for");
 
     // `generated_at` is ISO-8601 string.
     assert!(body["generated_at"].is_string());
+}
+
+/// Issue #35: snapshot wire shape when the gate reports `Blocked` —
+/// verifies the typed `waiting_for` payload makes it through the route
+/// handler intact.
+#[tokio::test]
+async fn snapshot_blocked_gate_round_trips_typed_waiting_for() {
+    use std::time::Duration;
+    struct BlockedGate;
+    impl ProcessingGate for BlockedGate {
+        fn current(&self) -> GateState {
+            GateState::Blocked {
+                reason: BlockReason::DeviceActive,
+                since: Utc::now(),
+                waiting_for: WaitCondition::IdleFor {
+                    duration: Duration::from_secs(120),
+                },
+            }
+        }
+    }
+    let state = make_state(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(BlockedGate),
+    );
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let g = &body["processing_gate"];
+    assert_eq!(g["state"], json!("blocked"));
+    assert_eq!(g["reason"], json!("device_active"));
+    assert!(g["since"].is_string());
+    assert_eq!(g["waiting_for"]["type"], json!("idle_for"));
+    assert_eq!(g["waiting_for"]["duration_secs"], json!(120));
 }
 
 /// §Verification step 7: POST pause writes the row and returns
@@ -626,15 +667,15 @@ async fn enum_round_trip_via_wire() {
         assert_eq!(kind, back);
     }
 
-    // Every GateReason value.
+    // Issue #35: `GateReason` is gone, replaced by `BlockReason` (only
+    // the Blocked variant carries one — Allowed has no sub-reason).
     for (reason, wire) in [
-        (t::GateReason::Idle, "idle"),
-        (t::GateReason::DeviceActive, "device_active"),
-        (t::GateReason::OnBattery, "on_battery"),
-        (t::GateReason::Thermal, "thermal"),
-        (t::GateReason::Locked, "locked"),
-        (t::GateReason::ManualPause, "manual_pause"),
-        (t::GateReason::None, "none"),
+        (t::BlockReason::DeviceActive, "device_active"),
+        (t::BlockReason::OnBattery, "on_battery"),
+        (t::BlockReason::Thermal, "thermal"),
+        (t::BlockReason::Locked, "locked"),
+        (t::BlockReason::ManualPause, "manual_pause"),
+        (t::BlockReason::Unwired, "unwired"),
     ] {
         let s = serde_json::to_string(&reason).unwrap();
         assert_eq!(s, format!("\"{wire}\""));
