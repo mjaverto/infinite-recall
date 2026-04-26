@@ -3,9 +3,9 @@ import Foundation
 actor APIClient {
   static let shared = APIClient()
   // Primary data backend URL — Python backend (api.omi.me) is the single source of truth for all data CRUD.
-  // Override via OMI_PYTHON_API_URL for local dev.
+  // Override via IR_PYTHON_API_URL for local dev.
   var baseURL: String {
-    if let cString = getenv("OMI_PYTHON_API_URL"), let url = String(validatingUTF8: cString),
+    if let cString = getenv("IR_PYTHON_API_URL"), let url = String(validatingUTF8: cString),
       !url.isEmpty
     {
       return url.hasSuffix("/") ? url : url + "/"
@@ -16,20 +16,20 @@ actor APIClient {
   // Rust desktop backend URL — used only for: agent VM provisioning/status,
   // config/api-keys, Crisp, and local test subscription. All data CRUD,
   // chat AI, and title generation are on Python.
-  // Set via OMI_API_URL env var (in .env).
+  // Set via IR_API_URL env var (in .env).
   var rustBackendURL: String {
     // First check getenv() for values set by setenv() in loadEnvironment()
-    if let cString = getenv("OMI_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty
+    if let cString = getenv("IR_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty
     {
       let normalized = url.hasSuffix("/") ? url : url + "/"
       return normalized
     }
     // Fallback to ProcessInfo (launch-time snapshot)
-    if let envURL = ProcessInfo.processInfo.environment["OMI_API_URL"], !envURL.isEmpty {
+    if let envURL = ProcessInfo.processInfo.environment["IR_API_URL"], !envURL.isEmpty {
       let normalized = envURL.hasSuffix("/") ? envURL : envURL + "/"
       return normalized
     }
-    NSLog("OMI API: OMI_API_URL not set — Rust backend calls will fail")
+    NSLog("OMI API: IR_API_URL not set — Rust backend calls will fail")
     return ""
   }
 

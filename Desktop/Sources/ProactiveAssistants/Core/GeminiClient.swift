@@ -162,9 +162,9 @@ struct GeminiResponse: Decodable {
 actor GeminiClient {
   private let model: String
 
-  /// Backend proxy base URL (from OMI_API_URL env var)
+  /// Backend proxy base URL (from IR_API_URL env var)
   private static var proxyBaseURL: String {
-    if let cString = getenv("OMI_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty {
+    if let cString = getenv("IR_API_URL"), let url = String(validatingUTF8: cString), !url.isEmpty {
       return url.hasSuffix("/") ? url : url + "/"
     }
     return ""
@@ -228,7 +228,7 @@ actor GeminiClient {
 
   init(apiKey: String? = nil, model: String = ModelQoS.Gemini.proactive) throws {
     // Infinite Recall fork: local-only mode — Gemini proxy disabled.
-    // All Gemini requests previously routed through the backend proxy at OMI_API_URL.
+    // All Gemini requests previously routed through the backend proxy at IR_API_URL.
     // Refuse to construct a client so no caller can issue a remote request.
     log("[backend-stripped] GeminiClient.init: no-op (refusing to build client)")
     throw GeminiClientError.missingAPIKey

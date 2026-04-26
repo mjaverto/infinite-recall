@@ -12,10 +12,10 @@
 #   TEAM_ID                  Apple Developer Team ID (10-char alphanumeric).
 #
 # Optional env vars:
-#   OMI_SIGN_IDENTITY        Code-signing identity. Defaults to first
+#   IR_SIGN_IDENTITY        Code-signing identity. Defaults to first
 #                            "Developer ID Application" cert in the keychain.
-#   OMI_APP_NAME             Display + bundle name. Default: "Infinite Recall".
-#   OMI_VERSION              Override version string (otherwise read from
+#   IR_APP_NAME             Display + bundle name. Default: "Infinite Recall".
+#   IR_VERSION              Override version string (otherwise read from
 #                            Desktop/Info.plist:CFBundleShortVersionString,
 #                            falling back to `git describe --tags`).
 #
@@ -92,7 +92,7 @@ for tool in xcrun codesign hdiutil spctl /usr/libexec/PlistBuddy; do
 done
 
 # ─── Configuration ─────────────────────────────────────────────────────
-APP_NAME="${OMI_APP_NAME:-Infinite Recall}"
+APP_NAME="${IR_APP_NAME:-Infinite Recall}"
 BINARY_NAME="Omi Computer"   # Package.swift target name (matches run.sh)
 BUNDLE_ID="com.omi.infinite-recall"
 
@@ -100,8 +100,8 @@ INFO_PLIST="Desktop/Info.plist"
 [ -f "$INFO_PLIST" ] || die "Desktop/Info.plist not found at $REPO_ROOT/$INFO_PLIST"
 
 # Version: prefer explicit override → Info.plist → git tag → "0.0.0".
-if [ -n "${OMI_VERSION:-}" ]; then
-    VERSION="$OMI_VERSION"
+if [ -n "${IR_VERSION:-}" ]; then
+    VERSION="$IR_VERSION"
 else
     VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST" 2>/dev/null || true)
     if [ -z "$VERSION" ] || [ "$VERSION" = "0" ]; then
@@ -122,11 +122,11 @@ ENTITLEMENTS="Desktop/Omi-Release.entitlements"
 [ -f "$ENTITLEMENTS" ] || die "No entitlements file found (Desktop/Omi-Release.entitlements or Desktop/Omi.entitlements)."
 
 # ─── Resolve signing identity ──────────────────────────────────────────
-SIGN_IDENTITY="${OMI_SIGN_IDENTITY:-}"
+SIGN_IDENTITY="${IR_SIGN_IDENTITY:-}"
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 fi
-[ -n "$SIGN_IDENTITY" ] || die "No 'Developer ID Application' identity found in keychain. Install one or set OMI_SIGN_IDENTITY."
+[ -n "$SIGN_IDENTITY" ] || die "No 'Developer ID Application' identity found in keychain. Install one or set IR_SIGN_IDENTITY."
 substep "Signing identity: $SIGN_IDENTITY"
 
 # ─── Idempotent cleanup ────────────────────────────────────────────────

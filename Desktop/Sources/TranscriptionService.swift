@@ -522,7 +522,7 @@ extension TranscriptionService {
 //    private var urlSession: URLSession?
 //    private let apiKey: String = ""
 //    private static let pythonBackendBaseURL: String = {
-//        if let cString = getenv("OMI_PYTHON_API_URL"),
+//        if let cString = getenv("IR_PYTHON_API_URL"),
 //           let url = String(validatingUTF8: cString), !url.isEmpty {
 //            return url.hasSuffix("/") ? url : url + "/"
 //        }

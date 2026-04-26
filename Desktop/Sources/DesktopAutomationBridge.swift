@@ -9,7 +9,7 @@ enum DesktopAutomationLaunchOptions {
 
   static var isEnabled: Bool {
     CommandLine.arguments.contains(enableFlag)
-      || ProcessInfo.processInfo.environment["OMI_ENABLE_LOCAL_AUTOMATION"] == "1"
+      || ProcessInfo.processInfo.environment["IR_ENABLE_LOCAL_AUTOMATION"] == "1"
   }
 
   static var port: UInt16 {
@@ -21,7 +21,7 @@ enum DesktopAutomationLaunchOptions {
       }
     }
 
-    if let rawValue = ProcessInfo.processInfo.environment["OMI_AUTOMATION_PORT"],
+    if let rawValue = ProcessInfo.processInfo.environment["IR_AUTOMATION_PORT"],
       let parsed = UInt16(rawValue)
     {
       return parsed
