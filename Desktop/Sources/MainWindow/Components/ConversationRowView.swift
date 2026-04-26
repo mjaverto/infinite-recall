@@ -38,6 +38,16 @@ struct ConversationRowView: View {
     Date().timeIntervalSince(conversation.createdAt) < 60
   }
 
+  /// True when the recording finished but the LLM has not yet produced a
+  /// title/overview. Delegates to the shared
+  /// `ServerConversation.isSummaryPending(cachedPreview:)` extension so the
+  /// list and detail views never diverge (PR #30 review).
+  var isSummaryPending: Bool {
+    conversation.isSummaryPending(
+      cachedPreview: appState.conversationPreviews[conversation.id]
+    )
+  }
+
   private static let timeFormatter: DateFormatter = {
     let f = DateFormatter()
     f.dateFormat = "h:mm a"
@@ -112,6 +122,12 @@ struct ConversationRowView: View {
     if !joined.isEmpty {
       return stripWhisperTokens(String(joined.prefix(120)))
     }
+    // Recording finished but the LLM hasn't produced a summary yet. Tell the
+    // user when the autonomous summarizer will run instead of an empty/italic
+    // "No transcript yet" placeholder.
+    if isSummaryPending {
+      return "Will summarize when your Mac is plugged in and idle or locked."
+    }
     return nil
   }
 
@@ -149,6 +165,18 @@ struct ConversationRowView: View {
         .foregroundColor(OmiColors.textTertiary)
         .lineLimit(1)
     }
+  }
+
+  /// Title to display in the row. Replaces the "Untitled Conversation"
+  /// fallback with "Summary Pending" when `isSummaryPending` so the user
+  /// understands the LLM hasn't run yet rather than seeing a generic
+  /// untitled placeholder.
+  private var displayTitle: String {
+    let raw = conversation.title
+    if isSummaryPending && raw == "Untitled Conversation" {
+      return "Summary Pending"
+    }
+    return raw
   }
 
   /// Label for the conversation source
@@ -371,13 +399,17 @@ struct ConversationRowView: View {
       // Title + metadata below
       VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 8) {
-          Text(conversation.title)
+          Text(displayTitle)
             .scaledFont(size: 14, weight: .medium)
             .foregroundColor(OmiColors.textPrimary)
             .lineLimit(1)
 
           if isNewlyCreated {
             NewBadge()
+          }
+
+          if isSummaryPending {
+            SummaryPendingBadge()
           }
 
           // Inline action buttons (show on hover)
@@ -463,13 +495,17 @@ struct ConversationRowView: View {
       // Title + time/duration below
       VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 8) {
-          Text(conversation.title)
+          Text(displayTitle)
             .scaledFont(size: 15, weight: .medium)
             .foregroundColor(OmiColors.textPrimary)
             .lineLimit(1)
 
           if isNewlyCreated {
             NewBadge()
+          }
+
+          if isSummaryPending {
+            SummaryPendingBadge()
           }
 
           // Inline action buttons (show on hover)
@@ -659,4 +695,23 @@ struct ConversationRowView: View {
   }
   .padding()
   .background(OmiColors.backgroundPrimary)
+}
+
+// MARK: - Summary Pending Badge
+
+/// Small inline badge displayed next to a conversation title when the
+/// recording is finished but the autonomous summarizer hasn't produced a
+/// title/overview yet. Styled to mirror `NewBadge` (TasksPage.swift:4896)
+/// so the row keeps a consistent visual rhythm.
+struct SummaryPendingBadge: View {
+  var body: some View {
+    Text("Summary Pending")
+      .scaledFont(size: 10, weight: .semibold)
+      .foregroundColor(OmiColors.purplePrimary)
+      .padding(.horizontal, 6)
+      .padding(.vertical, 2)
+      .background(OmiColors.purplePrimary.opacity(0.15))
+      .cornerRadius(4)
+      .help("Will summarize when your Mac is plugged in and idle or locked.")
+  }
 }

@@ -503,6 +503,55 @@ actor TranscriptionStorage {
         }
     }
 
+    /// Idempotent repair for sessions left in a non-terminal
+    /// `conversationStatus` after a crash/quit, where the recording itself
+    /// is finished but the conversation status was never advanced. Without
+    /// this, the Conversations list keeps showing them as "In Progress" /
+    /// "Processing" / "Merging" forever and the summary pipeline considers
+    /// them ineligible.
+    ///
+    /// Runs the SQL semantics required by the contract
+    /// (`TranscriptionStorageRepairContract.repairFinishedInProgressSessions`).
+    /// The legacy clause only matched `conversationStatus = 'in_progress'`,
+    /// but `LocalConversationStatus` also includes `processing` and
+    /// `merging` — both of which can be "frozen" by a crash in the same
+    /// way. Expand the WHERE to cover all three non-terminal statuses:
+    ///
+    ///     UPDATE transcription_sessions
+    ///        SET conversationStatus = 'completed', updatedAt = ?
+    ///      WHERE finishedAt IS NOT NULL
+    ///        AND conversationStatus IN ('in_progress', 'merging', 'processing')
+    ///        AND status != 'recording';
+    ///
+    /// - Returns: number of rows updated. Idempotent: subsequent calls return 0.
+    /// - Note: explicitly EXCLUDES rows where `status = 'recording'` so an
+    ///   active recording is never accidentally normalized.
+    @discardableResult
+    func repairFinishedInProgressSessions() async throws -> Int {
+        let db = try await ensureInitialized()
+        let now = Date()
+
+        let changed = try await db.write { database -> Int in
+            try database.execute(
+                sql: """
+                    UPDATE transcription_sessions
+                       SET conversationStatus = 'completed',
+                           updatedAt = ?
+                     WHERE finishedAt IS NOT NULL
+                       AND conversationStatus IN ('in_progress', 'merging', 'processing')
+                       AND status != 'recording'
+                    """,
+                arguments: [now]
+            )
+            return database.changesCount
+        }
+
+        if changed > 0 {
+            log("TranscriptionStorage: Repaired \(changed) finished non-terminal session(s) → completed")
+        }
+        return changed
+    }
+
     /// Recover sessions left in `recording` after an app crash/quit. In the
     /// local-first fork there is no remote backend retry to reconcile these, so
     /// old recording rows with transcript/audio must be closed locally; otherwise

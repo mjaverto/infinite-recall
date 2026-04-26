@@ -297,6 +297,11 @@ class AppState: ObservableObject {
         self?.checkNotificationPermission()
       }
     }
+
+    // Summary backfill launch hooks moved into `PowerWorkBridge.start()` so
+    // they run AFTER `BatteryAwareScheduler.shared.start()` is wired up.
+    // Previously this fire-and-forget Task could race the scheduler init and
+    // enqueue summary work before any handler was registered. See PR #30.
   }
 
   /// Initialize Bluetooth manager and subscribe to state changes

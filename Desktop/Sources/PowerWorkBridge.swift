@@ -49,10 +49,85 @@ final class PowerWorkBridge {
             try await PowerWorkBridge.handleOCR(work)
         }
 
+        // .summarize — autonomous title/overview generation. Decode the
+        // session_id payload and route through Agent A's
+        // `ConversationSummaryBackfillService.processSummary(sessionId:autonomous:)`.
+        // The `autonomous: true` flag forces the LLM call through
+        // `LocalLLMClient.chatAutonomous` so Memory Saver can still unload the
+        // model after the queue drains.
+        BatteryAwareScheduler.shared.registerHandler(for: .summarize) { work in
+            try await PowerWorkBridge.handleSummarize(work)
+        }
+
         // Start the periodic sweeper that reclaims expired leases and GCs old rows.
         PendingWorkSweeper.shared.start()
 
-        log("PowerWorkBridge: Started — registered .transcribe and .ocr handlers")
+        // Wire the dead-letter callback so summary jobs that exhaust their
+        // retry budget surface a structured "Summary Unavailable" placeholder
+        // instead of leaving a permanently-pending UI row. The callback is
+        // `@Sendable` and runs from inside `PendingWorkStorage.fail()` after
+        // the SQL transition completes.
+        Task {
+            await PendingWorkStorage.shared.setDeadLetterCallback { workType, payload in
+                await PowerWorkBridge.handleDeadLetter(workType: workType, payload: payload)
+            }
+        }
+
+        // Summary backfill launch hooks (moved from AppState.init so they run
+        // strictly AFTER `BatteryAwareScheduler.shared.start()` and the
+        // `.summarize` handler registration above). Fire-and-forget — both
+        // calls are async + idempotent and tolerate DB-not-yet-initialized
+        // by retrying lazily inside their own implementations.
+        Task { @MainActor in
+            do {
+                let repaired = try await TranscriptionStorage.shared.repairFinishedInProgressSessions()
+                if repaired > 0 {
+                    log("PowerWorkBridge: repaired \(repaired) finished non-terminal session(s) on launch")
+                }
+            } catch {
+                logError("PowerWorkBridge: repairFinishedInProgressSessions failed", error: error)
+            }
+            await ConversationSummaryBackfillService.shared
+                .enqueueHistoricalSummariesIfNeeded(reason: "launch")
+        }
+
+        log("PowerWorkBridge: Started — registered .transcribe, .ocr, and .summarize handlers")
+    }
+
+    // MARK: - Dead-letter handler
+
+    /// Called by `PendingWorkStorage` when a row exhausts `maxAttempts` and
+    /// transitions to `dead`. For `.summarize` work, decode the payload and
+    /// write a structured "Summary Unavailable" placeholder so the row stops
+    /// rendering as indefinitely-pending in the UI; then post a list-refresh
+    /// notification.
+    @Sendable
+    fileprivate static func handleDeadLetter(workType: String, payload: Data) async {
+        guard workType == PendingWork.Kind.summarize.rawValue else { return }
+
+        struct Payload: Decodable { let session_id: Int64 }
+        let sessionId: Int64
+        do {
+            sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
+        } catch {
+            logError("PowerWorkBridge: dead-letter payload undecodable for \(workType)", error: error)
+            return
+        }
+
+        do {
+            try await ConversationSummaryBackfillService.shared.writeUnavailablePlaceholder(sessionId: sessionId)
+            log("PowerWorkBridge: dead-letter — wrote Summary Unavailable placeholder for session \(sessionId)")
+        } catch {
+            logError("PowerWorkBridge: dead-letter — placeholder write failed for session \(sessionId)", error: error)
+        }
+
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .conversationsListNeedsRefresh,
+                object: nil,
+                userInfo: ["session_id": sessionId]
+            )
+        }
     }
 
     // MARK: - Transcribe handler
@@ -78,7 +153,13 @@ final class PowerWorkBridge {
             let started = ISO8601DateFormatter().date(from: startedStr),
             let ended = ISO8601DateFormatter().date(from: endedStr)
         else {
-            log("PowerWorkBridge: .transcribe payload undecodable, dropping")
+            // Corrupt payload is non-recoverable; logError so we get telemetry
+            // visibility without leaving the row stuck. We still ack/return.
+            logError(
+                "PowerWorkBridge: .transcribe payload undecodable, dropping",
+                error: NSError(domain: "PowerWorkBridge", code: 2,
+                               userInfo: [NSLocalizedDescriptionKey: "transcribe payload undecodable"])
+            )
             return
         }
         let language = (dict["language"] as? String) ?? "en"
@@ -180,7 +261,11 @@ final class PowerWorkBridge {
             let dict = json as? [String: Any],
             let id = (dict["screenshot_id"] as? Int64) ?? (dict["screenshot_id"] as? Int).map(Int64.init)
         else {
-            log("PowerWorkBridge: .ocr payload undecodable, dropping")
+            logError(
+                "PowerWorkBridge: .ocr payload undecodable, dropping",
+                error: NSError(domain: "PowerWorkBridge", code: 3,
+                               userInfo: [NSLocalizedDescriptionKey: "ocr payload undecodable"])
+            )
             return
         }
 
@@ -222,6 +307,76 @@ final class PowerWorkBridge {
             // row. (Same defensive policy as the legacy backfill path.)
             try? await RewindDatabase.shared.clearSkippedForBattery(id: id)
         }
+    }
+
+    // MARK: - Summarize handler
+
+    /// Decode a `.summarize` payload (`{"session_id": Int64}`) and invoke
+    /// `ConversationSummaryBackfillService.shared.processSummary(sessionId:autonomous:)`
+    /// with `autonomous: true`. Throws on retryable failure so PendingWork
+    /// retry/backoff can take over. Posts `.conversationsListNeedsRefresh`
+    /// after a successful processing pass so the conversations list updates
+    /// without an app relaunch.
+    fileprivate static func handleSummarize(_ work: PendingWork) async throws {
+        try await _handleSummarizePayload(
+            work.payload,
+            processor: { sessionId in
+                try await ConversationSummaryBackfillService.shared.processSummary(
+                    sessionId: sessionId,
+                    autonomous: true
+                )
+            },
+            notify: { sessionId in
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: .conversationsListNeedsRefresh,
+                        object: nil,
+                        userInfo: ["session_id": sessionId]
+                    )
+                }
+            }
+        )
+    }
+
+    /// Testable seam for `handleSummarize`. Decodes the payload, invokes the
+    /// injected `processor`, then `notify`. Mirrors the production semantics:
+    /// undecodable payload → no throw, no notify, no processor call;
+    /// processor throw → re-thrown, no notify; success → notify called.
+    /// Visible to tests via `@testable import`.
+    static func _handleSummarizePayload(
+        _ payload: Data,
+        processor: (Int64) async throws -> Void,
+        notify: (Int64) async -> Void
+    ) async throws {
+        struct Payload: Decodable {
+            let session_id: Int64
+        }
+
+        let sessionId: Int64
+        do {
+            sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
+        } catch {
+            // Undecodable payload is not retryable. logError so we get
+            // telemetry visibility, then return so the row gets ack'd and
+            // removed from the queue.
+            logError("PowerWorkBridge: .summarize payload undecodable, dropping", error: error)
+            return
+        }
+
+        do {
+            try await processor(sessionId)
+        } catch {
+            // Re-throw so the scheduler calls PendingWorkStorage.fail() and
+            // backoff/retry kicks in. Per Agent A's design, processSummary
+            // throws ONLY on retryable failures (LLM unreachable, transient
+            // DB error). Non-retryable conditions return normally.
+            logError("PowerWorkBridge: .summarize — session \(sessionId) failed (will retry)", error: error)
+            throw error
+        }
+
+        // Success path — let the conversations list refresh.
+        await notify(sessionId)
+        log("PowerWorkBridge: .summarize — session \(sessionId) done")
     }
 }
 

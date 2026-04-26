@@ -149,6 +149,38 @@ actor LocalLLMClient: LLMClient {
     }
   }
 
+  /// Autonomous-mode chat. Same wire behavior as `chat(...)` but DOES NOT
+  /// call `IdleAIController.shared.recordAICall()`.
+  ///
+  /// Why: autonomous summarize work runs while the user is locked or input-
+  /// idle. If we bumped `lastAICall`, Memory Saver's idle-unload threshold
+  /// would never elapse during a long drain, pinning the local LLM in memory
+  /// indefinitely and defeating the user's "release on idle" preference.
+  /// `BatteryAwareScheduler.drain()` calls
+  /// `IdleAIController.releaseAfterAutonomousWorkIfAppropriate()` after each
+  /// batch finishes so the server CAN unload once the queue is empty and the
+  /// user is still away.
+  ///
+  /// This method MUST NOT be used by user-initiated chat paths — those keep
+  /// using `chat(...)` so the idle watchdog continues to bump and the server
+  /// auto-restarts on the next user request.
+  ///
+  /// INVARIANT: do not introduce a flag on `chat(...)` to share this body.
+  /// Keeping the two entry points distinct makes the call-site contract
+  /// (does this pin the model alive?) auditable from the call graph alone.
+  func chatAutonomous(
+    messages: [LLM.ChatMessage],
+    stream: Bool = false
+  ) async throws -> AsyncThrowingStream<LLM.ChatChunk, Error> {
+    // Intentionally NO recordAICall() here.
+    let request = try makeChatRequest(messages: messages, stream: stream)
+    if stream {
+      return makeStreamingChat(request: request)
+    } else {
+      return makeNonStreamingChat(request: request)
+    }
+  }
+
   /// Convenience: single-prompt completion. Returns the full text.
   func complete(prompt: String, maxTokens: Int = 512) async throws -> String {
     await IdleAIController.shared.recordAICall()
