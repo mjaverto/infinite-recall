@@ -775,7 +775,7 @@ async fn enum_round_trip_via_wire() {
         (t::BlockReason::Thermal, "thermal"),
         (t::BlockReason::Locked, "locked"),
         (t::BlockReason::ManualPause, "manual_pause"),
-        (t::BlockReason::Unwired, "unwired"),
+        (t::BlockReason::Initializing, "initializing"),
     ] {
         let s = serde_json::to_string(&reason).unwrap();
         assert_eq!(s, format!("\"{wire}\""));
@@ -994,7 +994,7 @@ async fn gate_state_post_updates_snapshot() {
     let app = routes::router(state);
     let (k, v) = auth_header();
 
-    // Pre-condition: snapshot reports `Blocked { reason: Unwired }` until
+    // Pre-condition: snapshot reports `Blocked { reason: Initializing }` until
     // the first POST arrives.
     let snap_req = Request::builder()
         .method(Method::GET)
@@ -1004,7 +1004,7 @@ async fn gate_state_post_updates_snapshot() {
         .unwrap();
     let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
     assert_eq!(snap["processing_gate"]["state"], json!("blocked"));
-    assert_eq!(snap["processing_gate"]["reason"], json!("unwired"));
+    assert_eq!(snap["processing_gate"]["reason"], json!("initializing"));
 
     // POST a real `Allowed` state.
     let body = json!({
@@ -1126,15 +1126,15 @@ async fn gate_state_post_rejects_invalid_bodies() {
     }
 }
 
-/// `BridgedProcessingGate::set` rejects external `Blocked { Unwired, .. }`
-/// posts (defense-in-depth). The `Unwired` variant exists ONLY to
+/// `BridgedProcessingGate::set` rejects external `Blocked { Initializing, .. }`
+/// posts (defense-in-depth). The `Initializing` variant exists ONLY to
 /// represent "haven't received the first POST yet" — Swift should never
 /// post it, but if it ever does, we must not let it latch the gate back
 /// into the boot-window state. The route handler still returns 204 (this
 /// is internal validation that doesn't leak to the caller); the post-
 /// condition is that the stored gate state is unchanged.
 #[tokio::test]
-async fn gate_state_post_rejects_external_unwired_silently() {
+async fn gate_state_post_rejects_external_initializing_silently() {
     use infinite_recall_api::activity::BridgedProcessingGate;
 
     let gate: Arc<BridgedProcessingGate> = Arc::new(BridgedProcessingGate::new());
@@ -1148,7 +1148,7 @@ async fn gate_state_post_rejects_external_unwired_silently() {
     let app = routes::router(state);
     let (k, v) = auth_header();
 
-    // Pre: snapshot reports Unwired (initial state, no real POST yet).
+    // Pre: snapshot reports Initializing (initial state, no real POST yet).
     let snap_req = Request::builder()
         .method(Method::GET)
         .uri("/v1/activity/snapshot")
@@ -1157,18 +1157,18 @@ async fn gate_state_post_rejects_external_unwired_silently() {
         .unwrap();
     let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
     assert_eq!(snap["processing_gate"]["state"], json!("blocked"));
-    assert_eq!(snap["processing_gate"]["reason"], json!("unwired"));
+    assert_eq!(snap["processing_gate"]["reason"], json!("initializing"));
     let initial_since = snap["processing_gate"]["since"]
         .as_str()
         .expect("since must be a string")
         .to_string();
 
-    // POST a `Blocked { Unwired, .. }` body — the handler must accept it
+    // POST a `Blocked { Initializing, .. }` body — the handler must accept it
     // at the wire level (return 204) but the gate's internal state must
     // be unchanged (rejected by `BridgedProcessingGate::set`).
     let body = json!({
         "state": "blocked",
-        "reason": "unwired",
+        "reason": "initializing",
         "since": "2030-01-01T00:00:00.000Z",
         "waiting_for": { "type": "manual" }
     });
@@ -1183,7 +1183,7 @@ async fn gate_state_post_rejects_external_unwired_silently() {
     // 204 — defense-in-depth, no validation leak.
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Post: snapshot still reports the original Unwired state (the same
+    // Post: snapshot still reports the original Initializing state (the same
     // `since` from before — the rejected POST didn't overwrite anything).
     let snap_req = Request::builder()
         .method(Method::GET)
@@ -1193,10 +1193,10 @@ async fn gate_state_post_rejects_external_unwired_silently() {
         .unwrap();
     let snap = json_body(app.clone().oneshot(snap_req).await.unwrap()).await;
     assert_eq!(snap["processing_gate"]["state"], json!("blocked"));
-    assert_eq!(snap["processing_gate"]["reason"], json!("unwired"));
+    assert_eq!(snap["processing_gate"]["reason"], json!("initializing"));
     assert_eq!(
         snap["processing_gate"]["since"].as_str().unwrap(),
         initial_since,
-        "`since` must NOT advance — the Unwired POST should be a no-op"
+        "`since` must NOT advance — the Initializing POST should be a no-op"
     );
 }

@@ -303,17 +303,18 @@ final class ActivityModelsTests: XCTestCase {
     func testBlockReasonEveryEnumValueDecodes() throws {
         // Issue #35: BlockReason replaces GateReason. The pre-#35 `idle`
         // and `none` reasons are gone — they map to `Allowed` now.
-        // PR #40 review: `unwired` is the placeholder reason returned by
-        // Rust's `AlwaysAllowedGate` until the real ProcessingGate (#32)
-        // ships — it MUST decode + encode like every other variant so the
-        // UI can render an honest "gate not yet wired" banner.
+        // PR #40 review: `initializing` is the placeholder reason returned
+        // by Rust's `BridgedProcessingGate` during the brief boot window
+        // before the first `ProcessingGateReporter` POST arrives — it MUST
+        // decode + encode like every other variant so the UI can render an
+        // honest "initializing" banner.
         let cases: [(String, BlockReason)] = [
             ("device_active", .deviceActive),
             ("on_battery",    .onBattery),
             ("thermal",       .thermal),
             ("locked",        .locked),
             ("manual_pause",  .manualPause),
-            ("unwired",       .unwired),
+            ("initializing",  .initializing),
         ]
         for (wire, expected) in cases {
             let json = """

@@ -43,14 +43,13 @@ pub struct BridgedProcessingGate {
 }
 
 impl BridgedProcessingGate {
-    /// Construct a gate seeded with `Blocked { reason: Unwired, ... }`.
-    /// The variant is the same honest "not wired yet" signal the previous
-    /// stub emitted; once Swift POSTs its first real reading, this is
-    /// overwritten and never reverts.
+    /// Construct a gate seeded with `Blocked { reason: Initializing, ... }`
+    /// so callers see "initializing" until Swift POSTs its first real
+    /// reading, which overwrites the state and never reverts.
     pub fn new() -> Self {
         tracing::info!(
             target: "activity.gate",
-            initial = "Unwired",
+            initial = "Initializing",
             "BridgedProcessingGate constructed"
         );
         Self {
@@ -65,8 +64,8 @@ impl BridgedProcessingGate {
     /// `into_inner()` rather than panicking the route handler. The data
     /// itself is still writable.
     ///
-    /// `Blocked { reason: Unwired, .. }` is rejected (defense-in-depth):
-    /// the `Unwired` variant exists ONLY to represent "haven't received
+    /// `Blocked { reason: Initializing, .. }` is rejected (defense-in-depth):
+    /// the `Initializing` variant exists ONLY to represent "haven't received
     /// the first POST yet" — Swift should never post it. We swallow the
     /// write and emit a `tracing::warn!` so an external POST can't latch
     /// the gate back into the boot-window state. The route handler still
@@ -74,14 +73,14 @@ impl BridgedProcessingGate {
     /// caller.
     pub fn set(&self, new_state: GateState) {
         if let GateState::Blocked {
-            reason: BlockReason::Unwired,
+            reason: BlockReason::Initializing,
             ..
         } = &new_state
         {
             tracing::warn!(
                 target: "activity.gate",
                 ?new_state,
-                "rejected external Unwired gate-state post (Unwired is reserved for the boot window)"
+                "rejected external Initializing gate-state post (Initializing is reserved for the boot window)"
             );
             return;
         }
@@ -121,7 +120,7 @@ impl WritableProcessingGate for BridgedProcessingGate {
 
 fn initial_state() -> GateState {
     GateState::Blocked {
-        reason: BlockReason::Unwired,
+        reason: BlockReason::Initializing,
         since: Utc::now(),
         waiting_for: WaitCondition::Manual,
     }
@@ -147,14 +146,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_state_is_blocked_unwired() {
+    fn initial_state_is_blocked_initializing() {
         let gate = BridgedProcessingGate::new();
         match gate.current() {
             GateState::Blocked { reason, waiting_for, .. } => {
-                assert_eq!(reason, BlockReason::Unwired);
+                assert_eq!(reason, BlockReason::Initializing);
                 assert_eq!(waiting_for, WaitCondition::Manual);
             }
-            GateState::Allowed { .. } => panic!("initial must be Blocked Unwired"),
+            GateState::Allowed { .. } => panic!("initial must be Blocked Initializing"),
         }
     }
 

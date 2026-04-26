@@ -112,7 +112,7 @@ pub enum BlockReason {
     /// arrives. Should only be observed during the brief boot window
     /// (~3s — one `ProcessingGateReporter` poll cycle). External POSTs
     /// of this variant are rejected by `BridgedProcessingGate::set`.
-    Unwired,
+    Initializing,
 }
 
 /// What the gate is waiting for before it will let work drain again.
@@ -405,7 +405,7 @@ mod tests {
             (BlockReason::Thermal, "thermal"),
             (BlockReason::Locked, "locked"),
             (BlockReason::ManualPause, "manual_pause"),
-            (BlockReason::Unwired, "unwired"),
+            (BlockReason::Initializing, "initializing"),
         ] {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{wire}\""));
             let back: BlockReason = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
