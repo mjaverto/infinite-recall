@@ -3,8 +3,11 @@
 //! Implements [`ResourceSampler`] using:
 //! - `libproc::pid_rusage::pidinfo::<TaskInfo>` for self + Swift PID + mlx-lm PID
 //!   CPU/RSS deltas.
-//! - PID discovery: pidfile under `~/Library/Application Support/InfiniteRecall/`
-//!   first, then `launchctl list` parsing as fallback.
+//! - PID discovery order:
+//!   1. pidfile under `~/Library/Application Support/InfiniteRecall/{swift,mlxlm}.pid`
+//!   2. `pgrep -f` against the well-known executable pattern
+//!   3. (mlx only) `launchctl list com.infiniterecall.mlx` for the launchd-managed
+//!      `mlx_lm.server` agent
 //! - `ioreg -r -c IOAccelerator -d 1` shellout to read `Device Utilization %`.
 //! - `pmset -g batt` for battery / low-power state.
 //! - `sysctl machdep.xcpm.cpu_thermal_level` (with `pmset -g therm` fallback)
@@ -24,21 +27,16 @@ use libproc::task_info::TaskInfo;
 use super::traits::ResourceSampler;
 use super::types::{ProcessBreakdown, ResourceSample, ThermalState};
 
-/// Default labels we will probe via `launchctl list` if a pidfile is missing.
-///
-/// The first matching label wins. The plan suggested `com.omi.infinite-recall`
-/// and `org.mlxlm.server`; observed installs use `com.infiniterecall.*`. We
-/// probe both to stay robust.
-const SWIFT_LABEL_CANDIDATES: &[&str] = &[
-    "com.omi.infinite-recall",
-    "com.infiniterecall.app",
-    "com.infiniterecall.desktop",
-];
-const MLX_LABEL_CANDIDATES: &[&str] = &[
-    "com.infiniterecall.mlx",
-    "org.mlxlm.server",
-    "com.mlxlm.server",
-];
+/// `pgrep -f` patterns. The Swift app is launched as a regular `.app` (never
+/// under launchd) so its PID has to come from the bundle path; the mlx-lm
+/// helper is a `uv tool run mlx_lm.server` invocation that uniquely matches
+/// the executable name.
+const SWIFT_PGREP_PATTERN: &str = "Infinite Recall.app/Contents/MacOS";
+const MLX_PGREP_PATTERN: &str = "mlx_lm.server";
+
+/// Launchd label for `mlx_lm.server`. The Swift app is NOT under launchd, so
+/// no swift-side label is probed.
+const MLX_LAUNCHD_LABEL: &str = "com.infiniterecall.mlx";
 
 /// How long to hold a sample in cache before re-sampling.
 ///
@@ -181,51 +179,79 @@ fn discover_pids(support_dir_override: Option<&std::path::Path>) -> Vec<(String,
         .map(|p| p.to_path_buf())
         .unwrap_or_else(default_support_dir);
 
-    let swift_pidfile = support_dir.join("swift.pid");
-    if let Some(pid) = read_pidfile(&swift_pidfile) {
-        tracing::debug!(
-            component = "activity.discover",
-            target = "swift",
-            via = "pidfile",
-            path = %swift_pidfile.display(),
-            pid,
-            "discovered pid via pidfile"
-        );
-        out.push(("swift".to_string(), pid));
-    } else if let Some(pid) = pid_from_launchctl_any(SWIFT_LABEL_CANDIDATES, "swift") {
-        tracing::debug!(
-            component = "activity.discover",
-            target = "swift",
-            via = "launchctl",
-            pid,
-            "discovered pid via launchctl"
-        );
+    if let Some(pid) = discover_one(
+        "swift",
+        &support_dir.join("swift.pid"),
+        SWIFT_PGREP_PATTERN,
+        None,
+    ) {
         out.push(("swift".to_string(), pid));
     }
 
-    let mlx_pidfile = support_dir.join("mlxlm.pid");
-    if let Some(pid) = read_pidfile(&mlx_pidfile) {
-        tracing::debug!(
-            component = "activity.discover",
-            target = "mlx",
-            via = "pidfile",
-            path = %mlx_pidfile.display(),
-            pid,
-            "discovered pid via pidfile"
-        );
-        out.push(("mlx-lm".to_string(), pid));
-    } else if let Some(pid) = pid_from_launchctl_any(MLX_LABEL_CANDIDATES, "mlx") {
-        tracing::debug!(
-            component = "activity.discover",
-            target = "mlx",
-            via = "launchctl",
-            pid,
-            "discovered pid via launchctl"
-        );
+    if let Some(pid) = discover_one(
+        "mlx",
+        &support_dir.join("mlxlm.pid"),
+        MLX_PGREP_PATTERN,
+        Some(MLX_LAUNCHD_LABEL),
+    ) {
         out.push(("mlx-lm".to_string(), pid));
     }
 
     out
+}
+
+/// Try pidfile, then `pgrep -f`, then (optionally) `launchctl list`. Emits a
+/// single `tracing::debug!` when every path falls through; never warns
+/// because a missing target is normal before the user starts the helper.
+fn discover_one(
+    target: &str,
+    pidfile: &std::path::Path,
+    pgrep_pattern: &str,
+    launchd_label: Option<&str>,
+) -> Option<i32> {
+    if let Some(pid) = read_pidfile(pidfile) {
+        tracing::debug!(
+            component = "activity.discover",
+            target,
+            via = "pidfile",
+            path = %pidfile.display(),
+            pid,
+            "discovered pid via pidfile"
+        );
+        return Some(pid);
+    }
+    if let Some(pid) = pid_from_pgrep(pgrep_pattern, target) {
+        tracing::debug!(
+            component = "activity.discover",
+            target,
+            via = "pgrep",
+            pattern = pgrep_pattern,
+            pid,
+            "discovered pid via pgrep"
+        );
+        return Some(pid);
+    }
+    if let Some(label) = launchd_label {
+        if let Some(pid) = pid_from_launchctl(label) {
+            tracing::debug!(
+                component = "activity.discover",
+                target,
+                via = "launchctl",
+                label,
+                pid,
+                "discovered pid via launchctl"
+            );
+            return Some(pid);
+        }
+    }
+    tracing::debug!(
+        component = "activity.discover",
+        target,
+        pgrep_pattern,
+        launchd_label,
+        "no pid found via pidfile / pgrep / launchctl"
+    );
+    None
 }
 
 fn default_support_dir() -> PathBuf {
@@ -301,22 +327,49 @@ fn read_pidfile(path: &std::path::Path) -> Option<i32> {
     Some(pid)
 }
 
-/// Tries each candidate label until one returns a live pid. If none match,
-/// emits a single `tracing::warn!` listing the candidates we tried so the
-/// next person who renames a launchd label sees an actionable breadcrumb.
-fn pid_from_launchctl_any(labels: &[&str], target: &str) -> Option<i32> {
-    for label in labels {
-        if let Some(pid) = pid_from_launchctl(label) {
-            return Some(pid);
+/// Runs `pgrep -f <pattern>` and returns the first live, non-self pid.
+fn pid_from_pgrep(pattern: &str, target: &str) -> Option<i32> {
+    let out = Command::new("pgrep").args(["-f", pattern]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_pgrep_pid(&stdout, std::process::id() as i32, target)
+}
+
+/// Parse newline-separated `pgrep` output. Skips our own pid (which can match
+/// when the daemon was launched with the matching pattern in argv).
+///
+/// F4: emits a `warn!` when more than one non-self live PID matches (e.g.
+/// dev + prod IR builds against the same bundle pattern). Pick semantics
+/// unchanged — first match still wins.
+fn parse_pgrep_pid(stdout: &str, self_pid: i32, target: &str) -> Option<i32> {
+    let mut picked: Option<i32> = None;
+    let mut extras: u32 = 0;
+    for line in stdout.lines() {
+        let Ok(pid) = line.trim().parse::<i32>() else {
+            continue;
+        };
+        if pid > 0 && pid != self_pid && pid_alive(pid) {
+            if picked.is_none() {
+                picked = Some(pid);
+            } else {
+                extras += 1;
+            }
         }
     }
-    tracing::warn!(
-        component = "activity.discover",
-        target,
-        labels = ?labels,
-        "no launchctl entry found for {target} (tried all candidate labels)"
-    );
-    None
+    if extras > 0 {
+        if let Some(pid) = picked {
+            tracing::warn!(
+                component = "activity.discover",
+                target,
+                picked_pid = pid,
+                extra_matches = extras,
+                "pgrep returned multiple live candidates; picking first"
+            );
+        }
+    }
+    picked
 }
 
 /// Parses `launchctl list <label>` for a `"PID" = <int>;` (legacy) or
@@ -723,6 +776,43 @@ mod tests {
         assert_eq!(a.process_breakdown[0].pid, b.process_breakdown[0].pid);
         assert_eq!(a.process_breakdown[0].rss_mb, b.process_breakdown[0].rss_mb);
         assert!((a.cpu_percent - b.cpu_percent).abs() < f32::EPSILON);
+    }
+
+    /// `pgrep` returned a single pid for our own process — discovery must
+    /// reject it so we never double-count the daemon as the Swift app.
+    #[test]
+    fn pgrep_skips_self_pid() {
+        let me = std::process::id() as i32;
+        assert_eq!(parse_pgrep_pid(&format!("{me}\n"), me, "swift"), None);
+    }
+
+    /// First live non-self pid in the buffer wins. Garbage lines are skipped.
+    #[test]
+    fn pgrep_returns_first_live_non_self() {
+        let me = std::process::id() as i32;
+        assert_eq!(parse_pgrep_pid("", me, "swift"), None);
+        // Self filter skips every match.
+        assert_eq!(parse_pgrep_pid(&format!("{me}\n{me}\n"), me, "swift"), None);
+        // A garbage line is skipped, then our (live) pid is returned when we
+        // pretend to be discovering "from" a different self pid.
+        let other_self = me + 1;
+        let buf = format!("not-a-pid\n{me}\n");
+        assert_eq!(parse_pgrep_pid(&buf, other_self, "swift"), Some(me));
+    }
+
+    /// F4: when `pgrep` returns multiple live non-self pids (dev + prod IR
+    /// builds matching the same bundle pattern), pick the first and warn.
+    #[test]
+    fn pgrep_multi_match_picks_first() {
+        let me = std::process::id() as i32;
+        let other_self = me + 1;
+        let buf = format!("{me}\n{me}\n");
+        assert_eq!(
+            parse_pgrep_pid(&buf, other_self, "swift"),
+            Some(me),
+            "first live non-self pid wins"
+        );
+        // TODO: assert warn when log capture available
     }
 
     #[test]
