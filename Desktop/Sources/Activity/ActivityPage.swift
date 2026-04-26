@@ -35,6 +35,9 @@ struct ActivityPage: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 gateBanner
+                if let err = service.lastError {
+                    errorBanner(err)
+                }
                 resourceCards
                 inFlightSection
                 liveCaptureSection
@@ -50,11 +53,58 @@ struct ActivityPage: View {
         .background(OmiColors.backgroundPrimary)
         .navigationTitle("Activity")
         .onReceive(tickTimer) { now in tick = now }
+        // === activity:C1 ===
+        // Polling lifecycle: start when the tab is visible, stop on
+        // disappear so we don't hammer the daemon while hidden (per UX
+        // scenario 9 in the plan). CapturePauseGate is owned by OmiApp.
+        .task {
+            service.start()
+        }
+        .onDisappear {
+            service.stop()
+        }
+        // === /activity:C1 ===
         .sheet(item: $captureToConfirm) { kind in
             captureConfirmSheet(kind: kind)
         }
         .accessibilityIdentifier("activity_page")
     }
+
+    // === activity:C3 ===
+    /// Small dismissible banner under the header for the most recent
+    /// pause/resume/snapshot failure surfaced by `ActivityMonitorService`.
+    private func errorBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .scaledFont(size: 14)
+                .foregroundColor(OmiColors.error)
+            Text(message)
+                .scaledFont(size: 12)
+                .foregroundColor(OmiColors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button {
+                service.clearLastError()
+            } label: {
+                Image(systemName: "xmark")
+                    .scaledFont(size: 11)
+                    .foregroundColor(OmiColors.textTertiary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Dismiss error")
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(OmiColors.error.opacity(0.1))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(OmiColors.error.opacity(0.35), lineWidth: 1)
+                )
+        )
+        .accessibilityIdentifier("activity_error_banner")
+    }
+    // === /activity:C3 ===
 
     // MARK: Snapshot accessors
 
@@ -118,6 +168,14 @@ struct ActivityPage: View {
             )
         }
         switch gate.reason {
+        case .stub:
+            // Consensus-fix C4: honest copy when AlwaysAllowedGate is wired.
+            return BannerInfo(
+                icon: "wrench.adjustable",
+                title: "Gate not yet wired (#32)",
+                detail: "Activity scheduling will start once the real ProcessingGate ships.",
+                color: OmiColors.textTertiary
+            )
         case .idle, .none:
             if gate.allowed {
                 return BannerInfo(
@@ -556,6 +614,8 @@ struct ActivityPage: View {
                 return ("Up to date — 0 queued", "Manually paused.")
             case .idle, .none:
                 return ("Up to date — 0 queued", "Idle processing standing by.")
+            case .stub:
+                return ("Up to date — 0 queued", "Gate not yet wired (#32).")
             }
         }()
         return VStack(spacing: 6) {

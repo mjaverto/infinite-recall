@@ -63,6 +63,12 @@ pub async fn run() -> Result<()> {
         Arc::new(activity::resources::SystemResourceSampler::new());
     let processing_gate: Arc<dyn activity::ProcessingGate> =
         Arc::new(activity::gate::AlwaysAllowedGate);
+    // Consensus-fix C4: leave a single, grep-able boot breadcrumb so anyone
+    // staring at the Activity tab can confirm we are still on the stub.
+    tracing::warn!(
+        component = "activity.gate",
+        "AlwaysAllowedGate active — real ProcessingGate not yet wired (issue #32)"
+    );
     let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
     // === /activity:A ===
 

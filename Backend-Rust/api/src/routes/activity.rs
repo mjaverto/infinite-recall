@@ -9,10 +9,11 @@
 //! impls are owned by Streams B/C/D and the idle-gate agent — the Phase 0
 //! contract (`activity/contract.md`) is the source of truth.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::Utc;
 use serde_json::json;
 
+use crate::activity::traits::PauseStoreError;
 use crate::activity::types::{
     ActivitySnapshot, CaptureKind, CaptureRow, InflightUpdate, KindRow, PauseRequest, PauseTarget,
     ResumeRequest, WorkKind,
@@ -122,19 +123,33 @@ fn validate_target_id(target: PauseTarget, id: &str) -> Result<(), StatusCode> {
     }
 }
 
+/// Map `PauseStoreError` to a 5xx response with structured JSON detail
+/// (consensus-fix C3) so the Swift caller can show the real failure
+/// instead of silently rolling back optimistic UI state.
+fn pause_store_error_response(e: PauseStoreError) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "pause_store_failure",
+            "detail": e.to_string(),
+        })),
+    )
+}
+
 /// `POST /v1/activity/pause` — pause a kind or live capture for N minutes.
 pub async fn pause(
     State(state): State<AppState>,
     Json(body): Json<PauseRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     if body.minutes == 0 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into_response());
     }
-    validate_target_id(body.target, &body.id)?;
+    validate_target_id(body.target, &body.id).map_err(|s| s.into_response())?;
 
     let resume_at = state
         .pause_store
-        .pause(body.target, &body.id, body.minutes);
+        .pause(body.target, &body.id, body.minutes)
+        .map_err(|e| pause_store_error_response(e).into_response())?;
 
     // Best-effort fanout. No subscribers = ok; the Swift poller still
     // refreshes on its 1s tick.
@@ -153,16 +168,23 @@ pub async fn pause(
 pub async fn resume(
     State(state): State<AppState>,
     Json(body): Json<ResumeRequest>,
-) -> Result<StatusCode, StatusCode> {
-    validate_target_id(body.target, &body.id)?;
+) -> Result<StatusCode, axum::response::Response> {
+    validate_target_id(body.target, &body.id).map_err(|s| s.into_response())?;
 
-    state.pause_store.resume(body.target, &body.id);
+    let was_paused = state
+        .pause_store
+        .resume(body.target, &body.id)
+        .map_err(|e| pause_store_error_response(e).into_response())?;
 
-    let _ = state.pause_tx.send(PauseChange {
-        target: body.target,
-        id: body.id.clone(),
-        paused_until: None,
-    });
+    // Only fan out a notification if a row was actually deleted — otherwise
+    // we'd wake every Swift poller for every UI Cmd-R no-op.
+    if was_paused {
+        let _ = state.pause_tx.send(PauseChange {
+            target: body.target,
+            id: body.id.clone(),
+            paused_until: None,
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

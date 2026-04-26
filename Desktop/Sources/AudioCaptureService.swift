@@ -303,8 +303,10 @@ class AudioCaptureService: @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            // Re-check the gate; only stop if we're now paused.
-            let paused = CapturePauseGate.shared.isPaused(target: "capture", id: "audio")
+            // Re-check the gate via the nonisolated sync API (consensus-fix
+            // C6) — the observer block is not actor-isolated, so calling
+            // the @MainActor `isPaused` would race / require a hop.
+            let paused = CapturePauseGate.shared.isPausedSync(target: "capture", id: "audio")
             if paused {
                 log("AudioCapture: pause notification received while capturing — stopping mic")
                 self.stopCapture()

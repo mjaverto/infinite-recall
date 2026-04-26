@@ -901,18 +901,15 @@ final class ScreenCaptureService: Sendable {
 
   /// Capture the active window and return as JPEG data (synchronous - legacy)
   func captureActiveWindow() -> Data? {
-    // === activity:H ===
-    // Synchronous entry point: cannot await the MainActor-bound gate.
-    // Use a non-blocking best-effort read via DispatchQueue.main.sync,
-    // skipping the gate if we're already on the main thread (to avoid
-    // deadlock) — the async paths above provide the primary enforcement.
-    if !Thread.isMainThread {
-      let paused = DispatchQueue.main.sync { CapturePauseGate.shared.isPaused(target: "capture", id: "screen") }
-      if paused {
-        let until = DispatchQueue.main.sync { CapturePauseGate.shared.pausedUntil(target: "capture", id: "screen") }
-        log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
-        return nil
-      }
+    // === activity:H === (consensus-fix C6)
+    // Use the nonisolated, lock-protected mirror so we can read the gate
+    // from any thread — including the main thread. The previous
+    // `!Thread.isMainThread` guard silently skipped the gate when called
+    // from MainActor, which let user-paused screen captures continue.
+    if CapturePauseGate.shared.isPausedSync(target: "capture", id: "screen") {
+      let until = CapturePauseGate.shared.pausedUntilSync(target: "capture", id: "screen")
+      log("ScreenCapture: paused until \(String(describing: until)) — skipping start")
+      return nil
     }
     // === /activity:H ===
     guard let windowID = Self.getActiveWindowID() else {

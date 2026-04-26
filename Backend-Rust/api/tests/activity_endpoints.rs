@@ -83,7 +83,7 @@ use serde_json::{json, Value};
 use tower::util::ServiceExt; // brings `oneshot` onto Router
 
 use infinite_recall_api::activity::traits::{
-    InflightRegistry, PauseStore, ProcessingGate, ResourceSampler,
+    InflightRegistry, PauseStore, PauseStoreError, ProcessingGate, ResourceSampler,
 };
 use infinite_recall_api::activity::types::{
     GateReason, GateState, InFlight, PauseTarget, ProcessBreakdown,
@@ -120,20 +120,28 @@ impl PauseStore for MemPauseStore {
             .copied()
     }
 
-    fn pause(&self, target: PauseTarget, id: &str, minutes: u32) -> DateTime<Utc> {
+    fn pause(
+        &self,
+        target: PauseTarget,
+        id: &str,
+        minutes: u32,
+    ) -> Result<DateTime<Utc>, PauseStoreError> {
         let resume_at = Utc::now() + Duration::minutes(minutes as i64);
         self.inner
             .lock()
             .unwrap()
             .insert((target, id.to_string()), resume_at);
-        resume_at
+        Ok(resume_at)
     }
 
-    fn resume(&self, target: PauseTarget, id: &str) {
-        self.inner
+    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError> {
+        let removed = self
+            .inner
             .lock()
             .unwrap()
-            .remove(&(target, id.to_string()));
+            .remove(&(target, id.to_string()))
+            .is_some();
+        Ok(removed)
     }
 }
 
@@ -440,7 +448,9 @@ async fn pause_persists_across_restart() {
     // Lifecycle 1: write a pause then drop everything.
     {
         let store = SqlPauseStore::open(&path).expect("open SqlPauseStore");
-        let resume_at = store.pause(PauseTarget::Kind, "ocr", 30);
+        let resume_at = store
+            .pause(PauseTarget::Kind, "ocr", 30)
+            .expect("pause should persist");
         assert!(resume_at > Utc::now());
         // store dropped here.
     }
@@ -473,7 +483,9 @@ async fn resume_clears_pause() {
     let app = routes::router(state);
     let (k, v) = auth_header();
 
-    pause_store.pause(PauseTarget::Kind, "ocr", 5);
+    pause_store
+        .pause(PauseTarget::Kind, "ocr", 5)
+        .expect("pause ok");
     assert!(pause_store.paused_until(PauseTarget::Kind, "ocr").is_some());
 
     let req = Request::builder()

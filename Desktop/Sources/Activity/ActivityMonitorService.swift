@@ -105,19 +105,32 @@ public final class ActivityMonitorService: ObservableObject {
     }
 
     /// Resume a previously paused row.
+    /// Consensus-fix C3: only mutate local state after the backend write
+    /// succeeds. Previously we wrote optimistically and the next snapshot
+    /// poll silently reverted on backend failure.
     public func resume(target: PauseTarget, id: String) async {
         do {
             try await APIClient.shared.resumeActivity(target: target.rawValue, id: id)
             applyOptimisticPause(target: target, id: id, until: nil)
             postPauseChanged()
+            self.lastError = nil
             await fetchOnce()
         } catch {
-            lastError = "resume failed: \(error.localizedDescription)"
+            self.lastError = userFacingErrorMessage(action: "Resume", error: error)
         }
+    }
+
+    /// Clear the user-visible error banner. Bound to the dismiss button in
+    /// `ActivityPage.errorBanner`.
+    public func clearLastError() {
+        self.lastError = nil
     }
 
     // MARK: - Private
 
+    /// Consensus-fix C3: write to local state ONLY after the round-trip
+    /// returns success. On failure we set `lastError` and leave the
+    /// snapshot untouched so the UI never silently rolls back.
     private func pause(target: PauseTarget, id: String, minutes: Int) async {
         do {
             let until = try await APIClient.shared.pauseActivity(
@@ -127,10 +140,34 @@ public final class ActivityMonitorService: ObservableObject {
             )
             applyOptimisticPause(target: target, id: id, until: until)
             postPauseChanged()
+            self.lastError = nil
             await fetchOnce()
         } catch {
-            lastError = "pause failed: \(error.localizedDescription)"
+            self.lastError = userFacingErrorMessage(action: "Pause", error: error)
         }
+    }
+
+    /// Convert an `APIError` (or any `Error`) into a one-line user-readable
+    /// banner string. Surfaces the route's `pause_store_failure` detail
+    /// when present so users see "Couldn't pause: pause store storage error
+    /// — disk full" rather than just "HTTP 500".
+    private func userFacingErrorMessage(action: String, error: Error) -> String {
+        let detail: String
+        if let apiErr = error as? APIError {
+            switch apiErr {
+            case .unauthorized:
+                detail = "the local API rejected the request"
+            case .httpError(let code):
+                detail = "the local API returned HTTP \(code)"
+            case .invalidResponse:
+                detail = "the local API returned an invalid response"
+            default:
+                detail = error.localizedDescription
+            }
+        } else {
+            detail = error.localizedDescription
+        }
+        return "\(action) failed: \(detail)"
     }
 
     private func handleBecameKey() {

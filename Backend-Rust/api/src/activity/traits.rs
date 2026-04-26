@@ -6,10 +6,57 @@
 //! these trait objects.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 
 use super::types::{GateState, InFlight, PauseTarget, ResourceSample, WorkKind};
+
+/// Errors surfaced by `PauseStore` writes (consensus-fix C3).
+///
+/// Pre-fix, `pause()` and `resume()` swallowed every SQLite / pool error
+/// and returned a value as if the write had succeeded — so the UI rendered
+/// optimistic state that quietly reverted on the next snapshot poll.
+/// Routes now translate this into 5xx so the Swift side can show the
+/// failure to the user instead of silently rolling back.
+#[derive(Debug)]
+pub enum PauseStoreError {
+    Storage(rusqlite::Error),
+    Pool(r2d2::Error),
+    Unknown(String),
+}
+
+impl fmt::Display for PauseStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PauseStoreError::Storage(e) => write!(f, "pause store storage error: {e}"),
+            PauseStoreError::Pool(e) => write!(f, "pause store pool error: {e}"),
+            PauseStoreError::Unknown(s) => write!(f, "pause store error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for PauseStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PauseStoreError::Storage(e) => Some(e),
+            PauseStoreError::Pool(e) => Some(e),
+            PauseStoreError::Unknown(_) => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for PauseStoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        PauseStoreError::Storage(e)
+    }
+}
+
+impl From<r2d2::Error> for PauseStoreError {
+    fn from(e: r2d2::Error) -> Self {
+        PauseStoreError::Pool(e)
+    }
+}
 
 /// Persistent absolute-time pause storage. Backed by SQLite (Stream B).
 pub trait PauseStore: Send + Sync {
@@ -18,10 +65,19 @@ pub trait PauseStore: Send + Sync {
     fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>>;
 
     /// Pause for `minutes` from now; returns the resolved resume time.
-    fn pause(&self, target: PauseTarget, id: &str, minutes: u32) -> DateTime<Utc>;
+    /// Errors propagate so the route can surface a 5xx instead of silently
+    /// returning a "successful" resume time on a failed write.
+    fn pause(
+        &self,
+        target: PauseTarget,
+        id: &str,
+        minutes: u32,
+    ) -> Result<DateTime<Utc>, PauseStoreError>;
 
-    /// Clear any pause row for the given target/id.
-    fn resume(&self, target: PauseTarget, id: &str);
+    /// Clear any pause row for the given target/id. Returns `true` iff a
+    /// row was actually deleted, so the route can decide whether to fan
+    /// out a `pauseChanged` notification.
+    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError>;
 }
 
 /// Tracks which `WorkKind` is currently mid-handler. Backed by an

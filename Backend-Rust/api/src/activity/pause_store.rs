@@ -30,7 +30,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
-use super::traits::PauseStore;
+use super::traits::{PauseStore, PauseStoreError};
 use super::types::PauseTarget;
 
 /// Inline migration source. Kept in lockstep with
@@ -143,42 +143,47 @@ impl PauseStore for SqlPauseStore {
         }
     }
 
-    fn pause(&self, target: PauseTarget, id: &str, minutes: u32) -> DateTime<Utc> {
+    fn pause(
+        &self,
+        target: PauseTarget,
+        id: &str,
+        minutes: u32,
+    ) -> Result<DateTime<Utc>, PauseStoreError> {
         let resume_at_secs = now_unix_secs().saturating_add(i64::from(minutes) * 60);
         let resume_at = from_unix_secs(resume_at_secs);
-        let conn = match self.pool.get() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "pause: pool checkout failed; returning resume time without persisting");
-                return resume_at;
-            }
-        };
         let t = target_str(target);
-        if let Err(e) = conn.execute(
+        let conn = self.pool.get().map_err(|e| {
+            tracing::error!(error = %e, "pause: pool checkout failed");
+            PauseStoreError::from(e)
+        })?;
+        conn.execute(
             "INSERT INTO paused_work (target, id, resume_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(target, id) DO UPDATE SET resume_at = excluded.resume_at",
             params![t, id, resume_at_secs],
-        ) {
+        )
+        .map_err(|e| {
             tracing::error!(error = %e, target = t, id = id, "pause upsert failed");
-        }
-        resume_at
+            PauseStoreError::from(e)
+        })?;
+        Ok(resume_at)
     }
 
-    fn resume(&self, target: PauseTarget, id: &str) {
-        let conn = match self.pool.get() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "resume: pool checkout failed");
-                return;
-            }
-        };
+    fn resume(&self, target: PauseTarget, id: &str) -> Result<bool, PauseStoreError> {
         let t = target_str(target);
-        if let Err(e) = conn.execute(
-            "DELETE FROM paused_work WHERE target = ?1 AND id = ?2",
-            params![t, id],
-        ) {
-            tracing::error!(error = %e, target = t, id = id, "resume delete failed");
-        }
+        let conn = self.pool.get().map_err(|e| {
+            tracing::error!(error = %e, "resume: pool checkout failed");
+            PauseStoreError::from(e)
+        })?;
+        let affected = conn
+            .execute(
+                "DELETE FROM paused_work WHERE target = ?1 AND id = ?2",
+                params![t, id],
+            )
+            .map_err(|e| {
+                tracing::error!(error = %e, target = t, id = id, "resume delete failed");
+                PauseStoreError::from(e)
+            })?;
+        Ok(affected > 0)
     }
 }
 
@@ -207,7 +212,7 @@ mod tests {
     #[test]
     fn pause_then_read_back_returns_resume_time() {
         let store = fresh_store();
-        let returned = store.pause(PauseTarget::Kind, "ocr", 15);
+        let returned = store.pause(PauseTarget::Kind, "ocr", 15).expect("pause ok");
         let observed = store
             .paused_until(PauseTarget::Kind, "ocr")
             .expect("paused row should be returned");
@@ -259,12 +264,13 @@ mod tests {
     #[test]
     fn pause_then_resume_clears_row() {
         let store = fresh_store();
-        store.pause(PauseTarget::Kind, "summarize", 30);
+        store.pause(PauseTarget::Kind, "summarize", 30).expect("pause ok");
         assert!(store
             .paused_until(PauseTarget::Kind, "summarize")
             .is_some());
 
-        store.resume(PauseTarget::Kind, "summarize");
+        let was_paused = store.resume(PauseTarget::Kind, "summarize").expect("resume ok");
+        assert!(was_paused, "resume should report row was deleted");
         assert!(store
             .paused_until(PauseTarget::Kind, "summarize")
             .is_none());
@@ -273,8 +279,8 @@ mod tests {
     #[test]
     fn pause_overwrite_extends_resume_time() {
         let store = fresh_store();
-        let short = store.pause(PauseTarget::Capture, "screen", 1);
-        let longer = store.pause(PauseTarget::Capture, "screen", 60);
+        let short = store.pause(PauseTarget::Capture, "screen", 1).expect("pause ok");
+        let longer = store.pause(PauseTarget::Capture, "screen", 60).expect("pause ok");
         assert!(longer.timestamp() > short.timestamp());
 
         let observed = store
@@ -293,8 +299,9 @@ mod tests {
     #[test]
     fn resume_on_unpaused_target_is_noop() {
         let store = fresh_store();
-        // Should not panic or error.
-        store.resume(PauseTarget::Kind, "extract_memory");
+        // Should not panic or error; should report no row was deleted.
+        let was_paused = store.resume(PauseTarget::Kind, "extract_memory").expect("resume ok");
+        assert!(!was_paused, "resume of un-paused target should report false");
         assert!(store
             .paused_until(PauseTarget::Kind, "extract_memory")
             .is_none());
@@ -303,7 +310,7 @@ mod tests {
     #[test]
     fn kind_and_capture_targets_are_independent() {
         let store = fresh_store();
-        store.pause(PauseTarget::Kind, "audio", 10);
+        store.pause(PauseTarget::Kind, "audio", 10).expect("pause ok");
         // Same id, different target — must be a separate row.
         assert!(store
             .paused_until(PauseTarget::Capture, "audio")
@@ -314,7 +321,7 @@ mod tests {
     #[test]
     fn concurrent_reads_are_safe() {
         let store = fresh_store();
-        store.pause(PauseTarget::Kind, "ocr", 5);
+        store.pause(PauseTarget::Kind, "ocr", 5).expect("pause ok");
         let store_arc = Arc::new(store);
 
         let handles: Vec<_> = (0..8)
@@ -341,7 +348,7 @@ mod tests {
                 let s = Arc::clone(&store);
                 thread::spawn(move || {
                     for _ in 0..20 {
-                        s.pause(PauseTarget::Kind, "ocr", i + 1);
+                        s.pause(PauseTarget::Kind, "ocr", i + 1).expect("pause ok");
                     }
                 })
             })
