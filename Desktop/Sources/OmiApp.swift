@@ -392,6 +392,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // per-tab basis from ActivityPage so polling pauses when hidden.
     Task { @MainActor in
       CapturePauseGate.shared.start()
+      InternalPostFailureTracker.shared.attach(ActivityMonitorService.shared)
     }
     // === /activity:C1 ===
 

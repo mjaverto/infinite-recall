@@ -476,9 +476,11 @@ public final class BatteryAwareScheduler: ObservableObject {
             kind: Self.toWireWorkKind(work.kind),
             inFlight: inflightEntry
           )
+          InternalPostFailureTracker.shared.reportSuccess(.inflight)
         } catch {
-          await ActivityReportLogger.shared.log(
+          ActivityReportLogger.shared.log(
             error: error, context: "reportInFlight(start:\(work.kind.rawValue))")
+          InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
         }
       }
       // === /activity:G ===
@@ -497,9 +499,11 @@ public final class BatteryAwareScheduler: ObservableObject {
               kind: Self.toWireWorkKind(work.kind),
               inFlight: nil
             )
+            InternalPostFailureTracker.shared.reportSuccess(.inflight)
           } catch {
-            await ActivityReportLogger.shared.log(
+            ActivityReportLogger.shared.log(
               error: error, context: "reportInFlight(done:\(work.kind.rawValue))")
+            InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
           }
         }
         // === /activity:G ===
@@ -513,9 +517,11 @@ public final class BatteryAwareScheduler: ObservableObject {
               kind: Self.toWireWorkKind(work.kind),
               inFlight: nil
             )
+            InternalPostFailureTracker.shared.reportSuccess(.inflight)
           } catch {
-            await ActivityReportLogger.shared.log(
+            ActivityReportLogger.shared.log(
               error: error, context: "reportInFlight(fail:\(work.kind.rawValue))")
+            InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
           }
         }
         // === /activity:G ===
@@ -726,11 +732,13 @@ public final class BatteryAwareScheduler: ObservableObject {
 
     do {
       try await APIClient.shared.reportQueueDepth(depths)
+      InternalPostFailureTracker.shared.reportSuccess(.queueDepth)
     } catch APIError.daemonNotConfigured {
       log("BatteryAwareScheduler: daemon not configured; queue-depth push skipped")
     } catch {
-      await ActivityReportLogger.shared.log(
+      ActivityReportLogger.shared.log(
         error: error, context: "reportQueueDepth")
+      InternalPostFailureTracker.shared.reportFailure(.queueDepth, error: error)
     }
   }
 }
