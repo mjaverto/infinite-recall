@@ -64,7 +64,7 @@ pub async fn run() -> Result<()> {
     // Issue #32: real `ProcessingGate` implementation. Swift owns the OS
     // signal observation and POSTs `GateState` updates to
     // `/v1/activity/_internal/gate-state`. Until that first POST arrives,
-    // `current()` returns `Blocked { reason: Unwired, ... }` so the UI is
+    // `current()` returns `Blocked { reason: Initializing, ... }` so the UI is
     // honest about the brief startup window.
     //
     // Single backing Arc upcast into both the read-side (`ProcessingGate`)

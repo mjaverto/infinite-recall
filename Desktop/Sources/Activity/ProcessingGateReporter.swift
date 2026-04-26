@@ -171,7 +171,7 @@ public func computeGateState(_ inputs: ProcessingGateInputs, now: Date = Date())
 ///   1. `start()` is called from `OmiApp` after `BatteryAwareScheduler`
 ///      starts.
 ///   2. We POST the initial state immediately (so the Rust gate's
-///      `Blocked(.unwired)` startup window closes within ~1 RTT).
+///      `Blocked(.initializing)` startup window closes within ~1 RTT).
 ///   3. We re-evaluate every `pollIntervalSeconds` (default 3s) and POST
 ///      only when the computed state structurally differs from
 ///      `lastPostedState`.
@@ -227,7 +227,7 @@ public final class ProcessingGateReporter {
 
     pollTask = Task { @MainActor [weak self] in
       // First tick fires immediately so the Rust gate stops reporting
-      // `Unwired` as soon as we have credentials + reachability.
+      // `Initializing` as soon as we have credentials + reachability.
       await self?.tick()
       while !Task.isCancelled {
         try? await Task.sleep(nanoseconds: UInt64((self?.pollIntervalSeconds ?? 3.0) * 1_000_000_000))
@@ -274,10 +274,10 @@ public final class ProcessingGateReporter {
 
       // Daemon-restart heuristic: 401 (token rotated), connection refused,
       // or 5xx gateway-style errors all indicate the daemon may have just
-      // restarted with a fresh `Blocked(.unwired)` initial state. Clear
+      // restarted with a fresh `Blocked(.initializing)` initial state. Clear
       // the local de-dupe cache so the NEXT successful POST re-syncs the
       // daemon to current Swift-side truth — otherwise the daemon could
-      // stay stuck on Unwired while Swift believes it already posted the
+      // stay stuck on Initializing while Swift believes it already posted the
       // current state.
       if Self.isDaemonRestartIndicator(error) {
         lastPostedState = nil

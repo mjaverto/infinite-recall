@@ -233,9 +233,9 @@ struct ActivityPage: View {
                 detail: detail,
                 color: OmiColors.error
             )
-        case .unwired:
+        case .initializing:
             // Issue #32: with the Swift→Rust gate-state bridge live, the
-            // Rust gate only emits `.unwired` during the brief startup
+            // Rust gate only emits `.initializing` during the brief startup
             // window before the first `ProcessingGateReporter` POST
             // arrives (typically <3s). Soften the copy accordingly.
             return BannerInfo(
@@ -638,12 +638,12 @@ struct ActivityPage: View {
             case .allowed:
                 return ("Up to date — 0 queued", "Idle processing standing by.")
             case .blocked(let reason, _, let waitingFor):
-                // Issue #32: with the Swift→Rust bridge live, `.unwired`
+                // Issue #32: with the Swift→Rust bridge live, `.initializing`
                 // is now just the brief boot window before the first
                 // `ProcessingGateReporter` POST. Render as "Initializing…"
                 // instead of the alarming pre-#32 copy.
                 let detail = emptyStateBlockedDetail(reason: reason, waitingFor: waitingFor)
-                let title = (reason == .unwired)
+                let title = (reason == .initializing)
                     ? "Initializing…"
                     : "Up to date — 0 queued"
                 return (title, detail)
@@ -682,7 +682,7 @@ struct ActivityPage: View {
         case .thermal:      return "Waiting for thermal cooldown."
         case .locked:       return "Resumes when you unlock."
         case .manualPause:  return "Manually paused."
-        case .unwired:      return "Reading idle / power / thermal state."
+        case .initializing: return "Reading idle / power / thermal state."
         }
     }
 
