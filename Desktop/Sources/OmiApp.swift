@@ -393,6 +393,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     // === /activity:C1 ===
 
+    // === activity:32 ===
+    // Issue #32: Swift→Rust gate-state bridge. Polls OS signals every ~3s
+    // and POSTs the resulting `GateState` to the Rust daemon when it
+    // changes. Must start AFTER `BatteryAwareScheduler.shared.start()`
+    // (above, via `PowerWorkBridge`) so the scheduler's published
+    // `isScreenLocked` / `source` / `thermalState` are seeded when we
+    // read them on the first tick.
+    Task { @MainActor in
+      ProcessingGateReporter.shared.start()
+    }
+    // === /activity:32 ===
+
     // Recover any pending/failed transcription sessions from previous runs
     Task {
       await TranscriptionRetryService.shared.recoverPendingTranscriptions()

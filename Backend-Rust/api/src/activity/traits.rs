@@ -103,9 +103,20 @@ pub trait ResourceSampler: Send + Sync {
     fn sample(&self) -> ResourceSample;
 }
 
-/// Read-only view of the device-idle / processing gate. Owned by the
-/// separate idle-gate agent; this trait is the contract for consuming
-/// their state from the snapshot route without coupling to internals.
+/// View of the device-idle / processing gate.
+///
+/// `current()` is the read side — every snapshot request calls it.
+/// `set()` is the write side, used by the
+/// `POST /v1/activity/_internal/gate-state` Swift→Rust loopback handler
+/// to push a freshly-computed `GateState` into the gate.
+///
+/// `set()` has a default no-op so test gates (e.g. `FakeGate` returning
+/// a fixed `Allowed` value) don't have to implement it. Production code
+/// uses [`crate::activity::BridgedProcessingGate`], which overrides it.
 pub trait ProcessingGate: Send + Sync {
     fn current(&self) -> GateState;
+
+    /// Replace the stored gate state. Default: no-op (read-only gates,
+    /// e.g. test stubs, can ignore writes safely).
+    fn set(&self, _new_state: GateState) {}
 }
