@@ -320,8 +320,15 @@ struct ConversationDetailView: View {
 
             Spacer()
 
-            // Status badge
-            if displayConversation.status != .completed {
+            // Status badge — hide for completed conversations, and also hide
+            // a stale `.inProgress` status when the session has actually
+            // finished (finishedAt != nil). Finished-but-in-progress is a
+            // legacy DB state we don't want to surface as "In Progress" in
+            // the detail header.
+            if displayConversation.status != .completed
+                && !(displayConversation.status == .inProgress
+                    && displayConversation.finishedAt != nil)
+            {
                 statusBadge
             }
 
@@ -557,10 +564,68 @@ struct ConversationDetailView: View {
         }
     }
 
+    // MARK: - Summary Pending
+
+    /// True when the recording finished but the LLM has not yet produced an
+    /// overview. Pure UI inference from existing fields; mirrors the logic
+    /// in `ConversationRowView.isSummaryPending` so the list and detail
+    /// views agree.
+    private var isSummaryPending: Bool {
+        guard displayConversation.status == .completed else { return false }
+        let overview = displayConversation.overview
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard overview.isEmpty else { return false }
+        if !displayConversation.transcriptSegments.isEmpty {
+            return true
+        }
+        if let start = displayConversation.startedAt,
+           let end = displayConversation.finishedAt {
+            return end.timeIntervalSince(start) > 10
+        }
+        return false
+    }
+
+    /// Banner shown above the (empty) overview section when the recording
+    /// has finished but the autonomous summarizer hasn't run yet.
+    private var summaryPendingPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "hourglass")
+                    .scaledFont(size: 13)
+                    .foregroundColor(OmiColors.purplePrimary)
+
+                Text("Summary pending")
+                    .scaledFont(size: 14, weight: .semibold)
+                    .foregroundColor(OmiColors.textPrimary)
+            }
+
+            Text("Infinite Recall will summarize this transcript when your Mac is plugged in and idle or locked.")
+                .scaledFont(size: 12)
+                .foregroundColor(OmiColors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(OmiColors.purplePrimary.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(OmiColors.purplePrimary.opacity(0.25), lineWidth: 1)
+        )
+    }
+
     // MARK: - Summary Content (always visible, no tabs)
 
     @ViewBuilder
     private var summaryContent: some View {
+        // Pending panel — rendered above the overview section when the
+        // recording is finished but the LLM hasn't summarized yet.
+        if isSummaryPending {
+            summaryPendingPanel
+        }
+
         // Overview section
         if !displayConversation.overview.isEmpty {
             overviewSection
