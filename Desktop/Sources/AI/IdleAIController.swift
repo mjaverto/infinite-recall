@@ -87,7 +87,19 @@ final class IdleAIController: ObservableObject {
   private let restartPollTimeoutSeconds: TimeInterval = 60
   private let restartPollIntervalSeconds: UInt64 = 1
 
-  private init() {}
+  private init() {
+    migrateDefaultToAutonomousWorkMode()
+  }
+
+  private func migrateDefaultToAutonomousWorkMode() {
+    let defaults = UserDefaults.standard
+    let migrationKey = "autonomous_work_mode_default_migrated_v1"
+    guard !defaults.bool(forKey: migrationKey) else { return }
+
+    // Product default is now: keep AI available for idle background work.
+    defaults.set(false, forKey: "idle_ai_enabled")
+    defaults.set(true, forKey: migrationKey)
+  }
 
   // MARK: - Lifecycle
 
