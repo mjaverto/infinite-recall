@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::activity::traits::PauseStoreError;
 use crate::activity::types::{
-    ActivitySnapshot, CaptureKind, CaptureRow, InflightUpdate, KindRow, PauseRequest,
+    ActivitySnapshot, CaptureKind, CaptureRow, GateState, InflightUpdate, KindRow, PauseRequest,
     PauseTargetId, ResumeRequest, WorkKind,
 };
 use crate::state::{AppState, PauseChange};
@@ -188,6 +188,35 @@ pub async fn inflight(
     // the parse layer (returns 400/422), so no manual guard needed.
     state.inflight.update(body.kind, body.in_flight);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/activity/_internal/gate-state` — Swift → Rust loopback.
+///
+/// Issue #32: Swift owns the OS signal observation (CGEvent idle seconds,
+/// screen lock notifications, power source / low-power-mode, thermal
+/// pressure) — `IdleAIController` and `BatteryAwareScheduler` already
+/// subscribe for their own scheduling, so a Rust-native re-implementation
+/// would be redundant FFI. The Swift `ProcessingGateReporter` polls those
+/// signals every ~3s and POSTs the resulting `GateState` here when (and
+/// only when) the value changes.
+///
+/// The handler updates the `BridgedProcessingGate` (or any concrete
+/// `ProcessingGate` impl that overrides the trait's default no-op `set`)
+/// and returns 204. The existing snapshot poller picks the change up on
+/// its next tick — no separate fanout channel is needed.
+///
+/// Body: a fully-formed `GateState` (typed sum, snake_case discriminator).
+/// Bearer-authed via the `authed` middleware. Loopback is enforced by the
+/// listener bind (`127.0.0.1` only — see `lib.rs`).
+pub async fn gate_state(
+    State(state): State<AppState>,
+    Json(body): Json<GateState>,
+) -> StatusCode {
+    // Uses the write-side `WritableProcessingGate` trait — read-only stub
+    // gates (e.g. `#[cfg(test)] AlwaysAllowedGate`) cannot be wired here
+    // by mistake, since they don't implement the writable trait at all.
+    state.processing_gate_writer.set(body);
+    StatusCode::NO_CONTENT
 }
 
 #[cfg(test)]

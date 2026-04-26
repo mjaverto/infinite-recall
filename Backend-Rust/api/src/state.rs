@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::activity::{InflightRegistry, PauseStore, ProcessingGate, ResourceSampler};
+use crate::activity::{InflightRegistry, PauseStore, ProcessingGate, ResourceSampler, WritableProcessingGate};
 use crate::db::SqlitePool;
 
 /// Notification payload broadcast when a pause/resume is applied so other
@@ -40,8 +40,15 @@ pub struct AppState {
     pub inflight: Arc<dyn InflightRegistry>,
     /// Process-tree CPU/RSS + system GPU sampler (Stream C impl).
     pub resource_sampler: Arc<dyn ResourceSampler>,
-    /// Read-only view of the device-idle / processing gate.
+    /// Read-only view of the device-idle / processing gate. Used by the
+    /// snapshot route handler.
     pub processing_gate: Arc<dyn ProcessingGate>,
+    /// Write-side capability for the gate. Used by the
+    /// `POST /v1/activity/_internal/gate-state` route handler. Production
+    /// wires the same `Arc<BridgedProcessingGate>` here as
+    /// `processing_gate` (upcast); the trait split prevents read-only
+    /// stub gates from being silently substituted into the write path.
+    pub processing_gate_writer: Arc<dyn WritableProcessingGate>,
     /// Broadcast channel for pause/resume changes. Receivers are best-effort;
     /// Lagged receivers are simply expected to re-poll on their next tick.
     pub pause_tx: broadcast::Sender<PauseChange>,
