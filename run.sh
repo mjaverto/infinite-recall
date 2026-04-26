@@ -283,6 +283,18 @@ elif [ ! -f "google-credentials.json" ] && [ -f "../Backend/google-credentials.j
     ln -sf "../Backend/google-credentials.json" "google-credentials.json"
 fi
 
+# Guard: reject stale OMI_* keys that would silently miss the IR_ bootstrap.
+# Without this, a leftover OMI_PYTHON_API_URL=http://localhost:8080 silently falls
+# through to the production default https://api.omi.me — wrong behavior, no diagnostic.
+if [ -f "$BACKEND_DIR/.env" ] && grep -qE "^OMI_[A-Z]" "$BACKEND_DIR/.env"; then
+    echo "ERROR: $BACKEND_DIR/.env contains legacy OMI_* keys:" >&2
+    grep -E "^OMI_[A-Z][A-Z0-9_]*=" "$BACKEND_DIR/.env" | sed 's/=.*//; s/^/  /' >&2
+    echo "" >&2
+    echo "  These were renamed to IR_*. Update them and re-run:" >&2
+    echo "    sed -i '' -E 's/^OMI_([A-Z])/IR_\\1/' $BACKEND_DIR/.env" >&2
+    exit 1
+fi
+
 # Read environment from .env (skip if missing — yolo mode doesn't need it)
 if [ -f "$BACKEND_DIR/.env" ]; then
     set -a; source "$BACKEND_DIR/.env"; set +a
