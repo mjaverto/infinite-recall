@@ -108,6 +108,11 @@ pub enum BlockReason {
     Locked,
     /// User manually paused via the Activity tab.
     ManualPause,
+    /// The real `ProcessingGate` (issue #32) hasn't shipped yet —
+    /// `AlwaysAllowedGate` reports this so the UI can be honest about
+    /// the placeholder ("Activity gate not yet wired") instead of
+    /// falsely claiming `Allowed`. Removed when #32 lands.
+    Unwired,
 }
 
 /// What the gate is waiting for before it will let work drain again.
@@ -115,7 +120,7 @@ pub enum BlockReason {
 /// `Option<String>` (`"2 min of idle"`, `"AC power"`, ...) so consumers
 /// can render the right copy / icon without parsing English.
 ///
-/// Wire shape — adjacently-tagged sum, snake_case discriminator:
+/// Wire shape — internally-tagged sum, snake_case discriminator:
 /// ```json
 /// {"type": "idle_for", "duration_secs": 120}
 /// {"type": "ac_power"}
@@ -400,6 +405,7 @@ mod tests {
             (BlockReason::Thermal, "thermal"),
             (BlockReason::Locked, "locked"),
             (BlockReason::ManualPause, "manual_pause"),
+            (BlockReason::Unwired, "unwired"),
         ] {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{wire}\""));
             let back: BlockReason = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
@@ -430,6 +436,12 @@ mod tests {
             let back: WaitCondition = serde_json::from_value(v).unwrap();
             assert_eq!(back, w, "round-trip mismatch for {w:?}");
         }
+    }
+
+    #[test]
+    fn gate_state_rejects_unknown_state_tag() {
+        let json = r#"{"state":"throttled","since":"2026-04-26T00:00:00Z"}"#;
+        assert!(serde_json::from_str::<GateState>(json).is_err());
     }
 
     #[test]

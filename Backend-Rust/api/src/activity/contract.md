@@ -103,7 +103,7 @@ and a stringly-typed `waiting_for`.
 }
 ```
 
-`WaitCondition` is also an adjacently-tagged sum on `type`:
+`WaitCondition` is also an internally-tagged sum on `type`:
 
 | Variant | Wire shape |
 |---|---|
@@ -122,7 +122,7 @@ and a stringly-typed `waiting_for`.
 | `PauseRequest.target` / `ResumeRequest.target` / `PauseTargetId` | `kind`, `capture` (with typed `id` payload — see below) |
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
 | `GateState` (variant tag on `state`) | `allowed`, `blocked` |
-| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause` |
+| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `unwired` |
 
 ### `PauseRequest` / `ResumeRequest`
 

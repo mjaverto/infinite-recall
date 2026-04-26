@@ -1,28 +1,38 @@
 //! `ProcessingGate` placeholder. The real implementation is owned by the
-//! idle-gate agent (separate stream not yet shipped). Until then we ship
-//! an "always-allowed" stub so `ActivityState` can be constructed and the
-//! snapshot endpoint returns a stable shape.
+//! idle-gate agent (issue #32, separate stream not yet shipped).
 //!
-//! Issue #35: with `GateState` collapsed to a sum type, `AlwaysAllowedGate`
-//! returns `GateState::Allowed { since }` per the issue spec. The
-//! pre-#35 `GateReason::Stub` variant (and its "Gate not yet wired (#32)"
-//! UI banner) is gone — the sum doesn't have a "we don't really know"
-//! third state, and the issue acceptance criterion is explicit. The
-//! `tracing::warn!` boot breadcrumb in `lib.rs` still flags the stub for
-//! anyone debugging from the daemon side.
+//! PR #40 review: an earlier revision of this file returned
+//! `GateState::Allowed { since: now }` from the stub, which was bit-for-bit
+//! indistinguishable from a real wired gate that has decided we're clear to
+//! drain. Three reviewers independently flagged that as actively misleading
+//! — the UI would render "Idle processing — running" and "Up to date" while
+//! no real gating existed. The boot-time `tracing::warn!` in `lib.rs` is
+//! invisible to users.
+//!
+//! Fix: ship the stub as `GateState::Blocked` with a dedicated
+//! `BlockReason::Unwired` variant. The Swift side renders an honest
+//! "Activity gate not yet wired" banner pointing at issue #32, instead of
+//! falsely claiming we're processing. When the real gate lands, this whole
+//! file goes away and `BlockReason::Unwired` with it.
 
 use chrono::Utc;
 
 use super::traits::ProcessingGate;
-use super::types::GateState;
+use super::types::{BlockReason, GateState, WaitCondition};
 
-/// Always-allowed gate. No idle/thermal throttling enforced; the snapshot
-/// reports `Allowed` so the rest of the pipeline can run without being
-/// gated. The real `ProcessingGate` lands with issue #32.
+/// Placeholder gate that always reports `Blocked { reason: Unwired }`. The
+/// snapshot still renders, the UI tells the user what's actually happening
+/// (no real gate yet), and we don't pretend to be doing work we aren't.
+/// The real `ProcessingGate` lands with issue #32; this struct deletes
+/// then.
 pub struct AlwaysAllowedGate;
 
 impl ProcessingGate for AlwaysAllowedGate {
     fn current(&self) -> GateState {
-        GateState::Allowed { since: Utc::now() }
+        GateState::Blocked {
+            reason: BlockReason::Unwired,
+            since: Utc::now(),
+            waiting_for: WaitCondition::Manual,
+        }
     }
 }

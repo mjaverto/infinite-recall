@@ -233,6 +233,17 @@ struct ActivityPage: View {
                 detail: detail,
                 color: OmiColors.error
             )
+        case .unwired:
+            // PR #40 review: the Rust `AlwaysAllowedGate` placeholder
+            // reports `.unwired` until the real `ProcessingGate` (#32)
+            // ships. Render an honest, non-alarming banner instead of
+            // pretending we're processing.
+            return BannerInfo(
+                icon: "wrench.and.screwdriver",
+                title: "Activity gate not yet wired",
+                detail: "Processing decisions are placeholder. Tracking issue: #32.",
+                color: OmiColors.warning
+            )
         }
     }
 
@@ -627,8 +638,14 @@ struct ActivityPage: View {
             case .allowed:
                 return ("Up to date — 0 queued", "Idle processing standing by.")
             case .blocked(let reason, _, let waitingFor):
+                // PR #40 review: don't say "Up to date" when the gate is
+                // just unwired — that's misleading. Honest title for the
+                // placeholder; existing semantics for real block reasons.
                 let detail = emptyStateBlockedDetail(reason: reason, waitingFor: waitingFor)
-                return ("Up to date — 0 queued", detail)
+                let title = (reason == .unwired)
+                    ? "Activity gate not yet wired"
+                    : "Up to date — 0 queued"
+                return (title, detail)
             }
         }()
         return VStack(spacing: 6) {
@@ -664,6 +681,7 @@ struct ActivityPage: View {
         case .thermal:      return "Waiting for thermal cooldown."
         case .locked:       return "Resumes when you unlock."
         case .manualPause:  return "Manually paused."
+        case .unwired:      return "Processing decisions are placeholder until issue #32 ships."
         }
     }
 

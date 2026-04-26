@@ -675,6 +675,7 @@ async fn enum_round_trip_via_wire() {
         (t::BlockReason::Thermal, "thermal"),
         (t::BlockReason::Locked, "locked"),
         (t::BlockReason::ManualPause, "manual_pause"),
+        (t::BlockReason::Unwired, "unwired"),
     ] {
         let s = serde_json::to_string(&reason).unwrap();
         assert_eq!(s, format!("\"{wire}\""));

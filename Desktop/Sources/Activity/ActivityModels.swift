@@ -100,6 +100,11 @@ public enum BlockReason: String, Codable, Hashable, CaseIterable {
     case thermal
     case locked
     case manualPause = "manual_pause"
+    /// PR #40 review: the placeholder `AlwaysAllowedGate` (Rust) reports
+    /// this until the real `ProcessingGate` lands (issue #32). The UI
+    /// renders an honest "gate not yet wired" banner instead of falsely
+    /// claiming `.allowed`. Removed when #32 ships.
+    case unwired
 }
 
 /// Issue #35: typed mirror of Rust's `WaitCondition`. Replaces the
@@ -107,7 +112,7 @@ public enum BlockReason: String, Codable, Hashable, CaseIterable {
 /// `"2 min of idle"`) so the UI can render the right copy/icon
 /// without parsing English.
 ///
-/// Wire shape — adjacently-tagged sum on `type`:
+/// Wire shape — internally-tagged sum on `type`:
 /// ```json
 /// {"type": "idle_for", "duration_secs": 120}
 /// {"type": "ac_power"}
@@ -131,8 +136,8 @@ public enum WaitCondition: Codable, Hashable {
         case idleFor = "idle_for"
         case acPower = "ac_power"
         case thermalCooldown = "thermal_cooldown"
-        case unlock
-        case manual
+        case unlock = "unlock"
+        case manual = "manual"
     }
 
     public init(from decoder: Decoder) throws {
