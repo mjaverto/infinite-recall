@@ -157,6 +157,44 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
         // sweeper will eventually GC it. Leaving as-is is harmless for tests.
     }
 
+    // MARK: - Maintenance sweep fires delegate
+
+    /// Locks in #44: the sweeper's lease-reclaim path goes through the storage
+    /// actor, so the delegate fires and the Activity panel sees the
+    /// `claimed → queued` (or `claimed → dead`) transition immediately.
+    func test_runMaintenanceSweep_firesDelegateOnce_afterReclaimingExpiredLease() async throws {
+        try await drainQueue()
+        let storage = PendingWorkStorage.shared
+
+        // Set up a row in `claimed` state with an already-expired lease so the
+        // sweep's UPDATE actually changes something.
+        _ = try await storage.enqueue(
+            workType: workType,
+            payload: Data("delegate-test-sweep".utf8),
+            dedupKey: "delegate-sweep-\(UUID().uuidString)"
+        )
+        guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
+              claimed.storageId != nil else {
+            return XCTFail("expected to claim our just-enqueued row")
+        }
+
+        // Run the sweep with `now` 1 hour in the future so the 10-minute lease
+        // is guaranteed expired. Attach the delegate AFTER the setup mutators
+        // so we count only the sweep's notification.
+        let stub = StubDelegate()
+        await storage.setDelegate(stub)
+
+        let result = try await storage.runMaintenanceSweep(now: Date().addingTimeInterval(3600))
+        XCTAssertGreaterThanOrEqual(result.recovered, 1, "sweep should reclaim the expired-lease row")
+        XCTAssertEqual(stub.count, 1, "runMaintenanceSweep must fire the delegate exactly once")
+
+        // Cleanup: the row is now `queued` (or `dead`); claim+ack to drain.
+        if let again = try await storage.claimNext(claimedBy: "delegate-test-worker"),
+           let aSid = again.storageId {
+            try? await storage.ack(storageId: aSid)
+        }
+    }
+
     // MARK: - Read methods do NOT fire
 
     func test_readMethods_doNotFireDelegate() async throws {

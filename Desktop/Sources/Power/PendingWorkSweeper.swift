@@ -1,5 +1,4 @@
 import Foundation
-import GRDB
 
 /// Periodic background maintenance task for the `pending_work` table.
 ///
@@ -18,6 +17,10 @@ import GRDB
 /// 3. **Dead-row GC** — rows with `status = 'dead'` older than 30 days are
 ///    hard-deleted. The 30-day window is long enough for a developer to inspect
 ///    them via `sqlite3` CLI.
+///
+/// All three SQL operations live inside `PendingWorkStorage.runMaintenanceSweep`
+/// so they go through the actor's mutation delegate — keeps the Activity panel
+/// in sync without polling.
 ///
 /// Lifecycle: started from `PowerWorkBridge.start()` after
 /// `BatteryAwareScheduler.shared.start()`.
@@ -49,54 +52,12 @@ final class PendingWorkSweeper {
 
     @discardableResult
     func sweep() async -> (recovered: Int, doneGC: Int, deadGC: Int) {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            return (0, 0, 0)
-        }
-        let now = Date()
-
         do {
-            return try await dbQueue.write { db -> (Int, Int, Int) in
-                // 1. Reclaim expired leases.
-                let reclaimed = try db.execute(sql: """
-                    UPDATE pending_work
-                    SET status = CASE
-                            WHEN attempts + 1 >= maxAttempts THEN 'dead'
-                            ELSE 'queued'
-                        END,
-                        attempts      = attempts + 1,
-                        lastError     = COALESCE(lastError || ' ', '') || '[lease expired]',
-                        claimedAt     = NULL,
-                        claimedBy     = NULL,
-                        leaseExpiresAt = NULL,
-                        scheduledFor  = datetime(?, '+30 seconds'),
-                        updatedAt     = ?
-                    WHERE status = 'claimed'
-                      AND leaseExpiresAt < ?
-                """, arguments: [now, now, now])
-                let recoveredCount = db.changesCount
-
-                // 2. GC done rows > 24 h old.
-                try db.execute(sql: """
-                    DELETE FROM pending_work
-                    WHERE status = 'done'
-                      AND updatedAt < datetime(?, '-1 day')
-                """, arguments: [now])
-                let doneGCCount = db.changesCount
-
-                // 3. GC dead rows > 30 days old.
-                try db.execute(sql: """
-                    DELETE FROM pending_work
-                    WHERE status = 'dead'
-                      AND updatedAt < datetime(?, '-30 days')
-                """, arguments: [now])
-                let deadGCCount = db.changesCount
-
-                if recoveredCount > 0 || doneGCCount > 0 || deadGCCount > 0 {
-                    log("PendingWorkSweeper: recovered=\(recoveredCount) doneGC=\(doneGCCount) deadGC=\(deadGCCount)")
-                }
-
-                return (recoveredCount, doneGCCount, deadGCCount)
+            let result = try await PendingWorkStorage.shared.runMaintenanceSweep()
+            if result.recovered > 0 || result.doneGC > 0 || result.deadGC > 0 {
+                log("PendingWorkSweeper: recovered=\(result.recovered) doneGC=\(result.doneGC) deadGC=\(result.deadGC)")
             }
+            return result
         } catch {
             logError("PendingWorkSweeper: sweep failed", error: error)
             return (0, 0, 0)
