@@ -11,6 +11,7 @@
 set -euo pipefail
 
 BIN_NAME="infinite-recall-api"
+CLI_BIN_NAME="recall"
 PLIST_NAME="com.infiniterecall.api.plist"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 
@@ -52,14 +53,23 @@ if [[ ! -x "$BUILT" ]]; then
     exit 1
 fi
 
+BUILT_CLI="$CRATE_DIR/target/release/$CLI_BIN_NAME"
+if [[ ! -x "$BUILT_CLI" ]]; then
+    echo "ERROR: build did not produce $BUILT_CLI" >&2
+    exit 1
+fi
+
 progress "STEP=installing_launchd"
 echo "==> Installing $BIN_NAME to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 if [ "${AUTO_CONFIRM}" = "1" ]; then
     install -m 0755 "$BUILT" "$INSTALL_DIR/$BIN_NAME"
+    install -m 0755 "$BUILT_CLI" "$INSTALL_DIR/$CLI_BIN_NAME"
 else
     sudo install -m 0755 "$BUILT" "$INSTALL_DIR/$BIN_NAME"
+    sudo install -m 0755 "$BUILT_CLI" "$INSTALL_DIR/$CLI_BIN_NAME"
 fi
+echo "==> Installed $CLI_BIN_NAME to $INSTALL_DIR/$CLI_BIN_NAME"
 
 echo "==> Installing launchd plist to $TARGET_PLIST"
 mkdir -p "$LAUNCH_DIR"
