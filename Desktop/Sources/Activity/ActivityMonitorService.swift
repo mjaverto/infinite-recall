@@ -126,6 +126,13 @@ public final class ActivityMonitorService: ObservableObject {
         self.lastError = nil
     }
 
+    /// Surface a banner when `_internal/*` POSTs (inflight, queue-depth,
+    /// gate-state) have failed `consecutive` times in a row. Routed through
+    /// `InternalPostFailureTracker` so duplicate counters don't drift.
+    func reportInternalPostFailure(category: String, consecutive: Int) {
+        lastError = "Internal reporting failing: \(category) (\(consecutive) consecutive failures)"
+    }
+
     // MARK: - Private
 
     /// Consensus-fix C3: write to local state ONLY after the round-trip

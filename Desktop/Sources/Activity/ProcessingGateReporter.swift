@@ -263,7 +263,9 @@ public final class ProcessingGateReporter {
     do {
       try await APIClient.shared.reportGateState(newState)
       lastPostedState = newState
+      InternalPostFailureTracker.shared.reportSuccess(.gateState)
     } catch {
+      InternalPostFailureTracker.shared.reportFailure(.gateState, error: error)
       // Surface to console; the next tick will retry. We deliberately do
       // not back off — the daemon is loopback, transient errors are
       // typically "daemon not yet up" or "token file not yet written",
