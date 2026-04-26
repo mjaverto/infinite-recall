@@ -44,6 +44,27 @@ impl Client {
         self.send(req)
     }
 
+    /// POST `path` with a JSON body.
+    pub fn post(&self, path: &str, body: &Value) -> Result<Value, CliError> {
+        let url = format!("{}{}", self.base_url, path);
+        let req = self.http.post(&url).json(body);
+        self.send(req)
+    }
+
+    /// PATCH `path` with a JSON body.
+    pub fn patch(&self, path: &str, body: &Value) -> Result<Value, CliError> {
+        let url = format!("{}{}", self.base_url, path);
+        let req = self.http.patch(&url).json(body);
+        self.send(req)
+    }
+
+    /// DELETE `path`.
+    pub fn delete(&self, path: &str) -> Result<Value, CliError> {
+        let url = format!("{}{}", self.base_url, path);
+        let req = self.http.delete(&url);
+        self.send(req)
+    }
+
     fn send(&self, builder: RequestBuilder) -> Result<Value, CliError> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
