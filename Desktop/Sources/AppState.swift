@@ -3131,6 +3131,9 @@ extension Notification.Name {
   static let rewindPageDidLoad = Notification.Name("rewindPageDidLoad")
   /// Posted when Conversations page finishes loading initial data
   static let conversationsPageDidLoad = Notification.Name("conversationsPageDidLoad")
+  /// Posted when conversation rows are mutated under the UI (e.g. backfill
+  /// service rewrites title/overview). Listeners should refetch.
+  static let conversationsListNeedsRefresh = Notification.Name("conversationsListNeedsRefresh")
   /// Posted when Tasks page finishes loading initial data
   static let tasksPageDidLoad = Notification.Name("tasksPageDidLoad")
   /// Posted when Focus page finishes loading initial data

@@ -106,7 +106,7 @@ actor ConversationSummaryBackfillService {
 
             // Notify the conversations list so the row updates without a manual refresh.
             await MainActor.run {
-                NotificationCenter.default.post(name: .conversationsPageDidLoad, object: nil)
+                NotificationCenter.default.post(name: .conversationsListNeedsRefresh, object: nil)
             }
 
             // Throttle: give the LLM server a brief breather.

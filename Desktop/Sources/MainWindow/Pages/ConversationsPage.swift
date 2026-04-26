@@ -131,6 +131,11 @@ struct ConversationsPage: View {
       notification in
       handleAutomationOpenConversation(notification)
     }
+    .onReceive(NotificationCenter.default.publisher(for: .conversationsListNeedsRefresh)) { _ in
+      // Backfill / extraction / etc. wrote new title/overview rows under us.
+      // Re-fetch so the list shows the latest data.
+      Task { await appState.loadConversations() }
+    }
     .dismissableSheet(isPresented: $showCreateFolderSheet) {
       FolderFormSheet(folder: nil, onDismiss: { showCreateFolderSheet = false })
         .environmentObject(appState)
