@@ -14,6 +14,7 @@
 // as `"<target>/<id>"` so a single dictionary covers both `"capture"` and
 // `"kind"` namespaces.
 
+import AppKit
 import Foundation
 import Combine
 import os
@@ -38,14 +39,33 @@ final class CapturePauseGate: ObservableObject {
 
     @MainActor private var pollTimer: Timer?
     @MainActor private var observer: NSObjectProtocol?
+    @MainActor private var keyObserver: NSObjectProtocol?
+    @MainActor private var resignObserver: NSObjectProtocol?
+    @MainActor private var becameActiveObserver: NSObjectProtocol?
     @MainActor private var isStarted = false
 
+    /// User-facing message describing the most recent backend snapshot
+    /// fetch failure, or `nil` after a successful refresh. Mirrors
+    /// `ActivityMonitorService.lastError` so consumers can surface gate
+    /// staleness in the UI.
+    @Published @MainActor var lastError: String?
+
     private init() {}
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        if let becameActiveObserver { NotificationCenter.default.removeObserver(becameActiveObserver) }
+        pollTimer?.invalidate()
+    }
 
     // MARK: - Lifecycle
 
     /// Begin polling the Rust pause store and observing pause-change
-    /// notifications. Idempotent.
+    /// notifications. Idempotent. The 5s poll is gated on IR window
+    /// visibility (per Phase 0 contract — no daemon polling while the
+    /// window is hidden).
     @MainActor
     func start() {
         guard !isStarted else { return }
@@ -65,25 +85,45 @@ final class CapturePauseGate: ObservableObject {
             }
         }
 
-        // 5s background poll. Use a Timer scheduled on the main runloop so
-        // it interleaves cleanly with UI updates.
-        let timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+        keyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
             Task { @MainActor in
-                await self?.refreshFromBackend()
+                self?.handleBecameKey()
             }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        pollTimer = timer
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleResignedKey()
+            }
+        }
+        // Belt-and-suspenders for cold launch: if the app activates
+        // before any window becomes key (e.g. dock click → app active
+        // but key notification race), bootstrap the timer here too.
+        becameActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleBecameKey()
+            }
+        }
 
-        // Kick off an initial refresh so the gate isn't "open" for 5s on
-        // cold start when a pause is already live in the Rust store.
-        Task { @MainActor in
-            await self.refreshFromBackend()
+        // Only start the 5s poll if a window is already key. Otherwise
+        // wait for `didBecomeKeyNotification`.
+        if NSApp?.keyWindow != nil {
+            startPollTimerIfNeeded(immediateRefresh: true)
         }
     }
 
-    /// Stop polling and detach the notification observer. Safe to call
-    /// from any state.
+    /// Stop polling and detach observers. Safe to call from any state.
     @MainActor
     func stop() {
         pollTimer?.invalidate()
@@ -92,7 +132,56 @@ final class CapturePauseGate: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         observer = nil
+        if let keyObserver {
+            NotificationCenter.default.removeObserver(keyObserver)
+        }
+        keyObserver = nil
+        if let resignObserver {
+            NotificationCenter.default.removeObserver(resignObserver)
+        }
+        resignObserver = nil
+        if let becameActiveObserver {
+            NotificationCenter.default.removeObserver(becameActiveObserver)
+        }
+        becameActiveObserver = nil
         isStarted = false
+    }
+
+    @MainActor
+    private func handleBecameKey() {
+        guard isStarted else { return }
+        startPollTimerIfNeeded(immediateRefresh: true)
+    }
+
+    // While the window is hidden, `mirror` may diverge from the backend's
+    // authoritative pause store; `handleBecameKey` immediately refreshes to close the gap.
+    @MainActor
+    private func handleResignedKey() {
+        guard isStarted else { return }
+        // If another IR window is still key, keep polling.
+        if NSApp?.keyWindow != nil { return }
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    @MainActor
+    private func startPollTimerIfNeeded(immediateRefresh: Bool) {
+        if pollTimer != nil {
+            if immediateRefresh {
+                Task { @MainActor in await self.refreshFromBackend() }
+            }
+            return
+        }
+        let timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshFromBackend()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
+        if immediateRefresh {
+            Task { @MainActor in await self.refreshFromBackend() }
+        }
     }
 
     // MARK: - Reads (MainActor — for SwiftUI)
@@ -213,8 +302,10 @@ final class CapturePauseGate: ObservableObject {
             snapshot = try await Self.fetchSnapshot()
         } catch {
             logError("CapturePauseGate snapshot fetch failed", error: error)
+            self.lastError = "Pause gate refresh failed: \(error.localizedDescription)"
             return
         }
+        self.lastError = nil
         var next: [String: Date] = [:]
         let now = Date()
 
