@@ -102,16 +102,21 @@ struct LocalAIInstallSheet: View {
 
   /// Disk size string sourced from the catalog entry being installed, e.g.
   /// "5.5 GB". Falls back gracefully when no catalog entry is available.
+  /// For user-supplied custom HF ids we don't know the size up-front (no
+  /// network probe), so we return "size unknown" rather than seeding a
+  /// misleading "0 GB" figure — the real progress comes from the installer.
   private var catalogDiskSizeLabel: String {
     let resolvedKind = installAPIInstead ? Kind.api : kind
     switch resolvedKind {
     case .mlx:
-      let entry = modelId.flatMap { LocalModelCatalog.option(forId: $0) }
+      let entry = modelId.map { LocalModelCatalog.entry(forId: $0) }
         ?? LocalModelCatalog.recommended
+      if entry.approxDiskGB == 0 { return "size unknown" }
       return String(format: "%.4g GB", entry.approxDiskGB)
     case .vlm:
-      let entry = modelId.flatMap { VisionModelCatalog.option(forId: $0) }
+      let entry = modelId.map { VisionModelCatalog.entry(forId: $0) }
         ?? VisionModelCatalog.recommended
+      if entry.approxDiskGB == 0 { return "size unknown" }
       return String(format: "%.4g GB", entry.approxDiskGB)
     case .api:
       return ""

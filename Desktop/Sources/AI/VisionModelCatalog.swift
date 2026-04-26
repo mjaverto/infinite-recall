@@ -60,6 +60,21 @@ enum VisionModelCatalog {
     all.first(where: { $0.id == id })
   }
 
+  /// Display-side accessor. Returns the catalog entry for `id`, or a
+  /// synthesized "Custom" placeholder if the id is user-supplied and not in
+  /// the curated list. Use from UI code that needs *something* to render;
+  /// use `option(forId:)` from logic that must distinguish curated vs custom.
+  static func entry(forId id: String) -> VisionModelOption {
+    option(forId: id) ?? .init(
+      id: id,
+      displayName: id,
+      badge: "Custom",
+      approxRamGB: 0,
+      approxDiskGB: 0,
+      license: "Unknown",
+      contextWindow: 0)
+  }
+
   /// The "default" option. Matches `VLMLifecycleManager.defaultModelID`, or
   /// the first entry as a fallback.
   static var recommended: VisionModelOption {

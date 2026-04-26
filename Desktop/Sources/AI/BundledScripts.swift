@@ -228,8 +228,13 @@ else
     # in-flight file's tqdm fraction approximation via os.path.getsize().
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
     uv tool run --from mlx-lm python - <<'PY'
-import os, sys, threading, time
+import os, sys, threading, time, traceback
 from huggingface_hub import snapshot_download, HfApi
+from huggingface_hub.utils import (
+    RepositoryNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+)
 
 MODEL = os.environ.get("INFINITE_RECALL_MODEL") or os.environ.get("INFINITE_RECALL_MLX_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit")
 
@@ -265,7 +270,29 @@ def watcher():
 t = threading.Thread(target=watcher, daemon=True)
 t.start()
 try:
-    snapshot_download(MODEL)
+    try:
+        snapshot_download(MODEL)
+    except RepositoryNotFoundError:
+        reason = f"Repository not found: {MODEL}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
+    except GatedRepoError:
+        reason = f"Repository is gated and requires authentication: {MODEL}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
+    except HfHubHTTPError as e:
+        status = e.response.status_code if hasattr(e, "response") else "?"
+        reason = f"Hugging Face Hub error ({status}) for {MODEL}: {e}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        reason = f"Download failed for {MODEL}: {type(e).__name__}: {e}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
 finally:
     stop.set()
     t.join(timeout=3)
@@ -580,8 +607,13 @@ else
     bold "→ Downloading model (this may take a while)..."
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
     uv tool run --from mlx-vlm python - <<'PY'
-import os, sys, threading, time
+import os, sys, threading, time, traceback
 from huggingface_hub import snapshot_download, HfApi
+from huggingface_hub.utils import (
+    RepositoryNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+)
 
 MODEL = os.environ.get("INFINITE_RECALL_VLM_MODEL", "mlx-community/Qwen3-VL-8B-Instruct-4bit")
 
@@ -616,7 +648,29 @@ def watcher():
 t = threading.Thread(target=watcher, daemon=True)
 t.start()
 try:
-    snapshot_download(MODEL)
+    try:
+        snapshot_download(MODEL)
+    except RepositoryNotFoundError:
+        reason = f"Repository not found: {MODEL}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
+    except GatedRepoError:
+        reason = f"Repository is gated and requires authentication: {MODEL}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
+    except HfHubHTTPError as e:
+        status = e.response.status_code if hasattr(e, "response") else "?"
+        reason = f"Hugging Face Hub error ({status}) for {MODEL}: {e}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        reason = f"Download failed for {MODEL}: {type(e).__name__}: {e}"
+        emit(f"DOWNLOAD_FAIL={reason}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(2)
 finally:
     stop.set()
     t.join(timeout=3)
