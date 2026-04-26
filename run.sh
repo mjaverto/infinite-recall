@@ -17,7 +17,7 @@ Options (via environment variables):
   IR_SKIP_AUTH=1          Skip starting Python auth service (use remote auth via IR_AUTH_URL)
   IR_SKIP_TUNNEL=1        Skip Cloudflare tunnel (use IR_API_URL from .env directly)
   AUTH_PORT=10200           Auth service port (default: 10200)
-  PORT=10201                Rust backend port (default: 10201, never use 8080)
+  PORT=7331                 Rust backend port (default: 7331, never use 8080)
   IR_APP_NAME="Infinite Recall Dev"   Optional app name override (default: "Infinite Recall")
   IR_PYTHON_API_URL="..."  Python backend URL (subscriptions, payments, etc; default: https://api.omi.me)
   IR_SIGN_IDENTITY="..."  Code signing identity (auto-detected if not set)
@@ -34,7 +34,7 @@ Required tools:
   cargo, xcrun/swift, python3, npm, node, codesign, cloudflared (unless skipped)
 
 Port allocation (avoid 8080 to prevent port conflicts):
-  Auth default: 10200    Backend default: 10201
+  Auth default: 10200    Backend default: 7331
 
 Examples:
   ./run.sh                                  # Full local dev (backend + auth + tunnel + app)
@@ -627,7 +627,7 @@ if [ ! -f ".env" ] && [ "$1" != "--yolo" ]; then
     echo "     (GCP service account key with Firestore + Firebase Auth access)"
     echo ""
     echo "Minimal .env for local dev:"
-    echo "  PORT=10201"
+    echo "  PORT=7331"
     echo "  FIREBASE_PROJECT_ID=based-hardware-dev"
     echo "  FIREBASE_API_KEY=<from GCP console>"
     echo "  GOOGLE_APPLICATION_CREDENTIALS=./google-credentials.json"
@@ -666,8 +666,8 @@ if [ -f "$BACKEND_DIR/.env" ]; then
     set -a; source "$BACKEND_DIR/.env"; set +a
 fi
 
-# Read backend PORT from env (default: 10201, never use 8080)
-BACKEND_PORT="${PORT:-10201}"
+# Read backend PORT from env (default: 7331, never use 8080)
+BACKEND_PORT="${PORT:-7331}"
 export PORT="$BACKEND_PORT"
 
 # Validate credentials (needed for both backend and auth)
