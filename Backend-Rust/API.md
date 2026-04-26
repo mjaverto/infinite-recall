@@ -6,10 +6,18 @@ Version: `infinite-recall-api 0.1.0` | Base URL: `http://127.0.0.1:7331` | Shape
 
 ## Overview
 
-The Backend-Rust daemon is a thin **read-only** axum HTTP server that exposes the
-Swift app's GRDB SQLite database over a local REST API. It does not own any data;
-the Swift app is the sole writer. The Rust process opens the SQLite file in
-read-only mode and serves JSON on `127.0.0.1:7331`.
+The Backend-Rust daemon is a thin axum HTTP server that exposes the Swift app's
+GRDB SQLite database over a local REST API. The vast majority of the surface is
+read-only — the only mutation endpoints are the action-item CRUD set
+(`POST /v1/action-items`, `PATCH /v1/action-items/:id`,
+`POST /v1/action-items/:id/complete`, `DELETE /v1/action-items/:id`). The Swift
+app remains the primary writer for every other table; cross-process safety
+relies on SQLite's WAL journaling, which Swift configures at database open
+(`PRAGMA journal_mode = WAL`).
+
+Internally the daemon opens two pools against the same SQLite file: a large
+read-only pool that backs every GET handler, and a small (size 2) read-write
+pool used exclusively by the action-item mutation routes.
 
 The database lives at:
 
@@ -153,10 +161,12 @@ Example 400 (bad date on `/v1/scores`):
 
 ## Rate Limits and Concurrency
 
-None enforced. The server is local-only and single-user. The SQLite connection
-pool is managed internally; requests that hit the database run on a blocking
+None enforced. The server is local-only and single-user. SQLite connection
+pools are managed internally; requests that hit the database run on a blocking
 thread pool to avoid stalling the async executor. Concurrent reads are safe
-because the database is opened read-only.
+because they use a strictly read-only handle. Writes go through a separate,
+read-write pool with `busy_timeout = 5s` so a transient lock from the Swift
+writer becomes a wait rather than an error.
 
 ---
 
@@ -515,6 +525,171 @@ curl -H "Authorization: Bearer $(cat ~/Library/Application\ Support/InfiniteReca
 
 ---
 
+## POST /v1/action-items
+
+Create a new action item. Inserts a row into `action_items` with
+`completed=0`, `deleted=0`, `backendSynced=0`, and `source="cli"`. Returns
+HTTP 201 with the freshly inserted row.
+
+### Request body
+
+```json
+{
+  "description": "Review the Q2 budget proposal",
+  "due_at": "2025-04-30T17:00:00Z",
+  "priority": "high",
+  "conversation_id": "42",
+  "source_app": null
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `description` | string | yes | Action item text. Whitespace-only descriptions return 400. |
+| `due_at` | string | no | ISO 8601 due timestamp |
+| `priority` | string | no | Priority label (`"high"`, `"medium"`, `"low"`, or any project-defined value) |
+| `conversation_id` | string | no | Linked `transcription_sessions.id` as a string |
+| `source_app` | string | no | App name for screen-derived items |
+
+### Response
+
+```json
+{
+  "action_item": {
+    "id": 128,
+    "backend_id": null,
+    "description": "Review the Q2 budget proposal",
+    "completed": false,
+    "source": "cli",
+    "conversation_id": "42",
+    "priority": "high",
+    "category": null,
+    "due_at": "2025-04-30T17:00:00Z",
+    "source_app": null,
+    "created_at": "2025-04-26T14:22:51.123456+00:00",
+    "updated_at": "2025-04-26T14:22:51.123456+00:00"
+  }
+}
+```
+
+### Curl example
+
+```bash
+TOKEN=$(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"description":"Review Q2 budget","priority":"high"}' \
+     http://127.0.0.1:7331/v1/action-items
+```
+
+---
+
+## PATCH /v1/action-items/:id
+
+Partial update. Only fields present in the request body are written; `updatedAt`
+is always bumped. Returns the updated row. 404 if the row is missing or
+soft-deleted (a soft-deleted row cannot be edited; create a new one instead).
+
+### Path parameter
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | integer | `action_items.id` |
+
+### Request body
+
+Any subset of:
+
+| Field | Type | Description |
+|---|---|---|
+| `description` | string | Non-empty if provided |
+| `due_at` | string | ISO 8601, or empty string to clear is **not** supported here |
+| `priority` | string | Priority label |
+| `conversation_id` | string | Linked conversation ID |
+| `source_app` | string | App name |
+| `category` | string | Category label |
+
+### Response
+
+```json
+{ "action_item": { "id": 128, "description": "Review Q2 budget v2", "..." : "..." } }
+```
+
+### Curl example
+
+```bash
+TOKEN=$(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"priority":"medium"}' \
+     http://127.0.0.1:7331/v1/action-items/128
+```
+
+---
+
+## POST /v1/action-items/:id/complete
+
+Toggle the `completed` flag. The body specifies the desired value explicitly so
+callers can't accidentally leave the bit ambiguous. Returns the updated row.
+404 if the row is missing or soft-deleted.
+
+### Path parameter
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | integer | `action_items.id` |
+
+### Request body
+
+```json
+{ "completed": true }
+```
+
+### Response
+
+```json
+{ "action_item": { "id": 128, "completed": true, "..." : "..." } }
+```
+
+### Curl example
+
+```bash
+TOKEN=$(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"completed":true}' \
+     http://127.0.0.1:7331/v1/action-items/128/complete
+```
+
+---
+
+## DELETE /v1/action-items/:id
+
+Soft delete: sets `deleted=1` and bumps `updatedAt`. The row stays in the
+database (the Swift app expects soft semantics) but is filtered out of every
+list / show / lookup. Returns the row as it looked **before** the deletion so
+clients have something to undo with. 404 if the row is missing or already
+soft-deleted.
+
+### Path parameter
+
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | integer | `action_items.id` |
+
+### Response
+
+```json
+{ "action_item": { "id": 128, "completed": true, "..." : "..." } }
+```
+
+### Curl example
+
+```bash
+TOKEN=$(cat ~/Library/Application\ Support/InfiniteRecall/api-token.txt)
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:7331/v1/action-items/128
+```
+
+---
+
 ## GET /v1/people
 
 List all known people, sorted alphabetically by display name.
@@ -777,12 +952,17 @@ curl -H "Authorization: Bearer $TOKEN" \
 | GET | `/v3/memories` | Bearer | List memories; `limit`, `offset`, `category` |
 | GET | `/v3/memories/:id` | Bearer | Single memory |
 | GET | `/v1/action-items` | Bearer | List action items; `limit`, `offset`, `completed` |
+| POST | `/v1/action-items` | Bearer | Create an action item; body `{description, due_at?, priority?, conversation_id?, source_app?}` |
+| PATCH | `/v1/action-items/:id` | Bearer | Partial update; any subset of `{description, due_at, priority, conversation_id, source_app, category}` |
+| POST | `/v1/action-items/:id/complete` | Bearer | Set completed flag; body `{completed: bool}` |
+| DELETE | `/v1/action-items/:id` | Bearer | Soft delete (sets `deleted=1`) |
 | GET | `/v1/people` | Bearer | All people, alphabetical |
 | GET | `/v1/people/:id` | Bearer | Single person |
 | GET | `/v1/search` | Bearer | Unified search; `q`, `content_type`, `app`, `start`, `end`, `limit` |
 | GET | `/v1/scores` | Bearer | Daily activity rollup; `date` |
 
-There are no POST, PUT, PATCH, or DELETE endpoints. The API is strictly read-only.
+The action-item endpoints above are the only mutation surface. Memories,
+conversations, people, scores, search, and health remain strictly read-only.
 
 Routes mentioned in the plan but **not yet registered** in `routes/mod.rs`:
 

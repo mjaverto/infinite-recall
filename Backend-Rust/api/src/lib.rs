@@ -30,10 +30,12 @@ pub async fn run() -> Result<()> {
         .ok();
 
     let db_path = resolve_db_path();
-    tracing::info!(db = %db_path.display(), "opening sqlite read-only");
+    tracing::info!(db = %db_path.display(), "opening sqlite (read pool + write pool)");
 
     let pool = db::open_read_only_pool(&db_path)
-        .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
+        .with_context(|| format!("opening sqlite read pool at {}", db_path.display()))?;
+    let write_pool = db::open_read_write_pool(&db_path)
+        .with_context(|| format!("opening sqlite write pool at {}", db_path.display()))?;
 
     let token = token::ensure_token().context("ensuring api token file")?;
     tracing::info!(
@@ -41,7 +43,7 @@ pub async fn run() -> Result<()> {
         "bearer token ready (read it from the token file; not logged)"
     );
 
-    let state = AppState { pool, token };
+    let state = AppState { pool, write_pool, token };
     let app = routes::router(state);
 
     let bind: SocketAddr = std::env::var("INFINITE_RECALL_BIND")

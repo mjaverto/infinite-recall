@@ -1,8 +1,10 @@
-//! HTTP route surface — Omi-shaped, read-only.
+//! HTTP route surface — Omi-shaped. Read-only by default; the
+//! `/v1/action-items` family is the only mutation surface (see
+//! `action_items.rs`).
 
 use axum::{
     middleware,
-    routing::get,
+    routing::{get, patch, post},
     Router,
 };
 use tower_http::trace::TraceLayer;
@@ -25,7 +27,20 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/conversations/:id", get(conversations::get_one))
         .route("/v3/memories", get(memories::list))
         .route("/v3/memories/:id", get(memories::get_one))
-        .route("/v1/action-items", get(action_items::list))
+        // Action items: list (GET) and create (POST) share the collection URL;
+        // PATCH / soft-delete share the item URL; complete is its own POST.
+        .route(
+            "/v1/action-items",
+            get(action_items::list).post(action_items::create),
+        )
+        .route(
+            "/v1/action-items/:id",
+            patch(action_items::update).delete(action_items::delete),
+        )
+        .route(
+            "/v1/action-items/:id/complete",
+            post(action_items::complete),
+        )
         .route("/v1/people", get(people::list))
         .route("/v1/people/:id", get(people::get_one))
         .route("/v1/search", get(search::search))
