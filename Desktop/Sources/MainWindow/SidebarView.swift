@@ -15,6 +15,9 @@ enum SidebarNavItem: Int, CaseIterable {
   case permissions = 10
   case device = 11
   case help = 12
+  // === activity:E ===
+  case activity = 13
+  // === /activity:E ===
 
   var title: String {
     switch self {
@@ -31,6 +34,9 @@ enum SidebarNavItem: Int, CaseIterable {
     case .permissions: return "Permissions"
     case .device: return "Device"
     case .help: return "Help from Founder"
+    // === activity:E ===
+    case .activity: return "Activity"
+    // === /activity:E ===
     }
   }
 
@@ -49,6 +55,9 @@ enum SidebarNavItem: Int, CaseIterable {
     case .permissions: return "exclamationmark.triangle.fill"
     case .device: return "wave.3.right.circle.fill"
     case .help: return "bubble.left.fill"
+    // === activity:E ===
+    case .activity: return "gauge.with.dots.needle.50percent"
+    // === /activity:E ===
     }
   }
 
@@ -67,7 +76,9 @@ enum SidebarNavItem: Int, CaseIterable {
 
   /// Items shown in the main navigation (top section)
   static var mainItems: [SidebarNavItem] {
-    [.dashboard, .conversations, .memories, .tasks, .rewind, .apps]
+    // === activity:E ===
+    [.dashboard, .conversations, .memories, .tasks, .rewind, .apps, .activity]
+    // === /activity:E ===
   }
 }
 

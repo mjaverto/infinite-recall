@@ -841,6 +841,10 @@ private struct PageContentView: View {
         DeviceSettingsPage()
       case 12:
         HelpPage()
+      // === activity:E ===
+      case 13:
+        ActivityPage()
+      // === /activity:E ===
       default:
         DashboardPage(
           viewModel: viewModelContainer.dashboardViewModel,
