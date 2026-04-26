@@ -130,7 +130,8 @@ is_truthy() {
 
 warn_if_daemon_stale() {
     local installed="$HOME/Library/Application Support/InfiniteRecall/bin/infinite-recall-api"
-    local src_dir="$(dirname "$0")/Backend-Rust"
+    local src_dir
+    src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/Backend-Rust" 2>/dev/null && pwd)"
     [ -x "$installed" ] || return 0
     [ -d "$src_dir" ] || return 0
     local newer
