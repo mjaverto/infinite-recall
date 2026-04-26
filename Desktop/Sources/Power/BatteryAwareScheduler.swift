@@ -191,7 +191,43 @@ public final class BatteryAwareScheduler: ObservableObject {
   /// Worker tag embedded in `claimedBy` column so sweeper can identify orphans.
   private var workerTag: String { "PowerWorkBridge#\(ProcessInfo.processInfo.processIdentifier)" }
 
-  private init() {}
+  // MARK: - Queue-depth debouncer (Lane 4)
+
+  /// Coalesces a burst of `pendingWorkStorageDidMutate` callbacks into a
+  /// single Rust push. We pick 250 ms so a typical drain (ack → enqueue →
+  /// ack within tens of ms) emits exactly one POST while still feeling
+  /// instant in the Activity panel.
+  nonisolated fileprivate static let queueDepthDebounceMs: Int = 250
+
+  /// Nonisolated so the storage actor's executor (which calls
+  /// `pendingWorkStorageDidMutate`) can call `schedule()` without hopping
+  /// to the main actor first. Fire block is installed in `init()` so unit
+  /// tests that exercise the delegate without `start()` still get the
+  /// debounce path.
+  nonisolated private let queueDepthDebouncer = QueueDepthDebouncer(
+    debounceMs: BatteryAwareScheduler.queueDepthDebounceMs
+  )
+
+  private var didWireQueueDepthDelegate = false
+
+  #if DEBUG
+  /// Test hook: when set, `pushQueueDepthNow()` invokes this and returns
+  /// before touching `PendingWorkStorage` or `APIClient`. The debounce-test
+  /// uses it to count fires under rapid mutation without a live daemon.
+  internal var _testQueueDepthHook: (@Sendable () -> Void)?
+  #endif
+
+  private init() {
+    // Install the queue-depth debouncer's fire block now so a unit-test
+    // harness that exercises `pendingWorkStorageDidMutate` directly (without
+    // calling `start()`) still gets the debounce path. Production calls
+    // `start()`, which additionally registers us as the storage delegate.
+    queueDepthDebouncer.install { [weak self] in
+      Task { @MainActor in
+        await self?.pushQueueDepthNow()
+      }
+    }
+  }
 
   /// Wire up to the shared `PowerStateMonitor` and start watching for
   /// transitions. Idempotent.
@@ -277,6 +313,19 @@ public final class BatteryAwareScheduler: ObservableObject {
     // Seed lastAutonomousAllow from current state so the first tick doesn't
     // mistake "still false" for "just transitioned to false".
     self.lastAutonomousAllow = self.allowAutonomousAIWork
+
+    // Register with the storage actor so mutations push depth to the Rust
+    // daemon (debounced). Idempotent across repeated start() calls. Also
+    // emit one immediate hydration push so the Activity panel doesn't sit
+    // at "—" until the first mutation arrives.
+    if !didWireQueueDepthDelegate {
+      didWireQueueDepthDelegate = true
+      Task { [weak self] in
+        guard let self else { return }
+        await PendingWorkStorage.shared.setDelegate(self)
+        await self.pushQueueDepthNow()
+      }
+    }
   }
 
   /// Stop watching for transitions. Mainly for tests.
@@ -643,4 +692,101 @@ public final class BatteryAwareScheduler: ObservableObject {
     self.reevaluateAutonomousReadiness()
   }
   #endif
+
+  // MARK: - Queue-depth push (Lane 4)
+
+  /// Pull the latest depth summary from `PendingWorkStorage` and POST it to
+  /// the Rust daemon. Called from the debouncer's fire block and once at
+  /// `start()` for hydration. Errors are caught — `daemonNotConfigured`
+  /// (interface I2 from Lane 1) is logged at one line; everything else
+  /// flows through `ActivityReportLogger` like the inflight reporter.
+  fileprivate func pushQueueDepthNow() async {
+    #if DEBUG
+    if let hook = _testQueueDepthHook {
+      hook()
+      return
+    }
+    #endif
+
+    let summary: PendingWorkDepth
+    do {
+      summary = try await PendingWorkStorage.shared.depthSummary()
+    } catch {
+      log("BatteryAwareScheduler: depthSummary failed: \(error.localizedDescription)")
+      return
+    }
+
+    var depths: [PendingWork.Kind: (queued: Int, failed: Int)] = [:]
+    for kind in PendingWork.Kind.allCases {
+      depths[kind] = (
+        queued: summary.queued[kind.rawValue] ?? 0,
+        failed: summary.failed[kind.rawValue] ?? 0
+      )
+    }
+
+    do {
+      try await APIClient.shared.reportQueueDepth(depths)
+    } catch APIError.daemonNotConfigured {
+      log("BatteryAwareScheduler: daemon not configured; queue-depth push skipped")
+    } catch {
+      await ActivityReportLogger.shared.log(
+        error: error, context: "reportQueueDepth")
+    }
+  }
+}
+
+// MARK: - PendingWorkStorageDelegate (Lane 4)
+
+extension BatteryAwareScheduler: PendingWorkStorageDelegate {
+  /// Called from the `PendingWorkStorage` actor's executor after each
+  /// committed mutation. We bounce off the actor immediately and let the
+  /// debouncer coalesce bursts into one Rust push.
+  nonisolated func pendingWorkStorageDidMutate(_ storage: PendingWorkStorage) {
+    queueDepthDebouncer.schedule()
+  }
+}
+
+// MARK: - Queue-depth debouncer
+
+/// Cancel-and-reschedule debouncer dedicated to the queue-depth push. Owns
+/// a private serial `DispatchQueue` so mutator callbacks (which arrive on
+/// the storage actor's executor) don't contend with the main actor.
+///
+/// `@unchecked Sendable` is sound here because every read/write of `item`
+/// and `fireBlock` happens on `queue` (the same serial executor).
+fileprivate final class QueueDepthDebouncer: @unchecked Sendable {
+  private let queue = DispatchQueue(label: "BatteryAwareScheduler.queueDepth")
+  private var item: DispatchWorkItem?
+  private var fireBlock: (@Sendable () -> Void)?
+  private let debounceMs: Int
+
+  init(debounceMs: Int) {
+    self.debounceMs = debounceMs
+  }
+
+  /// Install (or replace) the closure invoked when the debounce window
+  /// closes. Must be called before `schedule()` produces an effect.
+  func install(fireBlock: @escaping @Sendable () -> Void) {
+    queue.async { [self] in
+      self.fireBlock = fireBlock
+    }
+  }
+
+  /// Cancel any pending work item and schedule a fresh one `debounceMs`
+  /// from now. Safe to call from any thread/actor.
+  func schedule() {
+    queue.async { [self] in
+      item?.cancel()
+      guard let fireBlock = fireBlock else {
+        // No fire block installed yet (scheduler hasn't called start()).
+        // Drop silently — the next mutation after start() will schedule.
+        return
+      }
+      let work = DispatchWorkItem {
+        fireBlock()
+      }
+      item = work
+      queue.asyncAfter(deadline: .now() + .milliseconds(debounceMs), execute: work)
+    }
+  }
 }

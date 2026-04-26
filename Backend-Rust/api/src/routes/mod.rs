@@ -51,6 +51,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/activity/pause", post(activity::pause))
         .route("/v1/activity/resume", post(activity::resume))
         .route("/v1/activity/_internal/inflight", post(activity::inflight))
+        .route(
+            "/v1/activity/_internal/queue-depth",
+            post(activity::internal_queue_depth),
+        )
         // === /activity:A ===
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

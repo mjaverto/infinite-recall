@@ -612,6 +612,80 @@ async fn inflight_loopback_round_trip() {
     assert!(inflight.snapshot().get(&WorkKind::Transcribe).is_none());
 }
 
+/// Issue #41 — `_internal/queue-depth` updates the per-kind queue / failure
+/// counters; the next snapshot reflects them on the matching `KindRow`.
+///
+/// Validates the frozen interface I1 wire shape (camelCase keys mapped to
+/// `PendingWork.Kind.rawValue` on the Swift side) and confirms the
+/// snapshot route degrades to 0/0 for any kind Swift hasn't reported yet
+/// (here: `summarize`, which is omitted from the payload).
+#[tokio::test]
+async fn queue_depth_loopback_round_trip() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+
+    // Push the frozen-interface payload — note `summarize` is intentionally
+    // omitted so we can also assert the missing-key default.
+    let body = json!({
+        "depths": {
+            "transcribe":         { "queued": 47, "failed": 0 },
+            "ocr":                { "queued": 2,  "failed": 1 },
+            "extractMemory":      { "queued": 5,  "failed": 0 },
+            "extractActionItems": { "queued": 0,  "failed": 3 },
+        }
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/activity/_internal/queue-depth")
+        .header(&k, v.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Snapshot must surface the depths on each KindRow.
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.oneshot(snap_req).await.unwrap()).await;
+    let kinds = snap["kinds"].as_array().expect("kinds is an array");
+
+    let row_for = |wire: &str| -> &Value {
+        kinds
+            .iter()
+            .find(|r| r["kind"] == wire)
+            .unwrap_or_else(|| panic!("snapshot missing row for `{wire}`"))
+    };
+
+    let transcribe = row_for("transcribe");
+    assert_eq!(transcribe["queued"], json!(47));
+    assert_eq!(transcribe["failed"], json!(0));
+
+    let ocr = row_for("ocr");
+    assert_eq!(ocr["queued"], json!(2));
+    assert_eq!(ocr["failed"], json!(1));
+
+    // `extract_memory` is the snake_case wire form for the WorkKind whose
+    // Swift rawValue is `extractMemory`.
+    let extract_memory = row_for("extract_memory");
+    assert_eq!(extract_memory["queued"], json!(5));
+    assert_eq!(extract_memory["failed"], json!(0));
+
+    let extract_action_items = row_for("extract_action_items");
+    assert_eq!(extract_action_items["queued"], json!(0));
+    assert_eq!(extract_action_items["failed"], json!(3));
+
+    // `summarize` was omitted from the payload — must default to 0/0
+    // rather than disappearing or crashing the snapshot.
+    let summarize = row_for("summarize");
+    assert_eq!(summarize["queued"], json!(0));
+    assert_eq!(summarize["failed"], json!(0));
+}
+
 /// Auth: missing bearer → 401.
 #[tokio::test]
 async fn missing_bearer_returns_401() {

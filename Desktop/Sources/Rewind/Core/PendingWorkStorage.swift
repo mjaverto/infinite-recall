@@ -17,6 +17,22 @@ enum PendingWorkStorageError: LocalizedError {
     }
 }
 
+// MARK: - Mutation delegate (frozen interface I3)
+
+/// Observes mutations to the `pending_work` table so listeners (e.g.
+/// `BatteryAwareScheduler`) can push fresh depth snapshots to the Rust
+/// daemon without polling.
+///
+/// Frozen contract:
+/// - Single method, no payload — listener calls `storage.depthSummary()` itself.
+/// - Fired AFTER each mutator's transaction commits, on the storage actor's
+///   own serial executor (no thread-hop).
+/// - NOT fired from read-only methods (`depthSummary`, `pendingCount`,
+///   `healthCounts`).
+protocol PendingWorkStorageDelegate: AnyObject {
+    func pendingWorkStorageDidMutate(_ storage: PendingWorkStorage)
+}
+
 // MARK: - Depth summary
 
 struct PendingWorkDepth {
@@ -58,7 +74,23 @@ actor PendingWorkStorage {
     // In-memory drop counter exposed via depthSummary (last-hour precision not required).
     private(set) var recentDrops: Int = 0
 
+    // Mutation observer (interface I3). Weak so listeners don't extend storage's lifetime.
+    weak var delegate: PendingWorkStorageDelegate?
+
     private init() {}
+
+    // MARK: - Delegate wiring
+
+    /// Set or clear the mutation delegate. Async because the actor owns the slot.
+    func setDelegate(_ delegate: PendingWorkStorageDelegate?) {
+        self.delegate = delegate
+    }
+
+    /// Fire the post-commit notification. Called from every mutator AFTER
+    /// `db.write { … }` returns, while still on the actor's serial executor.
+    private func notifyDidMutate() {
+        delegate?.pendingWorkStorageDidMutate(self)
+    }
 
     // MARK: - Cache management
 
@@ -142,6 +174,7 @@ actor PendingWorkStorage {
 
         // Update drop counter on actor-isolated side (after write closure returns).
         if wasCapped { recentDrops += 1 }
+        notifyDidMutate()
         return rowId
     }
 
@@ -158,7 +191,7 @@ actor PendingWorkStorage {
         let db = try await ensureInitialized()
         let now = Date()
 
-        return try await db.write { database -> PendingWork? in
+        let result: PendingWork? = try await db.write { database -> PendingWork? in
             let rows = try Row.fetchAll(database, sql: """
                 UPDATE pending_work
                 SET status = 'claimed',
@@ -195,6 +228,8 @@ actor PendingWorkStorage {
                 storageId: rowId
             )
         }
+        notifyDidMutate()
+        return result
     }
 
     // MARK: - Ack
@@ -210,6 +245,7 @@ actor PendingWorkStorage {
             """, arguments: [Date(), storageId])
         }
         log("PendingWorkStorage: ack id=\(storageId)")
+        notifyDidMutate()
     }
 
     // MARK: - Release claim (readiness loss)
@@ -239,6 +275,7 @@ actor PendingWorkStorage {
             """, arguments: [later, now, storageId])
         }
         log("PendingWorkStorage: released claim id=\(storageId) (no attempt counted)")
+        notifyDidMutate()
     }
 
     // MARK: - Dead-letter callback
@@ -315,6 +352,10 @@ actor PendingWorkStorage {
                 WHERE id = ?
             """, arguments: [newStatus, newAttempts, errorMsg, scheduledFor, now, storageId])
         }
+
+        // Fire delegate exactly once per fail() call, regardless of whether
+        // this transition lands in `failed` or `dead`.
+        notifyDidMutate()
 
         if newStatus == PendingWorkStatus.dead.rawValue {
             log("PendingWorkStorage: dead-lettered id=\(storageId) after \(newAttempts) attempts")
