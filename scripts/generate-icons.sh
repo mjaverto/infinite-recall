@@ -26,7 +26,7 @@ ICON_SVG="dmg-assets/logo/icon.svg"
 MENU_SVG="dmg-assets/logo/menubar-template.svg"
 ICONSET_DIR="Desktop/AppIcon.iconset"
 ICNS_OUT="Desktop/omi_icon.icns"
-MENU_DIR="Desktop/Sources/Resources/MenuBarIcon.imageset"
+MENU_DIR="dmg-assets/logo/MenuBarIcon.imageset"
 
 [ -f "${ICON_SVG}" ] || { echo "error: missing ${ICON_SVG}" >&2; exit 1; }
 [ -f "${MENU_SVG}" ] || { echo "error: missing ${MENU_SVG}" >&2; exit 1; }
