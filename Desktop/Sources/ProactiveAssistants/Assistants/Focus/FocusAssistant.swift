@@ -694,6 +694,34 @@ actor FocusAssistant: ProactiveAssistant {
             return nil
         }
 
+        // Per-user app classification short-circuit (evaluated before LLM call)
+        let classification = await MainActor.run {
+            FocusAssistantSettings.shared.classification(for: effectiveApp)
+        }
+        switch classification {
+        case .excluded:
+            log("Focus: Skipping excluded app '\(effectiveApp)'")
+            return nil
+        case .alwaysFocused:
+            log("Focus: Short-circuit focused for '\(effectiveApp)' (user override)")
+            return ScreenAnalysis(
+                status: .focused,
+                appOrSite: effectiveApp,
+                description: "User-classified as focus app.",
+                message: "On task."
+            )
+        case .alwaysDistracted:
+            log("Focus: Short-circuit distracted for '\(effectiveApp)' (user override)")
+            return ScreenAnalysis(
+                status: .distracted,
+                appOrSite: effectiveApp,
+                description: "User-classified as distraction.",
+                message: "Refocus when ready."
+            )
+        case .defaultLLM:
+            break
+        }
+
         // Refresh context from local DB
         let context = await refreshContext()
 

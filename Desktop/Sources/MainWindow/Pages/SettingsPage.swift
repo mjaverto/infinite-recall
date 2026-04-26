@@ -160,6 +160,8 @@ struct SettingsContentView: View {
   @State private var analysisDelay: Int
   @State private var focusNotificationsEnabled: Bool
   @State private var focusExcludedApps: Set<String>
+  @State private var focusAlwaysFocusedApps: Set<String>
+  @State private var focusAlwaysDistractedApps: Set<String>
 
   // Task Assistant states
   @State private var taskEnabled: Bool
@@ -487,6 +489,8 @@ struct SettingsContentView: View {
     _focusNotificationsEnabled = State(
       initialValue: FocusAssistantSettings.shared.notificationsEnabled)
     _focusExcludedApps = State(initialValue: FocusAssistantSettings.shared.excludedApps)
+    _focusAlwaysFocusedApps = State(initialValue: FocusAssistantSettings.shared.alwaysFocusedApps)
+    _focusAlwaysDistractedApps = State(initialValue: FocusAssistantSettings.shared.alwaysDistractedApps)
     _taskEnabled = State(initialValue: TaskAssistantSettings.shared.isEnabled)
     _taskChatAgentEnabled = State(initialValue: TaskAgentSettings.shared.isChatEnabled)
     _taskAgentWorkingDirectory = State(initialValue: TaskAgentSettings.shared.workingDirectory)
@@ -5152,10 +5156,89 @@ struct SettingsContentView: View {
             Divider()
               .background(OmiColors.backgroundQuaternary)
 
+            // Always Focused Apps
+            VStack(alignment: .leading, spacing: 12) {
+              VStack(alignment: .leading, spacing: 4) {
+                Text("Always Focused")
+                  .scaledFont(size: 14)
+                  .foregroundColor(OmiColors.textSecondary)
+                Text("These apps always count as focused — no LLM call")
+                  .scaledFont(size: 12)
+                  .foregroundColor(OmiColors.textTertiary)
+              }
+
+              if !focusAlwaysFocusedApps.isEmpty {
+                LazyVStack(spacing: 8) {
+                  ForEach(Array(focusAlwaysFocusedApps).sorted(), id: \.self) { appName in
+                    ExcludedAppRow(
+                      appName: appName,
+                      onRemove: {
+                        FocusAssistantSettings.shared.unmarkAlwaysFocused(appName)
+                        focusAlwaysFocusedApps = FocusAssistantSettings.shared.alwaysFocusedApps
+                      }
+                    )
+                  }
+                }
+              }
+
+              AddExcludedAppView(
+                onAdd: { appName in
+                  FocusAssistantSettings.shared.markAlwaysFocused(appName)
+                  focusAlwaysFocusedApps = FocusAssistantSettings.shared.alwaysFocusedApps
+                  focusAlwaysDistractedApps = FocusAssistantSettings.shared.alwaysDistractedApps
+                  focusExcludedApps = FocusAssistantSettings.shared.excludedApps
+                },
+                excludedApps: focusAlwaysFocusedApps
+              )
+            }
+
+            Divider()
+              .background(OmiColors.backgroundQuaternary)
+
+            // Always Distracted Apps
+            VStack(alignment: .leading, spacing: 12) {
+              VStack(alignment: .leading, spacing: 4) {
+                Text("Always Distracted")
+                  .scaledFont(size: 14)
+                  .foregroundColor(OmiColors.textSecondary)
+                Text("These apps always count as distracted — no LLM call")
+                  .scaledFont(size: 12)
+                  .foregroundColor(OmiColors.textTertiary)
+              }
+
+              if !focusAlwaysDistractedApps.isEmpty {
+                LazyVStack(spacing: 8) {
+                  ForEach(Array(focusAlwaysDistractedApps).sorted(), id: \.self) { appName in
+                    ExcludedAppRow(
+                      appName: appName,
+                      onRemove: {
+                        FocusAssistantSettings.shared.unmarkAlwaysDistracted(appName)
+                        focusAlwaysDistractedApps =
+                          FocusAssistantSettings.shared.alwaysDistractedApps
+                      }
+                    )
+                  }
+                }
+              }
+
+              AddExcludedAppView(
+                onAdd: { appName in
+                  FocusAssistantSettings.shared.markAlwaysDistracted(appName)
+                  focusAlwaysDistractedApps = FocusAssistantSettings.shared.alwaysDistractedApps
+                  focusAlwaysFocusedApps = FocusAssistantSettings.shared.alwaysFocusedApps
+                  focusExcludedApps = FocusAssistantSettings.shared.excludedApps
+                },
+                excludedApps: focusAlwaysDistractedApps
+              )
+            }
+
+            Divider()
+              .background(OmiColors.backgroundQuaternary)
+
             // Excluded Apps for Focus Analysis
             VStack(alignment: .leading, spacing: 12) {
               VStack(alignment: .leading, spacing: 4) {
-                Text("Excluded Apps")
+                Text("Excluded from Analysis")
                   .scaledFont(size: 14)
                   .foregroundColor(OmiColors.textSecondary)
                 Text("Focus coaching won't trigger for these apps")
@@ -5208,6 +5291,8 @@ struct SettingsContentView: View {
                 onAdd: { appName in
                   FocusAssistantSettings.shared.excludeApp(appName)
                   focusExcludedApps = FocusAssistantSettings.shared.excludedApps
+                  focusAlwaysFocusedApps = FocusAssistantSettings.shared.alwaysFocusedApps
+                  focusAlwaysDistractedApps = FocusAssistantSettings.shared.alwaysDistractedApps
                 },
                 excludedApps: focusExcludedApps
               )

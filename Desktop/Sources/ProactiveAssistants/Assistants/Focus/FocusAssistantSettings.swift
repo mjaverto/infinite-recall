@@ -1,5 +1,16 @@
 import Foundation
 
+// MARK: - App Focus Classification
+
+/// Per-app focus classification set by the user.
+/// Resolution order: excluded > alwaysFocused > alwaysDistracted > defaultLLM
+enum AppFocusClassification: String {
+    case excluded
+    case alwaysFocused
+    case alwaysDistracted
+    case defaultLLM
+}
+
 /// Manages Focus Assistant-specific settings stored in UserDefaults
 @MainActor
 class FocusAssistantSettings {
@@ -12,6 +23,8 @@ class FocusAssistantSettings {
     private let cooldownIntervalKey = "focusCooldownInterval"
     private let notificationsEnabledKey = "focusNotificationsEnabled"
     private let excludedAppsKey = "focusExcludedApps"
+    private let alwaysFocusedAppsKey = "focusAlwaysFocusedApps"
+    private let alwaysDistractedAppsKey = "focusAlwaysDistractedApps"
 
     // MARK: - Default Values
 
@@ -162,6 +175,109 @@ class FocusAssistantSettings {
         log("Focus: Included app '\(appName)' for focus analysis")
     }
 
+    // MARK: - Always Focused Apps
+
+    /// Apps that always short-circuit to .focused without an LLM call
+    var alwaysFocusedApps: Set<String> {
+        get {
+            if let saved = UserDefaults.standard.array(forKey: alwaysFocusedAppsKey) as? [String] {
+                return Set(saved)
+            }
+            return []
+        }
+        set {
+            UserDefaults.standard.set(Array(newValue), forKey: alwaysFocusedAppsKey)
+            NotificationCenter.default.post(name: .assistantSettingsDidChange, object: nil)
+        }
+    }
+
+    /// Mark an app as always focused (removes it from other lists)
+    func markAlwaysFocused(_ appName: String) {
+        var focused = alwaysFocusedApps
+        focused.insert(appName)
+        alwaysFocusedApps = focused
+        // Mutual exclusion: remove from other lists
+        var excl = excludedApps
+        excl.remove(appName)
+        excludedApps = excl
+        var dist = alwaysDistractedApps
+        dist.remove(appName)
+        alwaysDistractedApps = dist
+        log("Focus: Marked app '\(appName)' as always focused")
+    }
+
+    /// Unmark an app from the always-focused list
+    func unmarkAlwaysFocused(_ appName: String) {
+        var apps = alwaysFocusedApps
+        apps.remove(appName)
+        alwaysFocusedApps = apps
+        log("Focus: Unmarked app '\(appName)' from always focused")
+    }
+
+    // MARK: - Always Distracted Apps
+
+    /// Apps that always short-circuit to .distracted without an LLM call
+    var alwaysDistractedApps: Set<String> {
+        get {
+            if let saved = UserDefaults.standard.array(forKey: alwaysDistractedAppsKey) as? [String] {
+                return Set(saved)
+            }
+            return []
+        }
+        set {
+            UserDefaults.standard.set(Array(newValue), forKey: alwaysDistractedAppsKey)
+            NotificationCenter.default.post(name: .assistantSettingsDidChange, object: nil)
+        }
+    }
+
+    /// Mark an app as always distracted (removes it from other lists)
+    func markAlwaysDistracted(_ appName: String) {
+        var distracted = alwaysDistractedApps
+        distracted.insert(appName)
+        alwaysDistractedApps = distracted
+        // Mutual exclusion: remove from other lists
+        var excl = excludedApps
+        excl.remove(appName)
+        excludedApps = excl
+        var focused = alwaysFocusedApps
+        focused.remove(appName)
+        alwaysFocusedApps = focused
+        log("Focus: Marked app '\(appName)' as always distracted")
+    }
+
+    /// Unmark an app from the always-distracted list
+    func unmarkAlwaysDistracted(_ appName: String) {
+        var apps = alwaysDistractedApps
+        apps.remove(appName)
+        alwaysDistractedApps = apps
+        log("Focus: Unmarked app '\(appName)' from always distracted")
+    }
+
+    // MARK: - Classification
+
+    /// Returns the user-configured classification for an app.
+    /// Resolution order: excluded > alwaysFocused > alwaysDistracted > defaultLLM.
+    /// Logs a warning if an app appears in more than one list.
+    func classification(for appName: String) -> AppFocusClassification {
+        let inExcluded = isAppExcluded(appName)
+        let inFocused = alwaysFocusedApps.contains(appName)
+        let inDistracted = alwaysDistractedApps.contains(appName)
+
+        let membershipCount = (inExcluded ? 1 : 0) + (inFocused ? 1 : 0) + (inDistracted ? 1 : 0)
+        if membershipCount > 1 {
+            log(
+                "Focus: WARNING — '\(appName)' is in multiple classification lists "
+                + "(excluded:\(inExcluded), alwaysFocused:\(inFocused), alwaysDistracted:\(inDistracted)). "
+                + "Resolving: excluded > alwaysFocused > alwaysDistracted."
+            )
+        }
+
+        if inExcluded { return .excluded }
+        if inFocused { return .alwaysFocused }
+        if inDistracted { return .alwaysDistracted }
+        return .defaultLLM
+    }
+
     /// Reset only the analysis prompt to default
     func resetPromptToDefault() {
         UserDefaults.standard.removeObject(forKey: analysisPromptKey)
@@ -174,5 +290,7 @@ class FocusAssistantSettings {
         isEnabled = defaultEnabled
         resetPromptToDefault()
         UserDefaults.standard.removeObject(forKey: excludedAppsKey)
+        UserDefaults.standard.removeObject(forKey: alwaysFocusedAppsKey)
+        UserDefaults.standard.removeObject(forKey: alwaysDistractedAppsKey)
     }
 }
