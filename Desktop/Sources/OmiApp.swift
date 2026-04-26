@@ -241,6 +241,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Without this, writing to a dead FFmpeg stdin or agent-bridge pipe kills the process.
     signal(SIGPIPE, SIG_IGN)
 
+    PidFile.writeSelf()
+
     DesktopAutomationBridge.shared.startIfNeeded()
 
     // Strip com.apple.provenance xattrs that macOS adds when Sparkle extracts updates.
@@ -1253,6 +1255,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationWillTerminate(_ notification: Notification) {
     // Mark clean exit so crash detection works on next launch
     UserDefaults.standard.set(true, forKey: "lastSessionCleanExit")
+
+    PidFile.cleanup()
 
     // Stop MLX status polling
     Task { @MainActor in
