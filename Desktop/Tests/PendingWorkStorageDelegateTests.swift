@@ -157,6 +157,92 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
         // sweeper will eventually GC it. Leaving as-is is harmless for tests.
     }
 
+    // MARK: - Maintenance sweep fires delegate
+
+    /// Locks in #44: the sweeper's lease-reclaim path goes through the storage
+    /// actor, so the delegate fires and the Activity panel sees the
+    /// `claimed → queued` (or `claimed → dead`) transition immediately.
+    func test_runMaintenanceSweep_firesDelegateOnce_afterReclaimingExpiredLease() async throws {
+        try await drainQueue()
+        let storage = PendingWorkStorage.shared
+
+        // Set up a row in `claimed` state with an already-expired lease so the
+        // sweep's UPDATE actually changes something.
+        _ = try await storage.enqueue(
+            workType: workType,
+            payload: Data("delegate-test-sweep".utf8),
+            dedupKey: "delegate-sweep-\(UUID().uuidString)"
+        )
+        guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
+              claimed.storageId != nil else {
+            return XCTFail("expected to claim our just-enqueued row")
+        }
+
+        // Run the sweep with `now` 1 hour in the future so the 10-minute lease
+        // is guaranteed expired. Attach the delegate AFTER the setup mutators
+        // so we count only the sweep's notification.
+        let stub = StubDelegate()
+        await storage.setDelegate(stub)
+
+        let result = try await storage.runMaintenanceSweep(now: Date().addingTimeInterval(3600))
+        XCTAssertGreaterThanOrEqual(result.recovered, 1, "sweep should reclaim the expired-lease row")
+        XCTAssertEqual(stub.count, 1, "runMaintenanceSweep must fire the delegate exactly once")
+
+        // Cleanup: the row is now `queued` (or `dead`); claim+ack to drain.
+        if let again = try await storage.claimNext(claimedBy: "delegate-test-worker"),
+           let aSid = again.storageId {
+            try? await storage.ack(storageId: aSid)
+        }
+    }
+
+    /// Covers the `attempts + 1 >= maxAttempts` branch of the lease-reclaim
+    /// CASE: a row that's one fail away from `dead` should get pushed to `dead`
+    /// (not back to `queued`) when its lease expires. Locks in the count so a
+    /// regression in the CASE expression can't slip through.
+    func test_runMaintenanceSweep_transitionsExhaustedRowToDead() async throws {
+        try await drainQueue()
+        let storage = PendingWorkStorage.shared
+
+        // Enqueue + claim, then bump `attempts` to maxAttempts - 1 directly so
+        // the next attempt-bump (the sweep's reclaim) tips it into `dead`.
+        // Default maxAttempts is 8 (set by the table schema / record default).
+        _ = try await storage.enqueue(
+            workType: workType,
+            payload: Data("delegate-test-sweep-dead".utf8),
+            dedupKey: "delegate-sweep-dead-\(UUID().uuidString)"
+        )
+        guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
+              let sid = claimed.storageId else {
+            return XCTFail("expected to claim our just-enqueued row")
+        }
+
+        // Force attempts up to one-below-max via the same db pool. Read max from
+        // the row so we don't hard-code the schema default.
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            return XCTFail("database queue unavailable")
+        }
+        try await dbQueue.write { db in
+            try db.execute(sql: """
+                UPDATE pending_work
+                SET attempts = maxAttempts - 1
+                WHERE id = ?
+            """, arguments: [sid])
+        }
+
+        let stub = StubDelegate()
+        await storage.setDelegate(stub)
+
+        let result = try await storage.runMaintenanceSweep(now: Date().addingTimeInterval(3600))
+        XCTAssertGreaterThanOrEqual(result.recovered, 1, "sweep should reclaim our row")
+        XCTAssertEqual(stub.count, 1, "sweep must fire the delegate exactly once even when transitioning to dead")
+
+        // Verify the row landed in `dead`, not `queued`.
+        let landedStatus: String? = try await dbQueue.read { db in
+            try String.fetchOne(db, sql: "SELECT status FROM pending_work WHERE id = ?", arguments: [sid])
+        }
+        XCTAssertEqual(landedStatus, "dead", "exhausted-attempts row should transition to dead, not queued")
+    }
+
     // MARK: - Read methods do NOT fire
 
     func test_readMethods_doNotFireDelegate() async throws {
