@@ -103,9 +103,13 @@ osascript -e 'tell application "Infinite Recall" to quit'
     (number|null), thermal_state (one of nominal/fair/serious/critical),
     on_battery (bool), low_power (bool), process_breakdown[] (array of
     {name, pid, cpu_percent, rss_mb})`.
-  - `processing_gate` — `allowed (bool), reason (one of idle/device_active/
-    on_battery/thermal/locked/manual_pause/none), since (iso8601),
-    waiting_for (string|null|absent)`.
+  - `processing_gate` — sum type tagged on `state` (issue #35):
+    `{state: "allowed", since: iso8601}` OR
+    `{state: "blocked", reason: <BlockReason>, since: iso8601,
+      waiting_for: <WaitCondition>}` where `BlockReason` is one of
+    `device_active|on_battery|thermal|locked|manual_pause` and
+    `WaitCondition` is `{type: "idle_for", duration_secs: u64}` or
+    `{type: "ac_power"|"thermal_cooldown"|"unlock"|"manual"}`.
   - `generated_at` — iso8601.
 
   Sample (truncated):
@@ -125,7 +129,7 @@ osascript -e 'tell application "Infinite Recall" to quit'
       "on_battery": false, "low_power": false,
       "process_breakdown": [ {"name":"infinite-recall-api","pid":4242,
         "cpu_percent":12.4,"rss_mb":256} ] },
-    "processing_gate": { "allowed": true, "reason": "none",
+    "processing_gate": { "state": "allowed",
       "since": "2026-04-26T14:25:00Z" },
     "generated_at": "2026-04-26T14:25:30.512Z"
   }

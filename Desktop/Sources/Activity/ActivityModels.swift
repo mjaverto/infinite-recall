@@ -89,18 +89,78 @@ public enum ThermalState: String, Codable, Hashable {
     case critical
 }
 
-public enum GateReason: String, Codable, Hashable {
-    case idle
+/// Issue #35: the pre-#35 `GateReason` (`idle/device_active/on_battery/
+/// thermal/locked/manual_pause/none/stub`) was a stringly-typed enum that
+/// existed alongside an `allowed: Bool` permitting illegal combos like
+/// `{allowed: true, reason: .manualPause}`. Replaced by `GateState`
+/// (sum type) + `BlockReason` (only meaningful when blocked).
+public enum BlockReason: String, Codable, Hashable, CaseIterable {
     case deviceActive = "device_active"
     case onBattery = "on_battery"
     case thermal
     case locked
     case manualPause = "manual_pause"
-    case none
-    /// `AlwaysAllowedGate` placeholder is in use — real `ProcessingGate`
-    /// not yet wired (issue #32). Consensus-fix C4: surface honestly in
-    /// the UI instead of pretending idle processing is running.
-    case stub
+}
+
+/// Issue #35: typed mirror of Rust's `WaitCondition`. Replaces the
+/// pre-#35 stringly-typed `Option<String>` on the wire (e.g.
+/// `"2 min of idle"`) so the UI can render the right copy/icon
+/// without parsing English.
+///
+/// Wire shape — adjacently-tagged sum on `type`:
+/// ```json
+/// {"type": "idle_for", "duration_secs": 120}
+/// {"type": "ac_power"}
+/// {"type": "thermal_cooldown"}
+/// {"type": "unlock"}
+/// {"type": "manual"}
+/// ```
+public enum WaitCondition: Codable, Hashable {
+    case idleFor(seconds: UInt64)
+    case acPower
+    case thermalCooldown
+    case unlock
+    case manual
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case durationSecs = "duration_secs"
+    }
+
+    private enum TypeTag: String, Codable {
+        case idleFor = "idle_for"
+        case acPower = "ac_power"
+        case thermalCooldown = "thermal_cooldown"
+        case unlock
+        case manual
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let tag = try c.decode(TypeTag.self, forKey: .type)
+        switch tag {
+        case .idleFor:
+            let secs = try c.decode(UInt64.self, forKey: .durationSecs)
+            self = .idleFor(seconds: secs)
+        case .acPower: self = .acPower
+        case .thermalCooldown: self = .thermalCooldown
+        case .unlock: self = .unlock
+        case .manual: self = .manual
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .idleFor(let secs):
+            try c.encode(TypeTag.idleFor, forKey: .type)
+            try c.encode(secs, forKey: .durationSecs)
+        case .acPower: try c.encode(TypeTag.acPower, forKey: .type)
+        case .thermalCooldown: try c.encode(TypeTag.thermalCooldown, forKey: .type)
+        case .unlock: try c.encode(TypeTag.unlock, forKey: .type)
+        case .manual: try c.encode(TypeTag.manual, forKey: .type)
+        }
+    }
 }
 
 // MARK: - Inner shapes
@@ -231,24 +291,88 @@ public struct ResourceSample: Codable, Hashable {
     }
 }
 
-public struct GateState: Codable, Hashable {
-    public let allowed: Bool
-    public let reason: GateReason
-    public let since: Date
-    public let waitingFor: String?
+/// Issue #35: `GateState` is a sum type. The pre-#35 struct
+/// `{allowed: Bool, reason: GateReason, since: Date, waitingFor: String?}`
+/// permitted illegal combinations and a stringly-typed `waitingFor`. Now
+/// each variant carries exactly the data that's meaningful for it.
+///
+/// Wire shape — internally-tagged on `state`:
+/// ```json
+/// {"state": "allowed", "since": "..."}
+/// {"state": "blocked", "reason": "device_active", "since": "...",
+///  "waiting_for": {"type": "idle_for", "duration_secs": 120}}
+/// ```
+public enum GateState: Codable, Hashable {
+    case allowed(since: Date)
+    case blocked(reason: BlockReason, since: Date, waitingFor: WaitCondition)
 
-    enum CodingKeys: String, CodingKey {
-        case allowed
+    private enum CodingKeys: String, CodingKey {
+        case state
         case reason
         case since
         case waitingFor = "waiting_for"
     }
 
-    public init(allowed: Bool, reason: GateReason, since: Date, waitingFor: String?) {
-        self.allowed = allowed
-        self.reason = reason
-        self.since = since
-        self.waitingFor = waitingFor
+    private enum StateTag: String, Codable {
+        case allowed
+        case blocked
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let tag = try c.decode(StateTag.self, forKey: .state)
+        let since = try c.decode(Date.self, forKey: .since)
+        switch tag {
+        case .allowed:
+            self = .allowed(since: since)
+        case .blocked:
+            let reason = try c.decode(BlockReason.self, forKey: .reason)
+            let waiting = try c.decode(WaitCondition.self, forKey: .waitingFor)
+            self = .blocked(reason: reason, since: since, waitingFor: waiting)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .allowed(let since):
+            try c.encode(StateTag.allowed, forKey: .state)
+            try c.encode(since, forKey: .since)
+        case .blocked(let reason, let since, let waitingFor):
+            try c.encode(StateTag.blocked, forKey: .state)
+            try c.encode(reason, forKey: .reason)
+            try c.encode(since, forKey: .since)
+            try c.encode(waitingFor, forKey: .waitingFor)
+        }
+    }
+
+    // MARK: Convenience accessors
+
+    /// `true` iff this is the `.allowed` variant. The boolean is fully
+    /// derivable from the variant — that's the whole point of the sum.
+    public var isAllowed: Bool {
+        if case .allowed = self { return true }
+        return false
+    }
+
+    /// Timestamp the current variant became active.
+    public var since: Date {
+        switch self {
+        case .allowed(let s): return s
+        case .blocked(_, let s, _): return s
+        }
+    }
+
+    /// `BlockReason` if blocked, else `nil`.
+    public var blockReason: BlockReason? {
+        if case .blocked(let r, _, _) = self { return r }
+        return nil
+    }
+
+    /// `WaitCondition` if blocked, else `nil`.
+    public var waitingFor: WaitCondition? {
+        if case .blocked(_, _, let w) = self { return w }
+        return nil
     }
 }
 

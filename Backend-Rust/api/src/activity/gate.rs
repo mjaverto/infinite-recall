@@ -3,27 +3,26 @@
 //! an "always-allowed" stub so `ActivityState` can be constructed and the
 //! snapshot endpoint returns a stable shape.
 //!
-//! Consensus-fix C4: report the stub status via `GateReason::Stub` and
-//! `waiting_for: "real gate not wired"` so the UI can render an honest
-//! "Gate not yet wired (#32)" instead of "Idle processing — running".
+//! Issue #35: with `GateState` collapsed to a sum type, `AlwaysAllowedGate`
+//! returns `GateState::Allowed { since }` per the issue spec. The
+//! pre-#35 `GateReason::Stub` variant (and its "Gate not yet wired (#32)"
+//! UI banner) is gone — the sum doesn't have a "we don't really know"
+//! third state, and the issue acceptance criterion is explicit. The
+//! `tracing::warn!` boot breadcrumb in `lib.rs` still flags the stub for
+//! anyone debugging from the daemon side.
 
 use chrono::Utc;
 
 use super::traits::ProcessingGate;
-use super::types::{GateReason, GateState};
+use super::types::GateState;
 
 /// Always-allowed gate. No idle/thermal throttling enforced; the snapshot
-/// reports `allowed: true` with `reason: Stub` so consumers can detect the
-/// placeholder and surface it as such in the UI.
+/// reports `Allowed` so the rest of the pipeline can run without being
+/// gated. The real `ProcessingGate` lands with issue #32.
 pub struct AlwaysAllowedGate;
 
 impl ProcessingGate for AlwaysAllowedGate {
     fn current(&self) -> GateState {
-        GateState {
-            allowed: true,
-            reason: GateReason::Stub,
-            since: Utc::now(),
-            waiting_for: Some("real gate not wired".to_string()),
-        }
+        GateState::Allowed { since: Utc::now() }
     }
 }

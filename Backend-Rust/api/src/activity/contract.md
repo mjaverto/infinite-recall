@@ -73,14 +73,45 @@ Field names are snake_case on the wire. Swift mirrors live in
     ]
   },
   "processing_gate": {
-    "allowed": false,
-    "reason": "device_active",
-    "since": "2026-04-26T14:25:00.000Z",
-    "waiting_for": "2 min of idle"
+    "state":       "blocked",
+    "reason":      "device_active",
+    "since":       "2026-04-26T14:25:00.000Z",
+    "waiting_for": { "type": "idle_for", "duration_secs": 120 }
   },
   "generated_at": "2026-04-26T14:25:30.512Z"
 }
 ```
+
+### `GateState` — sum type (issue #35)
+
+`GateState` is an internally-tagged sum on the `state` field. The pre-#35
+flat shape (`{allowed: bool, reason: enum, waiting_for: string?}`) is gone:
+it permitted illegal combinations like `{allowed: true, reason: "manual_pause"}`
+and a stringly-typed `waiting_for`.
+
+```json
+// Allowed — work is draining. No `reason`/`waiting_for` (not meaningful).
+{ "state": "allowed", "since": "2026-04-26T14:25:00.000Z" }
+
+// Blocked — `reason` is a typed `BlockReason`, `waiting_for` is a typed
+// `WaitCondition`. Both are required when `state == "blocked"`.
+{
+  "state":       "blocked",
+  "reason":      "device_active",
+  "since":       "2026-04-26T14:25:00.000Z",
+  "waiting_for": { "type": "idle_for", "duration_secs": 120 }
+}
+```
+
+`WaitCondition` is also an adjacently-tagged sum on `type`:
+
+| Variant | Wire shape |
+|---|---|
+| `IdleFor(Duration)` | `{"type":"idle_for","duration_secs":<u64>}` |
+| `AcPower` | `{"type":"ac_power"}` |
+| `ThermalCooldown` | `{"type":"thermal_cooldown"}` |
+| `Unlock` | `{"type":"unlock"}` |
+| `Manual` | `{"type":"manual"}` |
 
 ### Enums (string-valued)
 
@@ -90,7 +121,8 @@ Field names are snake_case on the wire. Swift mirrors live in
 | `CaptureRow.kind` / `CaptureKind` | `audio`, `screen` |
 | `PauseRequest.target` / `ResumeRequest.target` / `PauseTargetId` | `kind`, `capture` (with typed `id` payload — see below) |
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
-| `GateState.reason` / `GateReason` | `idle`, `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `none` |
+| `GateState` (variant tag on `state`) | `allowed`, `blocked` |
+| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause` |
 
 ### `PauseRequest` / `ResumeRequest`
 

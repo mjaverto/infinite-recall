@@ -111,10 +111,10 @@ final class ActivityModelsTests: XCTestCase {
         ]
       },
       "processing_gate": {
-        "allowed": false,
+        "state": "blocked",
         "reason": "device_active",
         "since": "2026-04-26T14:25:00.000Z",
-        "waiting_for": "2 min of idle"
+        "waiting_for": { "type": "idle_for", "duration_secs": 120 }
       },
       "generated_at": "2026-04-26T14:25:30.512Z"
     }
@@ -171,10 +171,15 @@ final class ActivityModelsTests: XCTestCase {
         XCTAssertEqual(res.processBreakdown[2].cpuPercent, 78.4, accuracy: 0.001)
         XCTAssertEqual(res.processBreakdown[2].rssMb, 1498)
 
-        // Gate state
-        XCTAssertFalse(snap.processingGate.allowed)
-        XCTAssertEqual(snap.processingGate.reason, .deviceActive)
-        XCTAssertEqual(snap.processingGate.waitingFor, "2 min of idle")
+        // Gate state — issue #35: `processingGate` is now a sum-type
+        // mirror of Rust's `GateState`. Pattern-match and assert each
+        // field of the `Blocked` variant.
+        XCTAssertFalse(snap.processingGate.isAllowed)
+        guard case .blocked(let reason, _, let waitingFor) = snap.processingGate else {
+            return XCTFail("expected .blocked variant; got \(snap.processingGate)")
+        }
+        XCTAssertEqual(reason, .deviceActive)
+        XCTAssertEqual(waitingFor, .idleFor(seconds: 120))
     }
 
     // MARK: - Round-trip stability
@@ -220,24 +225,59 @@ final class ActivityModelsTests: XCTestCase {
         XCTAssertEqual(r.processBreakdown.count, 0)
     }
 
-    func testGateStateWaitingForMayBeOmitted() throws {
-        // Rust serializes this with `skip_serializing_if = "Option::is_none"`,
-        // so the field can be absent (not just null) on the wire.
+    // Issue #35: GateState is a sum type. The pre-#35 "waiting_for may
+    // be omitted/null" semantics no longer apply — `Allowed` doesn't
+    // carry one at all, and `Blocked` requires it. Replaced with the
+    // sum-type round-trip tests below.
+
+    func testGateStateAllowedRoundTrips() throws {
         let json = """
-        { "allowed": true, "reason": "none", "since": "2026-04-26T14:25:00.000Z" }
+        { "state": "allowed", "since": "2026-04-26T14:25:00.000Z" }
         """
         let g = try Self.makeDecoder().decode(GateState.self, from: json.data(using: .utf8)!)
-        XCTAssertTrue(g.allowed)
-        XCTAssertEqual(g.reason, .none)
+        XCTAssertTrue(g.isAllowed)
+        XCTAssertNil(g.blockReason)
         XCTAssertNil(g.waitingFor)
+
+        // Re-encode → decode → equal.
+        let data = try Self.makeEncoder().encode(g)
+        let str = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertTrue(str.contains("\"state\":\"allowed\""), "got: \(str)")
+        XCTAssertFalse(str.contains("\"reason\""), "Allowed must not encode reason: \(str)")
+        XCTAssertFalse(str.contains("\"waiting_for\""),
+                       "Allowed must not encode waiting_for: \(str)")
+        let back = try Self.makeDecoder().decode(GateState.self, from: data)
+        XCTAssertEqual(back, g)
     }
 
-    func testGateStateWaitingForExplicitNullDecodes() throws {
+    func testGateStateBlockedRoundTripsTypedWaitingFor() throws {
         let json = """
-        { "allowed": true, "reason": "none", "since": "2026-04-26T14:25:00.000Z", "waiting_for": null }
+        {
+          "state": "blocked",
+          "reason": "device_active",
+          "since": "2026-04-26T14:25:00.000Z",
+          "waiting_for": { "type": "idle_for", "duration_secs": 120 }
+        }
         """
         let g = try Self.makeDecoder().decode(GateState.self, from: json.data(using: .utf8)!)
-        XCTAssertNil(g.waitingFor)
+        XCTAssertFalse(g.isAllowed)
+        XCTAssertEqual(g.blockReason, .deviceActive)
+        XCTAssertEqual(g.waitingFor, .idleFor(seconds: 120))
+
+        let data = try Self.makeEncoder().encode(g)
+        let back = try Self.makeDecoder().decode(GateState.self, from: data)
+        XCTAssertEqual(back, g)
+    }
+
+    func testGateStateBlockedRequiresWaitingFor() {
+        // Sum-type discipline: Blocked without waiting_for is illegal.
+        let json = """
+        { "state": "blocked", "reason": "device_active",
+          "since": "2026-04-26T14:25:00.000Z" }
+        """
+        XCTAssertThrowsError(
+            try Self.makeDecoder().decode(GateState.self, from: json.data(using: .utf8)!)
+        )
     }
 
     func testEmptyInFlightMapAndQueuedZero() throws {
@@ -260,22 +300,44 @@ final class ActivityModelsTests: XCTestCase {
 
     // MARK: - Enum coverage (every wire value)
 
-    func testGateReasonEveryEnumValueDecodes() throws {
-        let cases: [(String, GateReason)] = [
-            ("idle",          .idle),
+    func testBlockReasonEveryEnumValueDecodes() throws {
+        // Issue #35: BlockReason replaces GateReason. The pre-#35 `idle`
+        // and `none` reasons are gone — they map to `Allowed` now.
+        let cases: [(String, BlockReason)] = [
             ("device_active", .deviceActive),
             ("on_battery",    .onBattery),
             ("thermal",       .thermal),
             ("locked",        .locked),
             ("manual_pause",  .manualPause),
-            ("none",          .none),
         ]
         for (wire, expected) in cases {
             let json = """
-            { "allowed": false, "reason": "\(wire)", "since": "2026-04-26T14:25:00.000Z" }
+            { "state": "blocked", "reason": "\(wire)",
+              "since": "2026-04-26T14:25:00.000Z",
+              "waiting_for": { "type": "manual" } }
             """
             let g = try Self.makeDecoder().decode(GateState.self, from: json.data(using: .utf8)!)
-            XCTAssertEqual(g.reason, expected, "wire value \(wire) should decode to \(expected)")
+            XCTAssertEqual(g.blockReason, expected,
+                           "wire value \(wire) should decode to \(expected)")
+        }
+    }
+
+    func testWaitConditionEveryVariantRoundTrips() throws {
+        let cases: [(String, WaitCondition)] = [
+            (#"{"type":"idle_for","duration_secs":120}"#, .idleFor(seconds: 120)),
+            (#"{"type":"ac_power"}"#,                     .acPower),
+            (#"{"type":"thermal_cooldown"}"#,             .thermalCooldown),
+            (#"{"type":"unlock"}"#,                       .unlock),
+            (#"{"type":"manual"}"#,                       .manual),
+        ]
+        for (json, expected) in cases {
+            let decoded = try Self.makeDecoder()
+                .decode(WaitCondition.self, from: json.data(using: .utf8)!)
+            XCTAssertEqual(decoded, expected, "decode mismatch for \(json)")
+            // Re-encoded must round-trip.
+            let data = try Self.makeEncoder().encode(decoded)
+            let back = try Self.makeDecoder().decode(WaitCondition.self, from: data)
+            XCTAssertEqual(back, expected, "round-trip mismatch for \(json)")
         }
     }
 

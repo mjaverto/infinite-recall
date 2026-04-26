@@ -20,7 +20,7 @@ pub mod types;
 
 pub use traits::{InflightRegistry, PauseStore, ProcessingGate, ResourceSampler};
 pub use types::{
-    ActivitySnapshot, CaptureKind, CaptureRow, GateReason, GateState, InFlight, InflightUpdate,
+    ActivitySnapshot, BlockReason, CaptureKind, CaptureRow, GateState, InFlight, InflightUpdate,
     KindRow, PauseRequest, PauseTargetId, ProcessBreakdown, ResourceSample, ResumeRequest,
-    ThermalState, WorkKind,
+    ThermalState, WaitCondition, WorkKind,
 };

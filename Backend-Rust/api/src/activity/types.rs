@@ -91,12 +91,13 @@ pub enum ThermalState {
     Critical,
 }
 
-/// Why deferred work is or is not draining.
+/// Why deferred work is currently blocked. Only meaningful inside
+/// `GateState::Blocked` — the `Allowed` variant doesn't carry one,
+/// because "we're allowed to drain" doesn't have a sub-reason
+/// (issue #35: collapse `{allowed: bool, reason: enum}` into a sum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GateReason {
-    /// Device is idle and we are draining.
-    Idle,
+pub enum BlockReason {
     /// User is actively using the device.
     DeviceActive,
     /// On battery and policy says wait for AC.
@@ -107,13 +108,52 @@ pub enum GateReason {
     Locked,
     /// User manually paused via the Activity tab.
     ManualPause,
-    /// No gating reason; trivial baseline.
-    None,
-    /// `AlwaysAllowedGate` placeholder is in use — the real `ProcessingGate`
-    /// owned by the idle-gate agent has not been wired yet (issue #32).
-    /// Consensus-fix C4: surface this so the UI doesn't gaslight users with
-    /// "Idle processing — running" when in reality no work drains.
-    Stub,
+}
+
+/// What the gate is waiting for before it will let work drain again.
+/// Typed payload (issue #35): replaces the previous stringly-typed
+/// `Option<String>` (`"2 min of idle"`, `"AC power"`, ...) so consumers
+/// can render the right copy / icon without parsing English.
+///
+/// Wire shape — adjacently-tagged sum, snake_case discriminator:
+/// ```json
+/// {"type": "idle_for", "duration_secs": 120}
+/// {"type": "ac_power"}
+/// {"type": "thermal_cooldown"}
+/// {"type": "unlock"}
+/// {"type": "manual"}
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WaitCondition {
+    /// Wait until the device has been idle for this long.
+    /// Wire field `duration_secs` is whole seconds; matches `Duration::from_secs`.
+    IdleFor {
+        #[serde(rename = "duration_secs", with = "duration_secs")]
+        duration: std::time::Duration,
+    },
+    /// Wait for the laptop to be back on AC power.
+    AcPower,
+    /// Wait for thermals to come down (gate decides when).
+    ThermalCooldown,
+    /// Wait for the user to unlock the screen.
+    Unlock,
+    /// Wait for the user to manually un-pause from the Activity tab.
+    Manual,
+}
+
+mod duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
+    }
 }
 
 /// Single in-flight task currently executing for a given `WorkKind`.
@@ -168,17 +208,59 @@ pub struct ResourceSample {
 }
 
 /// Snapshot of the idle/processing gate at sample time.
+///
+/// Issue #35: was a `{allowed: bool, reason: enum, waiting_for: Option<String>}`
+/// struct that permitted illegal states like `{allowed: true, reason: ManualPause}`
+/// or `Blocked` with no `waiting_for`. Now a sum type — each variant carries
+/// exactly the data that's meaningful for it.
+///
+/// Wire shape — internally-tagged sum, snake_case discriminator on field
+/// `state`. **Breaking change** vs the pre-#35 flat shape; the Swift mirror
+/// in `Desktop/Sources/Activity/ActivityModels.swift` is updated in lockstep.
+/// ```json
+/// // Allowed (work is draining, e.g. device is idle).
+/// {"state": "allowed", "since": "2026-04-26T14:25:00.000Z"}
+///
+/// // Blocked — `reason` says why, `waiting_for` says how to resume.
+/// {
+///   "state":       "blocked",
+///   "reason":      "device_active",
+///   "since":       "2026-04-26T14:25:00.000Z",
+///   "waiting_for": {"type": "idle_for", "duration_secs": 120}
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GateState {
-    /// Whether deferred-work claims are allowed right now.
-    pub allowed: bool,
-    pub reason: GateReason,
-    /// When the current `reason` started.
-    pub since: DateTime<Utc>,
-    /// Optional human-readable resume condition, e.g.
-    /// `"2 min of idle"`, `"AC power"`, `"thermal cooldown"`.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub waiting_for: Option<String>,
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GateState {
+    /// Deferred-work claims are permitted right now. `since` is the moment
+    /// the gate flipped to `Allowed`. No `reason` / `waiting_for` because
+    /// neither is meaningful when nothing is blocking.
+    Allowed { since: DateTime<Utc> },
+    /// Deferred work is held off. `reason` is a typed `BlockReason`,
+    /// `waiting_for` is a typed `WaitCondition` — both required.
+    Blocked {
+        reason: BlockReason,
+        since: DateTime<Utc>,
+        waiting_for: WaitCondition,
+    },
+}
+
+impl GateState {
+    /// Returns `true` iff this is the `Allowed` variant. Convenience
+    /// accessor for the (very common) "are we draining?" question; the
+    /// boolean is fully derivable from the variant, which is the whole
+    /// point of the sum-type refactor.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, GateState::Allowed { .. })
+    }
+
+    /// Timestamp the current variant became active.
+    pub fn since(&self) -> DateTime<Utc> {
+        match self {
+            GateState::Allowed { since } => *since,
+            GateState::Blocked { since, .. } => *since,
+        }
+    }
 }
 
 /// Top-level GET /v1/activity/snapshot response.
@@ -256,5 +338,124 @@ mod tests {
                 c
             );
         }
+    }
+
+    // ----- Issue #35: GateState sum-type wire-format coverage -----
+
+    #[test]
+    fn gate_state_allowed_wire_shape() {
+        let since: DateTime<Utc> = "2026-04-26T14:25:00Z".parse().unwrap();
+        let g = GateState::Allowed { since };
+        let v: serde_json::Value = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["state"], "allowed");
+        assert_eq!(v["since"], "2026-04-26T14:25:00Z");
+        // `Allowed` carries no `reason` / `waiting_for` — those keys must
+        // not be present (the whole point of the sum is that they're not
+        // meaningful in this variant).
+        assert!(v.get("reason").is_none(), "Allowed must not carry reason");
+        assert!(v.get("waiting_for").is_none(), "Allowed must not carry waiting_for");
+
+        // Round-trip back through the wire and we get the same variant.
+        let back: GateState = serde_json::from_value(v).unwrap();
+        assert!(back.is_allowed());
+        assert_eq!(back.since(), since);
+    }
+
+    #[test]
+    fn gate_state_blocked_wire_shape() {
+        let since: DateTime<Utc> = "2026-04-26T14:25:00Z".parse().unwrap();
+        let g = GateState::Blocked {
+            reason: BlockReason::DeviceActive,
+            since,
+            waiting_for: WaitCondition::IdleFor {
+                duration: std::time::Duration::from_secs(120),
+            },
+        };
+        let v: serde_json::Value = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["state"], "blocked");
+        assert_eq!(v["reason"], "device_active");
+        assert_eq!(v["waiting_for"]["type"], "idle_for");
+        assert_eq!(v["waiting_for"]["duration_secs"], 120);
+
+        let back: GateState = serde_json::from_value(v).unwrap();
+        assert!(!back.is_allowed());
+        assert_eq!(back.since(), since);
+        match back {
+            GateState::Blocked { reason, waiting_for, .. } => {
+                assert_eq!(reason, BlockReason::DeviceActive);
+                assert!(matches!(
+                    waiting_for,
+                    WaitCondition::IdleFor { duration } if duration.as_secs() == 120
+                ));
+            }
+            _ => panic!("expected Blocked"),
+        }
+    }
+
+    #[test]
+    fn block_reason_every_variant_round_trips() {
+        for (r, wire) in [
+            (BlockReason::DeviceActive, "device_active"),
+            (BlockReason::OnBattery, "on_battery"),
+            (BlockReason::Thermal, "thermal"),
+            (BlockReason::Locked, "locked"),
+            (BlockReason::ManualPause, "manual_pause"),
+        ] {
+            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{wire}\""));
+            let back: BlockReason = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    #[test]
+    fn wait_condition_every_variant_round_trips() {
+        let cases: Vec<(WaitCondition, serde_json::Value)> = vec![
+            (
+                WaitCondition::IdleFor {
+                    duration: std::time::Duration::from_secs(120),
+                },
+                serde_json::json!({"type":"idle_for","duration_secs":120}),
+            ),
+            (WaitCondition::AcPower, serde_json::json!({"type":"ac_power"})),
+            (
+                WaitCondition::ThermalCooldown,
+                serde_json::json!({"type":"thermal_cooldown"}),
+            ),
+            (WaitCondition::Unlock, serde_json::json!({"type":"unlock"})),
+            (WaitCondition::Manual, serde_json::json!({"type":"manual"})),
+        ];
+        for (w, expected) in cases {
+            let v = serde_json::to_value(w).unwrap();
+            assert_eq!(v, expected, "encode mismatch for {w:?}");
+            let back: WaitCondition = serde_json::from_value(v).unwrap();
+            assert_eq!(back, w, "round-trip mismatch for {w:?}");
+        }
+    }
+
+    #[test]
+    fn gate_state_blocked_rejects_when_waiting_for_missing() {
+        // Sum-type discipline: `Blocked` without `waiting_for` is not a
+        // legal value in either direction.
+        let bad = serde_json::json!({
+            "state": "blocked",
+            "reason": "device_active",
+            "since": "2026-04-26T14:25:00Z"
+            // no `waiting_for`
+        });
+        let r: Result<GateState, _> = serde_json::from_value(bad);
+        assert!(r.is_err(), "Blocked must require waiting_for");
+    }
+
+    #[test]
+    fn gate_state_allowed_rejects_extraneous_reason() {
+        // Allowed's untyped extras still parse (serde ignores unknown
+        // fields by default), but constructing and round-tripping a clean
+        // Allowed must not surface a `reason` key.
+        let g = GateState::Allowed {
+            since: "2026-04-26T14:25:00Z".parse().unwrap(),
+        };
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(!s.contains("reason"), "Allowed serialization must not contain reason: {s}");
+        assert!(!s.contains("waiting_for"), "Allowed must not contain waiting_for: {s}");
     }
 }

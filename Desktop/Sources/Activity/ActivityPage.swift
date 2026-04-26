@@ -167,65 +167,89 @@ struct ActivityPage: View {
                 color: OmiColors.textTertiary
             )
         }
-        switch gate.reason {
-        case .stub:
-            // Consensus-fix C4: honest copy when AlwaysAllowedGate is wired.
-            return BannerInfo(
-                icon: "wrench.adjustable",
-                title: "Gate not yet wired (#32)",
-                detail: "Activity scheduling will start once the real ProcessingGate ships.",
-                color: OmiColors.textTertiary
-            )
-        case .idle, .none:
-            if gate.allowed {
+        // Issue #35: `GateState` is a sum type. The pre-#35 `.idle/.none/.stub`
+        // reasons are gone — `Allowed` covers "we're draining" and the
+        // (now-deleted) "stub" reason is no longer tracked at the type level.
+        switch gate {
+        case .allowed:
+            if queued > 0 {
                 return BannerInfo(
                     icon: "checkmark.circle.fill",
                     title: "Idle processing — running",
-                    detail: queued > 0 ? "\(queued) item\(queued == 1 ? "" : "s") in queue" : nil,
+                    detail: "\(queued) item\(queued == 1 ? "" : "s") in queue",
                     color: OmiColors.success
                 )
             }
             return BannerInfo(
                 icon: "moon.zzz.fill",
-                title: queued > 0 ? "Up to date — \(queued) queued" : "Up to date — 0 queued",
+                title: "Up to date — 0 queued",
                 detail: "Idle processing standing by.",
                 color: OmiColors.textSecondary
             )
+        case .blocked(let reason, _, let waitingFor):
+            return blockedBannerInfo(reason: reason, waitingFor: waitingFor, queued: queued)
+        }
+    }
+
+    private func blockedBannerInfo(
+        reason: BlockReason,
+        waitingFor: WaitCondition,
+        queued: UInt32
+    ) -> BannerInfo {
+        let detail = waitingForDescription(waitingFor)
+        switch reason {
         case .deviceActive:
             return BannerInfo(
                 icon: "keyboard.fill",
                 title: "Waiting for idle — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: gate.waitingFor.map { "Resumes after \($0)." } ?? "Resumes after 2 min idle.",
+                detail: "Resumes after \(detail).",
                 color: OmiColors.warning
             )
         case .onBattery:
             return BannerInfo(
                 icon: "battery.25",
                 title: "Waiting for AC power — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: gate.waitingFor,
+                detail: detail,
                 color: OmiColors.warning
             )
         case .thermal:
             return BannerInfo(
                 icon: "thermometer.high",
                 title: "Cooling down — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: gate.waitingFor ?? "Resumes after thermal cooldown.",
+                detail: "Resumes after \(detail).",
                 color: OmiColors.warning
             )
         case .locked:
             return BannerInfo(
                 icon: "lock.fill",
                 title: "Screen locked — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: gate.waitingFor,
+                detail: detail,
                 color: OmiColors.warning
             )
         case .manualPause:
             return BannerInfo(
                 icon: "pause.circle.fill",
                 title: "Manually paused",
-                detail: gate.waitingFor,
+                detail: detail,
                 color: OmiColors.error
             )
+        }
+    }
+
+    /// Issue #35: render `WaitCondition` as user-facing copy. Replaces
+    /// the pre-#35 stringly-typed `waitingFor: String?`.
+    private func waitingForDescription(_ w: WaitCondition) -> String {
+        switch w {
+        case .idleFor(let secs):
+            if secs >= 60 {
+                let mins = secs / 60
+                return "\(mins) min of idle"
+            }
+            return "\(secs)s of idle"
+        case .acPower: return "AC power"
+        case .thermalCooldown: return "thermal cooldown"
+        case .unlock: return "unlock"
+        case .manual: return "manual resume"
         }
     }
 
@@ -598,24 +622,13 @@ struct ActivityPage: View {
             guard let gate = gate else {
                 return ("Up to date", "Loading…")
             }
-            if gate.allowed {
+            // Issue #35: switch on the sum-type variant.
+            switch gate {
+            case .allowed:
                 return ("Up to date — 0 queued", "Idle processing standing by.")
-            }
-            switch gate.reason {
-            case .deviceActive:
-                return ("Up to date — 0 queued", "Waiting for idle. Resumes after 2 min idle.")
-            case .onBattery:
-                return ("Up to date — 0 queued", "Waiting for AC power.")
-            case .thermal:
-                return ("Up to date — 0 queued", "Waiting for thermal cooldown.")
-            case .locked:
-                return ("Up to date — 0 queued", "Resumes when you unlock.")
-            case .manualPause:
-                return ("Up to date — 0 queued", "Manually paused.")
-            case .idle, .none:
-                return ("Up to date — 0 queued", "Idle processing standing by.")
-            case .stub:
-                return ("Up to date — 0 queued", "Gate not yet wired (#32).")
+            case .blocked(let reason, _, let waitingFor):
+                let detail = emptyStateBlockedDetail(reason: reason, waitingFor: waitingFor)
+                return ("Up to date — 0 queued", detail)
             }
         }()
         return VStack(spacing: 6) {
@@ -636,6 +649,22 @@ struct ActivityPage: View {
             RoundedRectangle(cornerRadius: 12)
                 .fill(OmiColors.backgroundSecondary.opacity(0.5))
         )
+    }
+
+    /// Empty-state copy for `Blocked` gate. Decoupled so the switch above
+    /// stays a one-line dispatch per variant.
+    private func emptyStateBlockedDetail(
+        reason: BlockReason,
+        waitingFor: WaitCondition
+    ) -> String {
+        let wait = waitingForDescription(waitingFor)
+        switch reason {
+        case .deviceActive: return "Waiting for idle. Resumes after \(wait)."
+        case .onBattery:    return "Waiting for AC power."
+        case .thermal:      return "Waiting for thermal cooldown."
+        case .locked:       return "Resumes when you unlock."
+        case .manualPause:  return "Manually paused."
+        }
     }
 
     // MARK: - Helpers
