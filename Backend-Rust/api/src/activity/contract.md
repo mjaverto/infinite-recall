@@ -1,0 +1,212 @@
+# Activity Tab — Phase 0 Contract (FROZEN)
+
+> Owner: Phase 0 contract-agent (issue #10).
+> Consumers: Phase 1 streams A–I (issues TBD; see umbrella #9).
+> Any change to this file requires a `stream 0-contract amendment` issue
+> and a re-freeze; downstream streams must pause work until merged.
+
+## Goals
+
+In-app **Activity** tab giving the user:
+1. Live process-tree CPU/RSS + system-wide GPU.
+2. Human-readable in-flight task list, one row per `WorkKind`.
+3. Per-kind / per-capture **Pause for N min** with persistence across restart.
+4. Honest explanation of *why* nothing is in-flight (idle gate vs battery
+   vs thermal vs locked vs manual pause).
+
+See `~/.claude/plans/for-ir-can-we-majestic-island.md` for full plan.
+
+---
+
+## REST surface
+
+All routes auth via existing bearer token (`Authorization: Bearer <token>`).
+All bodies + responses are JSON. Prefix: `/v1`.
+
+```
+GET  /v1/activity/snapshot                  → 200 ActivitySnapshot
+POST /v1/activity/pause                     → 200 { "paused_until": "<iso8601>" }
+POST /v1/activity/resume                    → 204
+POST /v1/activity/_internal/inflight        → 204    (loopback only)
+```
+
+The `_internal/inflight` route is Swift→Rust loopback. Stream A SHOULD reject
+non-loopback peer addresses defensively in addition to bearer auth.
+
+---
+
+## JSON shapes
+
+Field names are snake_case on the wire. Swift mirrors live in
+`Desktop/Sources/Activity/ActivityModels.swift` (see `CodingKeys`).
+
+### `ActivitySnapshot` (response of GET snapshot)
+
+```json
+{
+  "kinds": [
+    {
+      "kind": "transcribe",
+      "in_flight": { "label": "Transcribing 14:22:01→14:25:00 (en)",
+                     "started_at": "2026-04-26T14:22:03.812Z" },
+      "queued": 47,
+      "failed": 0,
+      "last_done_at": "2026-04-26T14:21:58.000Z",
+      "paused_until": null
+    }
+  ],
+  "capture": [
+    { "kind": "audio",  "running": true,  "paused_until": null },
+    { "kind": "screen", "running": true,  "paused_until": null }
+  ],
+  "resources": {
+    "cpu_percent": 142.0,
+    "rss_mb": 2342,
+    "gpu_system_percent": 38.0,
+    "thermal_state": "fair",
+    "on_battery": false,
+    "low_power": false,
+    "process_breakdown": [
+      { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84 },
+      { "name": "Infinite Recall",     "pid": 1235, "cpu_percent": 51.2, "rss_mb": 760 },
+      { "name": "mlx-lm.server",       "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498 }
+    ]
+  },
+  "processing_gate": {
+    "allowed": false,
+    "reason": "device_active",
+    "since": "2026-04-26T14:25:00.000Z",
+    "waiting_for": "2 min of idle"
+  },
+  "generated_at": "2026-04-26T14:25:30.512Z"
+}
+```
+
+### Enums (string-valued)
+
+| Field | Allowed values |
+|---|---|
+| `KindRow.kind` / `WorkKind` | `transcribe`, `ocr`, `summarize`, `extract_memory`, `extract_action_items` |
+| `CaptureRow.kind` / `CaptureKind` | `audio`, `screen` |
+| `PauseRequest.target` / `ResumeRequest.target` / `PauseTarget` | `kind`, `capture` |
+| `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
+| `GateState.reason` / `GateReason` | `idle`, `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `none` |
+
+### `PauseRequest` / `ResumeRequest`
+
+```json
+// POST /v1/activity/pause
+{ "target": "kind", "id": "ocr", "minutes": 15 }
+
+// POST /v1/activity/resume
+{ "target": "capture", "id": "audio" }
+```
+
+For `target: "kind"`, `id` is a `WorkKind` snake_case string.
+For `target: "capture"`, `id` is `"audio"` or `"screen"`.
+
+### `InflightUpdate` (Swift → Rust loopback)
+
+```json
+// POST /v1/activity/_internal/inflight
+{ "kind": "transcribe",
+  "in_flight": { "label": "Transcribing 14:22:01→14:25:00 (en)",
+                 "started_at": "2026-04-26T14:22:03.812Z" } }
+
+// Clearing the slot:
+{ "kind": "transcribe", "in_flight": null }
+```
+
+---
+
+## Internal Rust traits
+
+Stream A wires; B/C/D and the idle-gate agent implement.
+
+```rust
+trait PauseStore : Send + Sync {
+    fn paused_until(&self, target: PauseTarget, id: &str) -> Option<DateTime<Utc>>;
+    fn pause       (&self, target: PauseTarget, id: &str, minutes: u32) -> DateTime<Utc>;
+    fn resume      (&self, target: PauseTarget, id: &str);
+}
+
+trait InflightRegistry : Send + Sync {
+    fn snapshot(&self) -> HashMap<WorkKind, InFlight>;
+    fn update  (&self, kind: WorkKind, in_flight: Option<InFlight>);
+}
+
+trait ResourceSampler : Send + Sync {
+    fn sample(&self) -> ResourceSample;     // expected to cache ~1s
+}
+
+trait ProcessingGate : Send + Sync {
+    fn current(&self) -> GateState;
+}
+```
+
+`AppState` extended with:
+```rust
+pub pause_store:     Arc<dyn PauseStore>,
+pub inflight:        Arc<dyn InflightRegistry>,
+pub resource_sampler:Arc<dyn ResourceSampler>,
+pub processing_gate: Arc<dyn ProcessingGate>,
+```
+
+Stream A owns the AppState mutation. B/C/D do not edit `state.rs`.
+
+---
+
+## File ownership map
+
+| Stream | Owns (new) | Touches (append-only) |
+|---|---|---|
+| 0 (this PR) | `activity/{mod,types,traits,pause_store,resources,inflight}.rs`, `activity/contract.md`, `routes/activity.rs`, `Desktop/Sources/Activity/{ActivityModels,ActivityMonitorService,ActivityPage,WorkLabels,CapturePauseGate}.swift` | `main.rs`, `routes/mod.rs` (registers `mod activity` only) |
+| A | `routes/activity.rs` (flesh out) | `routes/mod.rs` (`// === activity routes ===` block), `state.rs`, `main.rs` |
+| B | `activity/pause_store.rs` (flesh out), `migrations/NNNN_paused_work.sql` | — |
+| C | `activity/resources.rs` (flesh out) | `Cargo.toml` (add `libproc`) |
+| D | `activity/inflight.rs` (flesh out) | — |
+| E | `Activity/ActivityPage.swift` (flesh out), `Activity/WorkLabels.swift` (flesh out) | `MainWindow/SidebarView.swift`, `MainWindow/DesktopHomeView.swift`, `OmiApp.swift` |
+| F | `Activity/ActivityMonitorService.swift` (flesh out), `Activity/ActivityModels.swift` (already shipped) | `APIClient.swift` (append-only) |
+| G | — | `Power/BatteryAwareScheduler.swift` |
+| H | `Activity/CapturePauseGate.swift` (flesh out) | `AudioCaptureService.swift`, `ScreenCaptureService.swift` |
+| I | `Backend-Rust/tests/activity_endpoints.rs`, `Desktop/Tests/ActivityModelsTests.swift`, `e2e/activity-tab.md` | — |
+
+All append-only edits MUST use bracket comments:
+```
+// === activity:<stream> ===
+...
+// === /activity:<stream> ===
+```
+to keep merge conflicts to single-line resolutions.
+
+---
+
+## Notification names + UserDefaults keys
+
+Defined in `Desktop/Sources/Activity/ActivityModels.swift`:
+
+| Constant | Value | Owner |
+|---|---|---|
+| `ActivityNotifications.pauseChanged` | `"activityPauseChanged"` | H posts; H/G observe |
+| `ActivityDefaultsKeys.lastGateStateJSON` | `"activity.lastGateStateJSON"` | F |
+
+---
+
+## Coordination notes
+
+- **Idle-gate agent.** A separate agent ships the device-idle/locked
+  processing gate. The `ProcessingGate` trait + `GateState` struct in this
+  contract are the seam. If their work lands first with a different
+  `GateState` shape, Stream A is responsible for an adapter — but the
+  on-the-wire `GateState` JSON in this contract MUST NOT change without an
+  amendment.
+- **Pause semantics.** Pause stops the *next* claim; in-flight handler
+  runs to completion (no cancellation refactor in scope). Pause + idle gate
+  AND together (whichever is later wins).
+- **Capture pause** triggers a confirm sheet in the UI ("recording will
+  stop"); the pause itself just stops the running capture and refuses
+  restart until `paused_until` passes.
+- **Pause persistence.** SQLite table `paused_work` (Stream B) keyed by
+  `(target, id)` with absolute `resume_at` unix-seconds.
+- **Hidden window** suspends polling (Stream F). UI MUST NOT poll the
+  Rust daemon while `NSWindow.didResignKey`.
