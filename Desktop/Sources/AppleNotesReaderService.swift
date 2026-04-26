@@ -97,92 +97,16 @@ actor AppleNotesReaderService {
     }
   }
 
+  /// Synthesize profile memories from Apple Notes.
+  ///
+  /// Infinite Recall fork: previously used agent bridge for synthesis. Returns
+  /// empty until a local-LLM synthesis path replaces it.
   func synthesizeFromNotes(notes: [AppleNoteRecord]) async -> (
     memories: Int, profileSummary: String
   ) {
     guard !notes.isEmpty else { return (0, "") }
-
-    let formatter = DateFormatter()
-    formatter.dateFormat = "MMM d"
-    let noteLines = notes.map { note in
-      let date = formatter.string(from: note.modifiedAt)
-      let detail = note.summary.isEmpty ? "" : " | \(note.summary)"
-      return "[\(date)] \(note.title)\(detail)"
-    }
-    let noteText = noteLines.joined(separator: "\n")
-
-    let synthesisPrompt = """
-      Analyze these \(notes.count) recent Apple Notes entries and extract profile information about the user.
-
-      APPLE NOTES:
-      \(noteText)
-
-      Respond ONLY with valid JSON (no markdown, no code fences):
-      {
-        "memories": [
-          "clear factual statement about the user"
-        ],
-        "profile": "2-3 sentence summary of what these notes say about the user"
-      }
-
-      RULES:
-      - Extract 8-12 memories grounded in the note titles and summaries
-      - Focus on plans, projects, interests, shopping intent, relationships, routines, and recurring ideas
-      - Ignore screenshot noise, OCR garbage, duplicate lines, and generic UI text
-      - Each memory should be one concise third-person factual statement
-      - Do not invent details not supported by the notes
-      """
-
-    do {
-      let bridge = AgentBridge(harnessMode: "piMono")
-      try await bridge.start()
-      defer { Task { await bridge.stop() } }
-
-      let result = try await bridge.query(
-        prompt: synthesisPrompt,
-        systemPrompt:
-          "You extract high-signal user facts from Apple Notes. Output only valid JSON.",
-        model: ModelQoS.Claude.synthesis,
-        onTextDelta: { @Sendable _ in },
-        onToolCall: { @Sendable _, _, _ in "" },
-        onToolActivity: { @Sendable _, _, _, _ in }
-      )
-
-      let responseText = Self.extractJSONObject(from: result.text)
-      guard
-        let jsonData = responseText.data(using: .utf8),
-        let parsed = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
-      else {
-        log("AppleNotesReaderService: Failed to parse synthesis response")
-        return (0, "")
-      }
-
-      let memoryStrings = (parsed["memories"] as? [String] ?? []).filter {
-        !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      }
-      let profileSummary = parsed["profile"] as? String ?? ""
-
-      var memoriesSaved = 0
-      for memory in memoryStrings {
-        do {
-          _ = try await APIClient.shared.createMemory(
-            content: memory,
-            visibility: "private",
-            tags: ["apple_notes", "import", "profile"],
-            source: "apple_notes",
-            headline: "Apple Notes Insight"
-          )
-          memoriesSaved += 1
-        } catch {
-          log("AppleNotesReaderService: Failed to save memory: \(error)")
-        }
-      }
-
-      return (memoriesSaved, profileSummary)
-    } catch {
-      log("AppleNotesReaderService: Synthesis failed: \(error)")
-      return (0, "")
-    }
+    log("AppleNotesReaderService: synthesis skipped — agent bridge removed in local-first build")
+    return (0, "")
   }
 
   func saveAsMemories(notes: [AppleNoteRecord], limit: Int? = nil) async -> (saved: Int, failed: Int) {

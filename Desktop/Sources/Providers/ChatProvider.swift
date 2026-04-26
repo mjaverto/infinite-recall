@@ -507,30 +507,14 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     /// When true, user can create multiple chat sessions
     @AppStorage("multiChatEnabled") var multiChatEnabled = false
 
-    // MARK: - Bridge
-    // NOTE: initialized lazily so it reads the persisted bridgeMode from UserDefaults,
-    // not always defaulting to Omi mode on cold start.
+    // MARK: - Bridge (legacy surface — agent bridge removed in local-first fork)
     //
-    // Default harness: piMono (Omi AI via the bundled pi-mono subprocess, authenticated
-    // with the user's Firebase ID token). Claude Code remains as an opt-in harness that
-    // uses the user's own Claude OAuth.
-    private lazy var agentBridge: AgentBridge = {
-        let mode = UserDefaults.standard.string(forKey: "chatBridgeMode") ?? BridgeMode.piMono.rawValue
-        let harness = mode == BridgeMode.piMono.rawValue ? "piMono" : "acp"
-        activeBridgeHarness = harness
-        return AgentBridge(harnessMode: harness)
-    }()
-    private var agentBridgeStarted = false
-    /// Tracks the harness mode the bridge is actually running (NOT the @AppStorage preference).
-    /// @AppStorage("chatBridgeMode") can be updated by other views sharing the same key,
-    /// so comparing against it in switchBridgeMode() would always match → no-op.
-    private var activeBridgeHarness: String = "piMono"
-    /// True while switchBridgeMode is in the critical section between stopping the old
-    /// bridge and starting the new one.  sendMessage checks this to avoid racing.
-    private var modeSwitchInProgress = false
-    /// Continuations for callers waiting on an in-flight mode switch. Supports
-    /// arbitrary overlap (A→B→A→B) without losing waiters.
-    private var modeSwitchWaiters: [CheckedContinuation<Void, Never>] = []
+    // Infinite Recall fork: the Node.js agent bridge subprocess that powered chat
+    // (piMono via Omi backend / Claude Code OAuth) has been deleted. Chat now goes
+    // through LocalLLMClient → mlx-lm directly. The properties below are retained
+    // as no-op stubs so existing UI bindings (Settings page, ChatPage sheets,
+    // BrowserExtensionSetup, etc.) continue to compile until that surface is
+    // refactored.
 
     enum BridgeMode: String {
         case omiAI = "agentSDK"     // Legacy, auto-migrated to piMono
@@ -539,20 +523,19 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     }
     @AppStorage("chatBridgeMode") var bridgeMode: String = BridgeMode.piMono.rawValue
 
-    /// Whether the agent bridge requires authentication (shown as sheet in UI)
+    /// Whether the agent bridge requires authentication (shown as sheet in UI). Always false in the local-first fork.
     @Published var isClaudeAuthRequired = false
-    /// Auth methods returned by agent bridge
+    /// Auth methods previously returned by agent bridge.
     @Published var claudeAuthMethods: [[String: Any]] = []
-    /// OAuth URL to open in browser (sent by bridge when auth is needed)
+    /// OAuth URL previously sent by bridge when auth was needed.
     @Published var claudeAuthUrl: String?
-    /// Whether the user has a cached Claude OAuth token
+    /// Whether the user has a cached Claude OAuth token. Always false now.
     @Published var isClaudeConnected = false
-    /// Cumulative tokens used in the current session via Omi account
+    /// Cumulative tokens used in the current session via Omi account (legacy).
     @Published var sessionTokensUsed: Int = 0
-    /// Cumulative USD cost spent using the Omi account, persisted across sessions.
-    /// Used to enforce the $50 threshold for auto-switching to the user's Claude account.
+    /// Cumulative USD cost spent using the Omi account (legacy, never updated now).
     @AppStorage("omiAICumulativeCostUsd") var omiAICumulativeCostUsd: Double = 0.0
-    /// Set to true when the $50 Omi account usage threshold is reached, triggering an alert.
+    /// Set to true when the $50 Omi account usage threshold was reached (legacy).
     @Published var showOmiThresholdAlert = false
 
     private let messagesPageSize = 50
@@ -677,37 +660,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 }
             }
 
-        // After the system wakes from sleep, the ACP bridge's internal state is
-        // stale — auth tokens expired, pipes half-dead, session context rotted.
-        // First query after wake often hangs because the bridge silently drops
-        // "stray turn_end" messages and the Swift waitForMessage() sits on an
-        // unbounded await forever. Preemptively restart the bridge on wake so
-        // the next query starts with a fresh subprocess. Skipped if a query is
-        // actively running (rare for user to wake mid-query).
-        systemWakeObserver = NSWorkspace.shared.notificationCenter
-            .publisher(for: NSWorkspace.didWakeNotification)
-            .sink { [weak self] _ in
-                Task { @MainActor in
-                    guard let self = self else { return }
-                    guard self.agentBridgeStarted else { return }
-                    guard !self.isSending else {
-                        log("ChatProvider: system woke but query in progress — skipping bridge restart")
-                        return
-                    }
-                    guard !self.modeSwitchInProgress else {
-                        log("ChatProvider: system woke but mode switch in progress — skipping bridge restart")
-                        return
-                    }
-                    log("ChatProvider: system woke — restarting agent bridge to clear stale session")
-                    self.agentBridgeStarted = false
-                    do {
-                        try await self.agentBridge.restart()
-                        self.agentBridgeStarted = true
-                    } catch {
-                        logError("ChatProvider: bridge restart after wake failed", error: error)
-                    }
-                }
-            }
+        // System-wake bridge restart was removed with agent bridge in the local-first fork.
 
         // Cmd+R: refresh messages on demand
         refreshAllObserver = NotificationCenter.default.publisher(for: .refreshAllData)
@@ -717,33 +670,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 }
             }
 
-        // Observe changes to Playwright extension mode setting — restart bridge to pick up new env vars
-        playwrightExtensionObserver = UserDefaults.standard.publisher(for: \.playwrightUseExtension)
-            .dropFirst()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                Task { @MainActor in
-                    guard let self = self else { return }
-                    guard !self.isSending else {
-                        log("ChatProvider: Skipping bridge restart — query in progress")
-                        return
-                    }
-                    guard !self.modeSwitchInProgress else {
-                        log("ChatProvider: Playwright setting changed but mode switch in progress — skipping bridge restart")
-                        return
-                    }
-                    guard self.agentBridgeStarted else { return }
-                    log("ChatProvider: Playwright extension setting changed, restarting agent bridge")
-                    self.agentBridgeStarted = false
-                    do {
-                        try await self.agentBridge.restart()
-                        self.agentBridgeStarted = true
-                        log("ChatProvider: agent bridge restarted with new Playwright settings")
-                    } catch {
-                        logError("Failed to restart agent bridge after Playwright setting change", error: error)
-                    }
-                }
-            }
+        // Playwright-extension bridge-restart observer removed with agent bridge in the local-first fork.
 
         // Keep groupedSessions in sync — runs off the hot path so SwiftUI body never recomputes it
         sessionGroupingObserver = Publishers.CombineLatest3($sessions, $searchQuery, $currentSession)
@@ -753,16 +680,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
                 self.groupedSessions = self.computeGroupedSessions()
             }
 
-        // Kill agent bridge subprocess on app quit to prevent orphaned Node.js processes
-        terminationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.agentBridge.stop()
-            }
-        }
+        // agent bridge subprocess termination observer removed with the bridge.
     }
 
     private var terminationObserver: NSObjectProtocol?
@@ -770,7 +688,7 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     /// Pre-start the active bridge so the first query doesn't wait for process launch.
     ///
     /// Infinite Recall fork: the Node.js agent bridge is intentionally stubbed
-    /// (AgentBridge.start unconditionally throws — it used to call api.omi.me).
+    /// (agent bridge.start unconditionally throws — it used to call api.omi.me).
     /// Chat now goes through LocalLLMClient directly to mlx-lm. Warm-up the
     /// prompt context for that path, but DO NOT call ensureBridgeStarted —
     /// it would set errorMessage to "AI components missing" on every launch
@@ -780,116 +698,18 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     }
 
     /// Drop a cached ACP session so the next query recreates it with fresh prompt context.
+    /// No-op in the local-first fork — agent bridge has been removed.
     func invalidateAgentSession(sessionKey: String) async {
-        guard agentBridgeStarted else { return }
-        await agentBridge.invalidateSession(sessionKey: sessionKey)
+        // intentional no-op
     }
 
     /// Test that the Playwright Chrome extension is connected and working.
-    /// Ensures the bridge is started (restarting if needed to pick up new token),
-    /// then sends a lightweight test query that triggers a browser_snapshot tool call.
+    /// No-op in the local-first fork — the bridge that hosted the test was removed.
     func testPlaywrightConnection() async throws -> Bool {
-        // Don't restart bridge during a mode switch — caller should retry after switch completes
-        guard !modeSwitchInProgress else {
-            log("ChatProvider: testPlaywrightConnection skipped — mode switch in progress")
-            return false
-        }
-        // Restart bridge to pick up new extension token
-        agentBridgeStarted = false
-        do {
-            try await agentBridge.restart()
-            agentBridgeStarted = true
-        } catch {
-            try await agentBridge.start()
-            agentBridgeStarted = true
-        }
-        return try await agentBridge.testPlaywrightConnection()
-    }
-
-    /// Whether we're currently in user's Claude account mode
-    private var isUserClaudeMode: Bool {
-        bridgeMode == BridgeMode.userClaude.rawValue
-    }
-
-    /// Ensure the agent bridge is started (restarts if the process died).
-    /// - Parameter fromModeSwitch: true when called from within switchBridgeMode,
-    ///   which already holds modeSwitchInProgress. External callers (sendMessage)
-    ///   pass false (the default) and will wait for any in-flight switch.
-    private func ensureBridgeStarted(fromModeSwitch: Bool = false) async -> Bool {
-        // Infinite Recall fork: the Node.js agent bridge is intentionally stubbed
-        // out (AgentBridge.start unconditionally throws — it used to call
-        // api.omi.me). The home-screen chat path uses LocalLLMClient directly
-        // and never enters this function. Remaining callers (switchBridgeMode,
-        // labRunQuestion) treat a `false` return as "bridge unavailable" and
-        // degrade gracefully. Short-circuit here so we don't set errorMessage
-        // (which surfaces as a permanent banner on the home chat).
         return false
     }
 
-    /// Stale bridge-start path retained only to keep the upstream Omi diff small.
-    /// Never reached — gated by the early `return false` above.
-    @available(*, deprecated, message: "Bridge is stubbed in Infinite Recall fork")
-    private func ensureBridgeStarted_legacy(fromModeSwitch: Bool = false) async -> Bool {
-        while !fromModeSwitch && modeSwitchInProgress {
-            log("ChatProvider: ensureBridgeStarted waiting for mode switch to complete")
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-                modeSwitchWaiters.append(c)
-            }
-        }
-        if agentBridgeStarted {
-            let alive = await agentBridge.isAlive
-            if !alive {
-                log("ChatProvider: agent bridge process died, will restart")
-                agentBridgeStarted = false
-            }
-        }
-        guard !agentBridgeStarted else { return true }
-        // Wait for API keys (Firebase, Calendar) before starting the bridge.
-        await APIKeyService.shared.waitForKeys()
-        do {
-            await preparePromptContextIfNeeded()
-            try await agentBridge.start()
-            agentBridgeStarted = true
-            log("ChatProvider: agent bridge started successfully")
-            // Set up global auth handlers so auth_required during warmup is handled
-            await agentBridge.setGlobalAuthHandlers(
-                onAuthRequired: { [weak self] methods, authUrl in
-                    Task { @MainActor [weak self] in
-                        self?.claudeAuthMethods = methods
-                        self?.claudeAuthUrl = authUrl
-                        self?.isClaudeAuthRequired = true
-                    }
-                },
-                onAuthSuccess: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        self?.isClaudeAuthRequired = false
-                        self?.checkClaudeConnectionStatus()
-                    }
-                }
-            )
-            // Pre-warm ACP sessions with their respective system prompts.
-            // This is the only place the system prompt is built and applied.
-            let mainSystemPrompt = buildSystemPrompt(contextString: formatMemoriesSection())
-            let floatingSystemPrompt = Self.floatingBarSystemPromptPrefix + "\n\n" + mainSystemPrompt
-            let floatingModel = ShortcutSettings.shared.selectedModel.isEmpty
-                ? ModelQoS.Claude.defaultSelection
-                : ShortcutSettings.shared.selectedModel
-            cachedMainSystemPrompt = mainSystemPrompt
-            await agentBridge.warmupSession(cwd: workingDirectory, sessions: [
-                .init(key: "main", model: ModelQoS.Claude.chat, systemPrompt: mainSystemPrompt),
-                .init(key: "floating", model: floatingModel, systemPrompt: floatingSystemPrompt)
-            ])
-            return true
-        } catch {
-            logError("Failed to start agent bridge", error: error)
-            let rawError = String(describing: error)
-            AnalyticsManager.shared.chatAgentError(error: "AI not available: bridge failed to start", rawError: rawError)
-            errorMessage = "AI not available: \(error.localizedDescription)"
-            return false
-        }
-    }
-
-    /// Ensures all prompt-backed local context is loaded before we build and cache the ACP session prompt.
+    /// Ensures all prompt-backed local context is loaded before we build the system prompt.
     private func preparePromptContextIfNeeded() async {
         await loadMemoriesIfNeeded()
         await loadGoalsIfNeeded()
@@ -898,157 +718,27 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         await loadSchemaIfNeeded()
     }
 
-    /// Switch between bridge modes (Omi AI via piMono, or user's Claude OAuth)
+    /// Switch between bridge modes. Stub in the local-first fork — no bridge to switch.
+    /// We still update `bridgeMode` so the @AppStorage-backed Settings UI reflects user intent.
     func switchBridgeMode(to mode: BridgeMode) async {
-        // Normalize legacy omiAI to piMono
         let resolvedMode: BridgeMode = (mode == .omiAI) ? .piMono : mode
-        let newHarness = resolvedMode == .piMono ? "piMono" : "acp"
-        let previousHarness = activeBridgeHarness
-        // Compare against the actual running harness, NOT @AppStorage (which may
-        // already reflect the new value because another view wrote the same key).
-        guard newHarness != previousHarness else { return }
-
-        // Serialize overlapping switches. The SettingsPage picker fires onChange
-        // in a new Task on each toggle, so rapid A→B→A→B can overlap multiple calls.
-        // Without serialization, overlapping calls could overwrite agentBridge and
-        // leak intermediate bridge processes. Loop re-checks after waking because
-        // another waiter may have started a new switch before this one resumes.
-        while modeSwitchInProgress {
-            log("ChatProvider: switchBridgeMode waiting for in-flight switch to finish")
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-                modeSwitchWaiters.append(c)
-            }
-        }
-
-        // Re-check after waiting — the in-flight switch may have already reached
-        // the same target mode we wanted.
-        guard newHarness != activeBridgeHarness else { return }
-
-        log("ChatProvider: Switching bridge mode from \(activeBridgeHarness) to \(resolvedMode.rawValue)")
-
-        // Update activeBridgeHarness immediately so a rapid second flip (e.g. user
-        // toggles back before the first switch finishes) sees the correct target
-        // mode in the guard above and doesn't no-op incorrectly.
-        activeBridgeHarness = newHarness
-
-        // Block queries during the transition so sendMessage doesn't race and
-        // restart the OLD bridge while we're replacing it.
-        modeSwitchInProgress = true
-
-        // Stop the current bridge and wait for the subprocess to fully terminate.
-        // This is critical: without the wait, the old Node.js process can still be
-        // alive when the new one starts, causing log confusion and session reuse.
-        await agentBridge.stopAndWaitForExit()
-        agentBridgeStarted = false
-
-        // Switch mode and recreate bridge
         bridgeMode = resolvedMode.rawValue
-        agentBridge = AgentBridge(harnessMode: newHarness)
-        AnalyticsManager.shared.chatBridgeModeChanged(from: previousHarness, to: resolvedMode.rawValue)
-
-        // Check Claude connection status when switching to user's Claude account
-        if mode == .userClaude {
-            checkClaudeConnectionStatus()
-        }
-
-        // Warm up the new bridge. Keep modeSwitchInProgress = true so external
-        // callers (sendMessage) block until warmup completes. Pass fromModeSwitch
-        // so ensureBridgeStarted skips its own mode-switch wait.
-        let started = await ensureBridgeStarted(fromModeSwitch: true)
-        log("ChatProvider: Bridge mode switch complete — \(resolvedMode.rawValue) started=\(started)")
-
-        // Unblock queries and wake all waiting switches now that the bridge
-        // is fully started and warmed.
-        modeSwitchInProgress = false
-        let waiters = modeSwitchWaiters
-        modeSwitchWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
+        log("ChatProvider: switchBridgeMode → \(resolvedMode.rawValue) (no-op — agent bridge removed)")
     }
 
-    /// Start Claude OAuth authentication (Mode B)
-    /// Opens the OAuth URL (provided by the bridge) in the default browser.
-    /// The bridge handles the full OAuth flow: local callback server, token exchange,
-    /// credential storage, and ACP subprocess restart.
+    /// Start Claude OAuth authentication. No-op in the local-first fork.
     func startClaudeAuth() {
-        guard isUserClaudeMode else { return }
-
-        if let urlString = claudeAuthUrl, let url = URL(string: urlString) {
-            log("ChatProvider: Opening Claude OAuth URL in browser")
-            NSWorkspace.shared.open(url)
-        } else {
-            logError("ChatProvider: No auth URL available from bridge")
-            isClaudeAuthRequired = false
-        }
+        isClaudeAuthRequired = false
     }
 
-    /// Check whether a cached Claude OAuth token exists (config file or Keychain)
+    /// Check whether a cached Claude OAuth token exists. Always reports disconnected.
     func checkClaudeConnectionStatus() {
-        // Check config file
-        let configPath = NSString(string: "~/Library/Application Support/Claude/config.json").expandingTildeInPath
-        if FileManager.default.fileExists(atPath: configPath),
-           let data = FileManager.default.contents(atPath: configPath),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let tokenCache = json["oauth:tokenCache"] as? String, !tokenCache.isEmpty {
-            isClaudeConnected = true
-            return
-        }
-
-        // Check Keychain via security CLI (Keychain item owned by Claude Desktop)
-        let secProcess = Process()
-        secProcess.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        secProcess.arguments = ["find-generic-password", "-s", "Claude Code-credentials"]
-        secProcess.standardOutput = FileHandle.nullDevice
-        secProcess.standardError = FileHandle.nullDevice
-        do {
-            try secProcess.run()
-            secProcess.waitUntilExit()
-            isClaudeConnected = (secProcess.terminationStatus == 0)
-        } catch {
-            isClaudeConnected = false
-        }
+        isClaudeConnected = false
     }
 
-    /// Disconnect from Claude: clear OAuth token, switch back to free mode via serialized path
+    /// Disconnect from Claude. No-op in the local-first fork.
     func disconnectClaude() async {
-        log("ChatProvider: Disconnecting Claude account")
-
-        // 1. Clear the OAuth token from config file
-        let configPath = NSString(string: "~/Library/Application Support/Claude/config.json").expandingTildeInPath
-        if let data = FileManager.default.contents(atPath: configPath),
-           var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            json.removeValue(forKey: "oauth:tokenCache")
-            if let updatedData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
-                try? updatedData.write(to: URL(fileURLWithPath: configPath))
-            }
-        }
-
-        // 2. Clear OAuth credentials from macOS Keychain
-        //    The Keychain item is owned by Claude Desktop/CLI, so SecItemDelete fails
-        //    with errSecInvalidOwnerEdit. Use the `security` CLI which runs as the user.
-        let secProcess = Process()
-        secProcess.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        secProcess.arguments = ["delete-generic-password", "-s", "Claude Code-credentials"]
-        secProcess.standardOutput = FileHandle.nullDevice
-        secProcess.standardError = FileHandle.nullDevice
-        do {
-            try secProcess.run()
-            secProcess.waitUntilExit()
-            if secProcess.terminationStatus == 0 {
-                log("ChatProvider: Cleared Claude Code credentials from Keychain")
-            } else {
-                log("ChatProvider: No Claude Code credentials found in Keychain (status=\(secProcess.terminationStatus))")
-            }
-        } catch {
-            log("ChatProvider: Failed to run security command: \(error.localizedDescription)")
-        }
-
-        // 3. Update state
         isClaudeConnected = false
-
-        // 4. Switch back to piMono through the serialized switchBridgeMode path
-        //    so all bridge lifecycle state (activeBridgeHarness, modeSwitchInProgress,
-        //    waiters) stays consistent.
-        await switchBridgeMode(to: .piMono)
     }
 
     // MARK: - Session Management
@@ -1749,34 +1439,9 @@ A screenshot may be attached — use it silently only if relevant. Never mention
     }
 
     /// Run a single question through the agent bridge for Chat Lab evaluation.
-    /// Uses a unique session key so it doesn't interfere with the real chat.
+    /// Disabled in the local-first fork — agent bridge has been removed.
     func labRunQuestion(question: String, systemPrompt: String, sessionKey: String) async -> String {
-        // Ensure bridge is running
-        guard await ensureBridgeStarted() else {
-            return "[Bridge not available]"
-        }
-
-        do {
-            let result = try await agentBridge.query(
-                prompt: question,
-                systemPrompt: systemPrompt,
-                sessionKey: sessionKey,
-                model: ModelQoS.Claude.chatLabQuery,
-                onTextDelta: { _ in },
-                onToolCall: { callId, name, input in
-                    let toolCall = ToolCall(name: name, arguments: input, thoughtSignature: nil)
-                    let result = await ChatToolExecutor.execute(toolCall)
-                    log("ChatLab: tool \(name) executed")
-                    return result
-                },
-                onToolActivity: { _, _, _, _ in },
-                onThinkingDelta: { _ in }
-            )
-            return result.text
-        } catch {
-            log("ChatLab: query error: \(error)")
-            return "[Error: \(error.localizedDescription)]"
-        }
+        return "[ChatLab disabled — agent bridge removed in local-first build]"
     }
 
     /// Formats the last 10 non-empty messages in the current session as a conversation history string.
@@ -2175,25 +1840,20 @@ A screenshot may be attached — use it silently only if relevant. Never mention
         isStopping = true
         sendGeneration += 1
         let myGen = sendGeneration
+        // agent bridge.interrupt() removed with the bridge in the local-first fork.
+        // The local-LLM send path observes `isStopping` and ends its own stream.
+        // Keep the watchdog so isSending always clears even if the local path
+        // somehow doesn't notice the stop.
         Task {
-            await agentBridge.interrupt()
-            // Normal path: interrupt → bridge emits final result or .stopped →
-            // sendMessage's do/catch resets isSending via its finally (line 2631).
-            // Fallback: if the bridge drops the turn_end as "stray" (known
-            // sleep/wake flake — see PR where this watchdog was added), the
-            // for-await in sendMessage hangs forever and isSending stays true.
-            // After a short grace, force-release so the user's next query isn't
-            // silently swallowed by the guard at sendMessage:start.
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             await MainActor.run {
                 if self.isSending && self.sendGeneration == myGen {
-                    log("ChatProvider: interrupt didn't close stream in 3s — force-resetting isSending")
+                    log("ChatProvider: stop watchdog firing — force-resetting isSending")
                     self.isSending = false
                     self.isStopping = false
                 }
             }
         }
-        // Result flows back normally through the bridge with partial text
     }
 
     /// Send a follow-up message while the agent is still running.
@@ -2234,12 +1894,11 @@ A screenshot may be attached — use it silently only if relevant. Never mention
             }
         }
 
-        // Queue the follow-up and interrupt the current query.
-        // When sendMessage finishes (due to the interrupt), it checks
-        // pendingFollowUpText and chains a new full query automatically.
+        // Queue the follow-up. agent bridge.interrupt() was removed with the bridge;
+        // the local-LLM send path watches `isStopping` to end its own stream.
         pendingFollowUpText = trimmedText
-        await agentBridge.interrupt()
-        log("ChatProvider: follow-up queued, interrupt sent")
+        isStopping = true
+        log("ChatProvider: follow-up queued (local-first build — no bridge interrupt)")
     }
 
     @discardableResult

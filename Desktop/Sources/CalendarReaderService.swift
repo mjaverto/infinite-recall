@@ -126,157 +126,16 @@ actor CalendarReaderService {
   }
 
   /// Synthesize profile memories and tasks from calendar events.
-  /// Uses local LLM (AgentBridge) to extract ~10 memories and 2-3 tasks.
+  ///
+  /// Infinite Recall fork: previously used agent bridge (Node.js Claude SDK
+  /// harness) for synthesis. That runtime has been deleted. Returns empty
+  /// until a local-LLM synthesis path replaces it.
   func synthesizeFromEvents(events: [CalendarEvent]) async -> (
     memories: Int, tasks: Int, profileSummary: String
   ) {
     guard !events.isEmpty else { return (0, 0, "") }
-
-    // Format events compactly for the LLM
-    var eventLines: [String] = []
-    for event in events {
-      var parts = ["[\(event.startTime)] \(event.summary)"]
-      if !event.attendees.isEmpty {
-        parts.append("With: \(event.attendees.prefix(5).joined(separator: ", "))")
-      }
-      if !event.location.isEmpty {
-        parts.append("Location: \(event.location)")
-      }
-      if !event.description.isEmpty {
-        let desc = String(event.description.prefix(150))
-        parts.append("Notes: \(desc)")
-      }
-      eventLines.append(parts.joined(separator: " | "))
-    }
-    let eventsText = eventLines.joined(separator: "\n")
-
-    let today = ISO8601DateFormatter().string(from: Date()).prefix(10)
-    let synthesisPrompt = """
-      Analyze these \(events.count) Google Calendar events and extract profile information about the user.
-
-      CALENDAR EVENTS:
-      \(eventsText)
-
-      Today's date: \(today)
-
-      Respond ONLY with valid JSON (no markdown, no code fences):
-      {
-        "memories": [
-          "factual statement about the user based on calendar patterns"
-        ],
-        "tasks": [
-          {"description": "actionable item based on upcoming events", "priority": "high", "due_at": "2026-03-20T09:00:00Z"}
-        ],
-        "profile": "2-3 sentence summary of who this user is based on their calendar"
-      }
-
-      RULES:
-      - Extract 10-15 memories (facts about their role, recurring meetings, relationships, routines, interests, work schedule, hobbies, social life)
-      - Extract 3-5 tasks (upcoming preparation, follow-ups, deadlines from future events)
-      - Focus on PATTERNS (weekly standups, regular gym, recurring 1-on-1s) not one-off events
-      - Each memory should be a single clear factual statement in third person ("The user...")
-      - Tasks should only reference FUTURE events with ISO date in due_at
-      - Task priorities: "high", "medium", or "low"
-      - Profile should summarize professional identity and schedule patterns
-      - Do NOT include raw event details — synthesize and generalize
-      - Do NOT include sensitive medical or financial details
-      """
-
-    do {
-      let bridge = AgentBridge(harnessMode: "piMono")
-      try await bridge.start()
-      defer { Task { await bridge.stop() } }
-
-      let result = try await bridge.query(
-        prompt: synthesisPrompt,
-        systemPrompt:
-          "You are a profile extraction assistant. Analyze calendar events and output structured JSON. Be concise and factual.",
-        model: ModelQoS.Claude.synthesis,
-        onTextDelta: { @Sendable _ in },
-        onToolCall: { @Sendable _, _, _ in return "" },
-        onToolActivity: { @Sendable _, _, _, _ in }
-      )
-
-      var responseText = result.text
-      log(
-        "CalendarReaderService: Synthesis raw response (\(responseText.count) chars): \(responseText.prefix(300))"
-      )
-
-      // Extract JSON from response — handle markdown code fences and leading text
-      if let jsonStart = responseText.range(of: "```json") {
-        responseText = String(responseText[jsonStart.upperBound...])
-        if let jsonEnd = responseText.range(of: "```") {
-          responseText = String(responseText[..<jsonEnd.lowerBound])
-        }
-      } else if let jsonStart = responseText.range(of: "```") {
-        responseText = String(responseText[jsonStart.upperBound...])
-        if let jsonEnd = responseText.range(of: "```") {
-          responseText = String(responseText[..<jsonEnd.lowerBound])
-        }
-      }
-      // Also try finding raw JSON object if there's leading text
-      if let braceStart = responseText.firstIndex(of: "{") {
-        responseText = String(responseText[braceStart...])
-      }
-      responseText = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
-
-      guard let jsonData = responseText.data(using: .utf8),
-        let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
-      else {
-        log(
-          "CalendarReaderService: Failed to parse synthesis response: \(responseText.prefix(200))")
-        return (0, 0, "")
-      }
-
-      let memoryStrings = parsed["memories"] as? [String] ?? []
-      let taskDicts = parsed["tasks"] as? [[String: Any]] ?? []
-      let profileSummary = parsed["profile"] as? String ?? ""
-
-      // Save memories
-      var memoriesSaved = 0
-      for memory in memoryStrings {
-        do {
-          _ = try await APIClient.shared.createMemory(
-            content: memory,
-            visibility: "private",
-            tags: ["calendar", "onboarding", "profile"],
-            source: "google_calendar",
-            headline: "Calendar Profile Insight"
-          )
-          memoriesSaved += 1
-        } catch {
-          log("CalendarReaderService: Failed to save memory: \(error)")
-        }
-      }
-
-      // Save tasks
-      var tasksSaved = 0
-      for taskDict in taskDicts {
-        guard let description = taskDict["description"] as? String else { continue }
-        let priority = taskDict["priority"] as? String ?? "medium"
-        let dueAtStr = taskDict["due_at"] as? String
-        var dueAt: Date? = nil
-        if let dueAtStr = dueAtStr {
-          dueAt = ISO8601DateFormatter().date(from: dueAtStr)
-        }
-        let task = await TasksStore.shared.createTask(
-          description: description,
-          dueAt: dueAt,
-          priority: priority,
-          tags: ["calendar", "onboarding"]
-        )
-        if task != nil { tasksSaved += 1 }
-      }
-
-      log(
-        "CalendarReaderService: Synthesis complete — \(memoriesSaved) memories, \(tasksSaved) tasks, profile: \(profileSummary.prefix(80))"
-      )
-      return (memoriesSaved, tasksSaved, profileSummary)
-
-    } catch {
-      log("CalendarReaderService: Synthesis failed: \(error)")
-      return (0, 0, "")
-    }
+    log("CalendarReaderService: synthesis skipped — agent bridge removed in local-first build")
+    return (0, 0, "")
   }
 
   func saveAsMemories(events: [CalendarEvent], limit: Int? = nil) async -> (saved: Int, failed: Int)

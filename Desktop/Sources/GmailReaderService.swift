@@ -212,137 +212,15 @@ actor GmailReaderService {
   }
 
   /// Synthesize profile memories and tasks from a batch of emails.
-  /// Uses an LLM call to extract ~10 memories and 2-3 tasks.
+  ///
+  /// Infinite Recall fork: previously used agent bridge for synthesis. Returns
+  /// empty until a local-LLM synthesis path replaces it.
   func synthesizeFromEmails(emails: [GmailEmail]) async -> (
     memories: Int, tasks: Int, profileSummary: String
   ) {
     guard !emails.isEmpty else { return (0, 0, "") }
-
-    // Format emails compactly for the LLM
-    var emailLines: [String] = []
-    let dateFormatter = DateFormatter()
-    dateFormatter.dateFormat = "MMM d"
-    for email in emails {
-      let date = dateFormatter.string(from: email.date)
-      let sender =
-        email.from.components(separatedBy: "<").first?.trimmingCharacters(in: .whitespaces)
-        ?? email.from
-      emailLines.append("[\(date)] From: \(sender) | Subject: \(email.subject) | \(email.snippet)")
-    }
-    let emailText = emailLines.joined(separator: "\n")
-
-    let synthesisPrompt = """
-      Analyze these \(emails.count) recent emails and extract profile information about the user.
-
-      EMAILS:
-      \(emailText)
-
-      Respond ONLY with valid JSON (no markdown, no code fences, no backticks):
-      {
-        "memories": [
-          "factual statement about the user based on email patterns"
-        ],
-        "tasks": [
-          {"description": "actionable follow-up item", "priority": "high"}
-        ],
-        "profile": "2-3 sentence summary of who this user is"
-      }
-
-      RULES:
-      - Extract exactly 10 memories (facts about their role, company, projects, relationships, interests, tools, communication patterns)
-      - Extract 2-3 tasks (pending replies, upcoming deadlines, things to follow up on)
-      - Each memory should be a single clear factual statement
-      - Task priorities: "high", "medium", or "low"
-      - Profile should summarize professional identity and key interests
-      - Do NOT include raw email content — synthesize and generalize
-      - Output ONLY the JSON object, nothing else
-      """
-
-    do {
-      let bridge = AgentBridge(harnessMode: "piMono")
-      try await bridge.start()
-      defer { Task { await bridge.stop() } }
-
-      let result = try await bridge.query(
-        prompt: synthesisPrompt,
-        systemPrompt:
-          "You are a profile extraction assistant. Output ONLY valid JSON. No markdown, no code fences, no explanation.",
-        model: ModelQoS.Claude.synthesis,
-        onTextDelta: { @Sendable _ in },
-        onToolCall: { @Sendable _, _, _ in return "" },
-        onToolActivity: { @Sendable _, _, _, _ in }
-      )
-
-      var responseText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-      log("GmailReaderService: Synthesis response length: \(responseText.count) chars")
-
-      // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
-      if responseText.hasPrefix("```") {
-        // Remove opening fence (```json or ```)
-        if let firstNewline = responseText.firstIndex(of: "\n") {
-          responseText = String(responseText[responseText.index(after: firstNewline)...])
-        }
-        // Remove closing fence
-        if responseText.hasSuffix("```") {
-          responseText = String(responseText.dropLast(3)).trimmingCharacters(
-            in: .whitespacesAndNewlines)
-        }
-      }
-
-      // Parse the JSON response
-      guard let jsonData = responseText.data(using: .utf8),
-        let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
-      else {
-        log("GmailReaderService: Failed to parse synthesis response: \(responseText.prefix(500))")
-        return (0, 0, "")
-      }
-
-      let memoryStrings = parsed["memories"] as? [String] ?? []
-      let taskDicts = parsed["tasks"] as? [[String: Any]] ?? []
-      let profileSummary = parsed["profile"] as? String ?? ""
-
-      log("GmailReaderService: Parsed \(memoryStrings.count) memories, \(taskDicts.count) tasks")
-
-      // Save memories
-      var memoriesSaved = 0
-      for memory in memoryStrings {
-        do {
-          _ = try await APIClient.shared.createMemory(
-            content: memory,
-            visibility: "private",
-            tags: ["gmail", "onboarding", "profile"],
-            source: "gmail",
-            headline: "Email Profile Insight"
-          )
-          memoriesSaved += 1
-        } catch {
-          log("GmailReaderService: Failed to save synthesized memory: \(error)")
-        }
-      }
-
-      // Save tasks
-      var tasksSaved = 0
-      for taskDict in taskDicts {
-        guard let description = taskDict["description"] as? String else { continue }
-        let priority = taskDict["priority"] as? String ?? "medium"
-        let task = await TasksStore.shared.createTask(
-          description: description,
-          dueAt: nil,
-          priority: priority,
-          tags: ["gmail", "onboarding"]
-        )
-        if task != nil { tasksSaved += 1 }
-      }
-
-      log(
-        "GmailReaderService: Synthesis complete — \(memoriesSaved) memories, \(tasksSaved) tasks"
-      )
-      return (memoriesSaved, tasksSaved, profileSummary)
-
-    } catch {
-      log("GmailReaderService: Synthesis failed: \(error)")
-      return (0, 0, "")
-    }
+    log("GmailReaderService: synthesis skipped — agent bridge removed in local-first build")
+    return (0, 0, "")
   }
 
   /// Save fetched emails as memories via the OMI backend API.

@@ -114,8 +114,7 @@ struct OnboardingChatView: View {
   @State private var pendingPermissionType: String? = nil  // e.g. "microphone" — waiting for user to grant
   @FocusState private var isInputFocused: Bool
 
-  // Parallel exploration state
-  @State private var explorationBridge: AgentBridge?
+  // Parallel exploration state — disabled in local-first fork (agent bridge removed)
   @State private var explorationRunning = false
   @State private var explorationCompleted = false
   @State private var explorationText = ""
@@ -1288,13 +1287,9 @@ struct OnboardingChatView: View {
     permissionHelpTimer?.cancel()
     permissionHelpTimer = nil
 
-    // Clean up parallel exploration
+    // Clean up parallel exploration (agent bridge removed in local-first fork)
     explorationTask?.cancel()
     explorationTask = nil
-    if let bridge = explorationBridge {
-      Task { await bridge.stop() }
-    }
-    explorationBridge = nil
 
     // Clean up Gmail reading
     gmailReadingTask?.cancel()
@@ -1361,87 +1356,13 @@ struct OnboardingChatView: View {
   }
 
   private func startExploration(fileCount: Int, graphViewModel: MemoryGraphViewModel?) {
-    guard !explorationRunning else { return }
-    explorationRunning = true
-    log("OnboardingChat: Starting parallel exploration (\(fileCount) files indexed)")
-    AnalyticsManager.shared.onboardingChatToolUsed(
-      tool: "exploration_started", properties: ["file_count": fileCount])
-
-    explorationTask = Task {
-      do {
-        let bridge = AgentBridge(harnessMode: "piMono")
-        await MainActor.run { explorationBridge = bridge }
-        try await bridge.start()
-
-        let userName =
-          AuthService.shared.displayName.isEmpty ? "User" : AuthService.shared.displayName
-        let schema = await Self.loadDatabaseSchema()
-        let systemPrompt = ChatPromptBuilder.buildOnboardingExploration(
-          userName: userName, databaseSchema: schema)
-
-        let result = try await bridge.query(
-          prompt:
-            "Begin exploration. \(fileCount) files have been indexed in the indexed_files table.",
-          systemPrompt: systemPrompt,
-          model: ModelQoS.Claude.chat,
-          onTextDelta: { @Sendable delta in
-            Task { @MainActor in
-              explorationText += delta
-              // Persist partial text periodically (every ~500 chars) so it survives crashes
-              if explorationText.count % 500 < delta.count {
-                OnboardingChatPersistence.saveExplorationState(
-                  text: explorationText, completed: false)
-              }
-            }
-          },
-          onToolCall: { @Sendable _, name, input in
-            let toolCall = ToolCall(name: name, arguments: input, thoughtSignature: nil)
-            let result = await ChatToolExecutor.execute(toolCall)
-            log("OnboardingChat: Exploration tool \(name) executed")
-            return result
-          },
-          onToolActivity: { @Sendable name, status, _, _ in
-            log("OnboardingChat: Exploration tool \(name) \(status)")
-          }
-        )
-
-        log(
-          "OnboardingChat: Exploration completed (cost=$\(String(format: "%.4f", result.costUsd)), tokens=\(result.inputTokens)+\(result.outputTokens))"
-        )
-        AnalyticsManager.shared.onboardingChatToolUsed(
-          tool: "exploration_completed",
-          properties: [
-            "cost_usd": result.costUsd,
-            "input_tokens": result.inputTokens,
-            "output_tokens": result.outputTokens,
-          ])
-
-        let finalText = await MainActor.run {
-          explorationCompleted = true
-          explorationRunning = false
-          return explorationText
-        }
-
-        // Persist so it survives app restarts
-        OnboardingChatPersistence.saveExplorationState(text: finalText, completed: true)
-
-        // Append to user profile and inject discovery card
-        await appendExplorationToProfile()
-        await injectExplorationDiscoveryCard()
-
-        await bridge.stop()
-        await MainActor.run { explorationBridge = nil }
-      } catch {
-        log("OnboardingChat: Exploration failed (non-fatal): \(error.localizedDescription)")
-        if let bridge = await MainActor.run(body: { explorationBridge }) {
-          await bridge.stop()
-        }
-        await MainActor.run {
-          explorationRunning = false
-          explorationBridge = nil
-        }
-      }
-    }
+    // Infinite Recall fork: parallel exploration ran through agent bridge (Node.js
+    // Claude SDK harness). Bridge has been removed; mark exploration as completed
+    // immediately so the onboarding flow doesn't hang waiting on it.
+    guard !explorationRunning && !explorationCompleted else { return }
+    log("OnboardingChat: Exploration skipped — agent bridge removed in local-first build (\(fileCount) files indexed)")
+    explorationCompleted = true
+    OnboardingChatPersistence.saveExplorationState(text: "", completed: true)
   }
 
   /// Load a compact database schema string from sqlite_master for the exploration prompt.

@@ -62,80 +62,11 @@ actor OnboardingMemoryLogImportService {
     let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return (0, "") }
 
-    let importPrompt = """
-      Analyze this exported \(source.displayName) memory log and extract persistent facts about the user.
-
-      MEMORY LOG:
-      \(String(trimmed.prefix(40_000)))
-
-      Respond ONLY with valid JSON (no markdown, no code fences):
-      {
-        "memories": [
-          "clear factual statement about the user"
-        ],
-        "profile": "2-3 sentence summary of what this memory log says about the user"
-      }
-
-      RULES:
-      - Extract 12-18 memories grounded in the provided memory log
-      - Keep only durable, user-specific facts, preferences, relationships, projects, interests, and goals
-      - Deduplicate overlapping memories
-      - Exclude tool details, implementation notes, and meta-instructions
-      - Each memory should be one concise factual statement
-      """
-
-    do {
-      let bridge = AgentBridge(harnessMode: "piMono")
-      try await bridge.start()
-      defer { Task { await bridge.stop() } }
-
-      let result = try await bridge.query(
-        prompt: importPrompt,
-        systemPrompt:
-          "You convert memory-log exports into concise durable user memories. Output only valid JSON.",
-        model: ModelQoS.Claude.synthesis,
-        onTextDelta: { @Sendable _ in },
-        onToolCall: { @Sendable _, _, _ in "" },
-        onToolActivity: { @Sendable _, _, _, _ in }
-      )
-
-      let responseText = Self.extractJSONObject(from: result.text)
-      guard
-        let jsonData = responseText.data(using: .utf8),
-        let parsed = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
-      else {
-        log("OnboardingMemoryLogImportService: Failed to parse \(source.displayName) response")
-        return (0, "")
-      }
-
-      let memoryStrings = (parsed["memories"] as? [String] ?? []).filter {
-        !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      }
-      let profileSummary = parsed["profile"] as? String ?? ""
-
-      var memoriesSaved = 0
-      for memory in memoryStrings {
-        do {
-          _ = try await APIClient.shared.createMemory(
-            content: memory,
-            visibility: "private",
-            tags: source.tags,
-            source: source.memorySource,
-            headline: source.headline
-          )
-          memoriesSaved += 1
-        } catch {
-          log(
-            "OnboardingMemoryLogImportService: Failed saving \(source.displayName) memory: \(error)"
-          )
-        }
-      }
-
-      return (memoriesSaved, profileSummary)
-    } catch {
-      log("OnboardingMemoryLogImportService: \(source.displayName) import failed: \(error)")
-      return (0, "")
-    }
+    // Infinite Recall fork: agent bridge (Node.js synthesis path) was deleted with
+    // the rest of the cloud agent runtime. Memory-log import is now a no-op until
+    // a local-LLM synthesis path replaces it.
+    log("OnboardingMemoryLogImportService: \(source.displayName) import skipped — AI synthesis disabled in local-first build")
+    return (0, "")
   }
 
   private static func extractJSONObject(from text: String) -> String {
