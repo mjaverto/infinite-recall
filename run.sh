@@ -128,6 +128,33 @@ is_truthy() {
     esac
 }
 
+warn_if_daemon_stale() {
+    local installed="$HOME/Library/Application Support/InfiniteRecall/bin/infinite-recall-api"
+    local src_dir="$(dirname "$0")/Backend-Rust"
+    [ -x "$installed" ] || return 0
+    [ -d "$src_dir" ] || return 0
+    local newer
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -type f -newer "$installed" -print 2>/dev/null)
+    [ -n "$newer" ] || return 0
+    {
+        echo ""
+        echo "=========================================="
+        echo "  WARNING: stale launchd daemon detected"
+        echo "=========================================="
+        echo "  IR_SKIP_BACKEND=1 is set, but the installed daemon at"
+        echo "    $installed"
+        echo "  is older than Backend-Rust/ source files. New routes (e.g."
+        echo "  /v1/activity/snapshot) will 404 until you reinstall."
+        echo ""
+        echo "  Newer source files:"
+        printf '%s\n' "$newer" | head -3 | sed 's/^/    /'
+        echo ""
+        echo "  Fix:  ./scripts/setup-api-server.sh --yes"
+        echo "=========================================="
+        echo ""
+    } >&2
+}
+
 make_temp_file() {
     local var_name="$1"
     local template="$2"
@@ -702,6 +729,7 @@ if [ "${IR_SKIP_BACKEND:-0}" != "1" ]; then
     done
 else
     substep "Skipping backend (IR_SKIP_BACKEND=1) — using IR_API_URL from .env"
+    warn_if_daemon_stale
 fi
 
 # ─── Start Python auth service ────────────────────────────────────────
