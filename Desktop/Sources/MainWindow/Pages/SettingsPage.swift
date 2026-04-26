@@ -2032,7 +2032,7 @@ struct SettingsContentView: View {
 
         Divider().overlay(OmiColors.backgroundQuaternary)
 
-        // Power Saving subsection — auto-unload local LLM when idle.
+        // Autonomous Work Mode subsection — keep local AI available while idle.
         powerSavingSubsection
       }
       .sheet(isPresented: $presentingInstallSheet) {
@@ -3028,36 +3028,39 @@ struct SettingsContentView: View {
     }
   }
 
-  // MARK: - Power Saving (idle-unload) subsection
+  // MARK: - Autonomous Work Mode subsection
 
-  /// Embedded inside the Local Model card. Lets the user toggle idle-unload
-  /// of `mlx-lm.server` and pick a timeout. Status line reflects the current
-  /// state of `IdleAIController`.
+  /// Embedded inside the Local Model card. Frames the idle behavior around
+  /// background work: turning it on keeps local AI loaded instead of unloading
+  /// it after idle. The timeout remains available for Memory Saver when this
+  /// mode is off.
   private var powerSavingSubsection: some View {
-    VStack(alignment: .leading, spacing: 10) {
+    let autonomousWorkEnabled = !idleController.isEnabled
+
+    return VStack(alignment: .leading, spacing: 10) {
       HStack(spacing: 10) {
-        Image(systemName: "bolt.slash")
+        Image(systemName: "sparkles")
           .scaledFont(size: 14)
           .foregroundColor(OmiColors.purplePrimary)
           .frame(width: 20)
-        Text("Power Saving")
+        Text("Autonomous Work Mode")
           .scaledFont(size: 14, weight: .medium)
           .foregroundColor(OmiColors.textPrimary)
         Spacer()
       }
 
       Toggle(
-        "Stop AI when idle",
+        "Let AI work while I’m away",
         isOn: Binding(
-          get: { idleController.isEnabled },
-          set: { idleController.isEnabled = $0 }
+          get: { !idleController.isEnabled },
+          set: { idleController.isEnabled = !$0 }
         )
       )
       .toggleStyle(.switch)
       .scaledFont(size: 13)
 
       HStack(spacing: 8) {
-        Text("Idle timeout")
+        Text("Memory saver timeout")
           .scaledFont(size: 13)
           .foregroundColor(OmiColors.textSecondary)
         Picker(
@@ -3076,7 +3079,7 @@ struct SettingsContentView: View {
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(maxWidth: 160)
-        .disabled(!idleController.isEnabled)
+        .disabled(autonomousWorkEnabled)
         Spacer()
       }
 
@@ -3084,15 +3087,21 @@ struct SettingsContentView: View {
         Text("Status:")
           .scaledFont(size: 12)
           .foregroundColor(OmiColors.textTertiary)
-        Text(idleController.statusText)
-          .scaledFont(size: 12)
+        Text(
+          autonomousWorkEnabled
+            ? "Ready to work while idle."
+            : idleController.statusText
+        )
+        .scaledFont(size: 12)
           .foregroundColor(
-            idleController.serverStoppedByIdle
+            !autonomousWorkEnabled && idleController.serverStoppedByIdle
               ? OmiColors.warning : OmiColors.textSecondary)
       }
 
       Text(
-        "Frees the ~20 GB the LLM holds in RAM. Cold restart on the next AI request takes ~30s."
+        autonomousWorkEnabled
+          ? "Runs queued tasks when your Mac is idle and on power."
+          : "Memory Saver is on: local AI may unload after idle and restart on demand."
       )
       .scaledFont(size: 11)
       .foregroundColor(OmiColors.textTertiary)
