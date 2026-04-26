@@ -34,5 +34,6 @@ jobs:
 
       - name: cargo test -p infinite-recall-api
         run: cargo test --locked -p infinite-recall-api
-      # activity_test_wiring run deferred to #70 — tower 0.4/0.5 dep
-      # collision (#69) breaks compile on a clean cache (E0464).
+
+      - name: cargo test -p infinite-recall-api activity endpoints
+        run: cargo test --locked -p infinite-recall-api --features activity_test_wiring --test activity_endpoints

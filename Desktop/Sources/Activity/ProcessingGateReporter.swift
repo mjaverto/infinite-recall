@@ -14,8 +14,8 @@
 //     no benefit — the Rust daemon is process-local and the bridge is a
 //     127.0.0.1 POST.
 //
-// Priority order (highest first): locked > thermal > on-battery >
-// device-active > allowed. The first matching condition wins.
+// Priority order (highest first): thermal > run-once > locked >
+// power > device-active > allowed. The first matching condition wins.
 
 import Foundation
 
@@ -52,11 +52,15 @@ public struct ProcessingGateInputs: Equatable {
   /// introduce a third user-visible knob.
   public var idleThresholdSeconds: TimeInterval
 
-  /// Number of items currently waiting in the deferred queue. The
-  /// `OnBattery` block reason is only meaningful when there's something
-  /// to do — if the queue is empty, we report `Allowed` even on battery
-  /// so the UI doesn't show a misleading "waiting for AC power" banner.
+  /// Number of items currently waiting in the deferred queue. The power
+  /// block reason is only meaningful when there's something to do — if the
+  /// queue is empty, we report `Allowed` even on battery / Low Power Mode
+  /// so the UI doesn't show a misleading power banner.
   public var pendingWorkCount: Int
+
+  /// Activity's one-shot “Run now” override. This is intentionally not the
+  /// persistent `userOverride`; it only lasts for one drain.
+  public var isRunOnceIgnoringPowerActive: Bool
 
   public init(
     isScreenLocked: Bool,
@@ -69,7 +73,8 @@ public struct ProcessingGateInputs: Equatable {
     systemIdleSeconds: TimeInterval,
     activeSince: Date,
     idleThresholdSeconds: TimeInterval,
-    pendingWorkCount: Int
+    pendingWorkCount: Int,
+    isRunOnceIgnoringPowerActive: Bool = false
   ) {
     self.isScreenLocked = isScreenLocked
     self.lockedSince = lockedSince
@@ -82,6 +87,7 @@ public struct ProcessingGateInputs: Equatable {
     self.activeSince = activeSince
     self.idleThresholdSeconds = idleThresholdSeconds
     self.pendingWorkCount = pendingWorkCount
+    self.isRunOnceIgnoringPowerActive = isRunOnceIgnoringPowerActive
   }
 }
 
@@ -90,10 +96,11 @@ public struct ProcessingGateInputs: Equatable {
 /// `now` is injected so tests can pin time without touching `Date()`.
 ///
 /// Priority (highest first):
-///   1. Locked            → `Blocked(.locked,        WaitCondition.unlock)`
-///   2. Thermal serious+  → `Blocked(.thermal,       .thermalCooldown)`
-///   3. On battery        → `Blocked(.onBattery,     .acPower)`
-///      (only when there's queued work — empty queue + battery = Allowed)
+///   0. Thermal serious+  → `Blocked(.thermal,       .thermalCooldown)`
+///   1. Run-once override → `Allowed(now)`
+///   2. Locked            → `Blocked(.locked,        WaitCondition.unlock)`
+///   3. Power             → `Blocked(.onBattery,     .acPower)`
+///      (battery or Low Power Mode with queued work; empty queue = Allowed)
 ///   4. Idle < threshold  → `Blocked(.deviceActive,  .idleFor(remaining))`
 ///   5. Else              → `Allowed(since: idleEnteredAt)`
 ///
@@ -102,23 +109,14 @@ public struct ProcessingGateInputs: Equatable {
 /// `Blocked` state here, otherwise the snapshot will lie about
 /// `Allowed` while the scheduler quietly refuses to drain. The scheduler
 /// blocks on ANY of: source != .ac, isLowPowerMode, thermal >= .serious
-/// (modulo userOverride which is intentionally not mirrored — the
-/// override is a per-user policy choice, not a hardware fact, so the
-/// gate stays honest about the underlying signal).
+/// unless the non-persistent run-once override is active. Persistent
+/// `userOverride` is intentionally not mirrored — it is a per-user policy
+/// choice, not a hardware fact, so the gate stays honest about the
+/// underlying signal.
 public func computeGateState(_ inputs: ProcessingGateInputs, now: Date = Date()) -> GateState {
-  // 1. Lock wins over everything — even thermal cooldown, since the user
-  //    is gone and we should resume the moment they unlock regardless of
-  //    what else changed in the interim.
-  if inputs.isScreenLocked {
-    return .blocked(
-      reason: .locked,
-      since: inputs.lockedSince ?? now,
-      waitingFor: .unlock
-    )
-  }
-
-  // 2. Thermal pressure. `serious` and `critical` block; `nominal` and
-  //    `fair` are fine.
+  // 0. Thermal pressure. `serious` and `critical` block even the explicit
+  //    one-shot run. The user can ask to spend battery; they cannot ask us
+  //    to cook the machine.
   if inputs.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue {
     return .blocked(
       reason: .thermal,
@@ -127,15 +125,28 @@ public func computeGateState(_ inputs: ProcessingGateInputs, now: Date = Date())
     )
   }
 
-  // 3. Power. `BatteryAwareScheduler.allowHeavyWork` returns false the
-  //    moment the source is not AC — LPM is a separate AND-clause but
-  //    on-battery alone is already enough to block draining. So the gate
-  //    must report `Blocked(.onBattery)` whenever the laptop is on
-  //    battery with queued work, regardless of LPM. Otherwise the
-  //    snapshot would lie: `Allowed` while the scheduler refuses to drain.
-  //    Empty queue = nothing to defer, so report Allowed (no banner spam
-  //    when there's nothing waiting).
-  if inputs.onBattery && inputs.pendingWorkCount > 0 {
+  // 1. Explicit one-shot run bypasses battery, low-power mode, and the
+  //    autonomous idle/lock gate for this drain only.
+  if inputs.isRunOnceIgnoringPowerActive {
+    return .allowed(since: now)
+  }
+
+  // 2. Lock wins over the remaining non-thermal blockers.
+  if inputs.isScreenLocked {
+    return .blocked(
+      reason: .locked,
+      since: inputs.lockedSince ?? now,
+      waitingFor: .unlock
+    )
+  }
+
+  // 3. Power. `BatteryAwareScheduler.allowHeavyWork` returns false when
+  //    either the source is not AC OR Low Power Mode is engaged. The gate
+  //    must report a power block for queued work in both cases; otherwise
+  //    the snapshot would lie: `Allowed` while the scheduler refuses to
+  //    drain. Empty queue = nothing to defer, so report Allowed (no banner
+  //    spam when there's nothing waiting).
+  if (inputs.onBattery || inputs.isLowPowerMode) && inputs.pendingWorkCount > 0 {
     return .blocked(
       reason: .onBattery,
       since: inputs.batterySince ?? now,
@@ -243,11 +254,18 @@ public final class ProcessingGateReporter {
     lastPostedState = nil
   }
 
-  /// Test-friendly forced tick. Public so unit tests can drive the loop
-  /// deterministically without sleeping. Production code does not need
-  /// to call this.
-  public func tickForTesting() async {
+  /// Production-safe immediate refresh used when another component changes
+  /// gate inputs outside the normal 3s poll cadence (for example Activity's
+  /// one-shot “Run now” state). It uses the same de-dupe + retry path as the
+  /// poller, so callers can invoke it freely without spamming the daemon.
+  public func refreshNow() async {
     await tick()
+  }
+
+  /// Test-friendly forced tick. Public so unit tests can drive the loop
+  /// deterministically without sleeping.
+  public func tickForTesting() async {
+    await refreshNow()
   }
 
   /// Internal tick: recompute → diff → POST.
@@ -371,7 +389,8 @@ public final class ProcessingGateReporter {
       systemIdleSeconds: idleSeconds,
       activeSince: activeSince,
       idleThresholdSeconds: threshold,
-      pendingWorkCount: scheduler.pendingWorkCount
+      pendingWorkCount: scheduler.pendingWorkCount,
+      isRunOnceIgnoringPowerActive: scheduler.isRunOnceIgnoringPowerActive
     )
   }
 

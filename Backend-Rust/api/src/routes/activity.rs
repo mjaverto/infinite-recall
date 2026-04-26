@@ -9,19 +9,19 @@
 //! impls are owned by Streams B/C/D and the idle-gate agent — the Phase 0
 //! contract (`activity/contract.md`) is the source of truth.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
-
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::Utc;
+use rusqlite::{Error as RusqliteError, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 
 use crate::activity::traits::PauseStoreError;
 use crate::activity::types::{
     ActivitySnapshot, CaptureKind, CaptureRow, GateState, InflightUpdate, KindRow, PauseRequest,
     PauseTargetId, ResumeRequest, WorkKind,
 };
+use crate::db::with_conn;
 use crate::state::{AppState, PauseChange};
 
 /// All `WorkKind`s, in display order. Used to assemble the `kinds` array
@@ -38,34 +38,15 @@ const ALL_KINDS: [WorkKind; 5] = [
 const ALL_CAPTURES: [CaptureKind; 2] = [CaptureKind::Audio, CaptureKind::Screen];
 
 // ---------------------------------------------------------------------
-// Per-kind queue-depth state (Issue #41 — Lane 2)
+// Per-kind queue-depth rows (DB-authoritative)
 // ---------------------------------------------------------------------
 //
-// The Swift app owns the `pending_work` table; only it knows how many rows
-// are queued / failed for each `PendingWork.Kind`. Lane 4 pushes a frozen
-// snapshot of those counts via `POST /v1/activity/_internal/queue-depth`
-// (loopback-only, mirrors `_internal/inflight`). The snapshot handler reads
-// from this map when assembling each `KindRow`, defaulting to 0/0 so the
-// `/v1/activity/snapshot` shape stays valid before the first push.
-//
-// Frozen interface I1 (do NOT renegotiate):
-//
-//   { "depths": {
-//       "transcribe":         { "queued": 47, "failed": 0 },
-//       "ocr":                { "queued": 2,  "failed": 1 },
-//       "summarize":          { "queued": 0,  "failed": 0 },
-//       "extractMemory":      { "queued": 0,  "failed": 0 },
-//       "extractActionItems": { "queued": 0,  "failed": 0 }
-//   } }
-//
-// Keys are `PendingWork.Kind.rawValue` (camelCase, Swift-side), NOT the
-// snake_case wire form of `WorkKind`. We map between them in
-// `workkind_swift_raw_value` below.
-//
-// State is process-global rather than another `Arc<dyn …>` field on
-// `AppState` because (a) lane 2 is forbidden from editing `state.rs` and
-// (b) the data is purely a passive cache pushed in by Swift. Replace is
-// atomic: each POST swaps the entire map under a single write lock.
+// The Swift app owns `pending_work`, but the Rust daemon already has a
+// read-only SQLite pool. Activity snapshots therefore read queue / failure
+// counts from the DB on every GET instead of trusting the old Swift→Rust
+// push cache. Missing migration/table degrades to all-zero counts so a fresh
+// install still renders a valid snapshot; query errors surface as 500 rather
+// than falling back to stale process memory.
 
 /// One row of the queue-depth payload — `queued` and `failed` counts for a
 /// single `PendingWork.Kind`. Defaults to all-zeros for kinds Swift hasn't
@@ -83,24 +64,63 @@ pub struct QueueDepthUpdate {
     pub depths: HashMap<String, QueueDepth>,
 }
 
-/// Process-global queue-depth state. `OnceLock` so the first reader/writer
-/// initializes the empty map; `RwLock` so the snapshot read path doesn't
-/// serialize against itself under load.
-fn queue_depths_state() -> &'static Arc<RwLock<HashMap<String, QueueDepth>>> {
-    static STATE: OnceLock<Arc<RwLock<HashMap<String, QueueDepth>>>> = OnceLock::new();
-    STATE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+fn is_missing_pending_work_table_error(error: &RusqliteError) -> bool {
+    matches!(
+        error,
+        RusqliteError::SqliteFailure(_, Some(message))
+            if message.contains("no such table: pending_work")
+    )
 }
 
-/// Snapshot of the current queue-depth map. Cloned under a read lock so
-/// callers never see a torn write. Falls back to an empty map on lock
-/// poisoning (a poisoned write means an earlier writer panicked; the data
-/// itself is still readable, but defaulting to empty here is the safer
-/// path — the snapshot just degrades to 0/0).
-fn queue_depths_snapshot() -> HashMap<String, QueueDepth> {
-    match queue_depths_state().read() {
-        Ok(g) => g.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+/// Query `pending_work` directly for per-kind Activity counts.
+async fn pending_work_depths_by_kind(
+    pool: &crate::db::SqlitePool,
+) -> anyhow::Result<HashMap<String, QueueDepth>> {
+    with_conn(pool, |c| {
+        let table_exists = c
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_work'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !table_exists {
+            return Ok(HashMap::new());
+        }
+
+        let mut depths: HashMap<String, QueueDepth> = HashMap::new();
+        let mut stmt = match c.prepare(
+            "SELECT status, workType, COUNT(*) AS cnt
+             FROM pending_work
+             WHERE status IN ('queued', 'failed')
+             GROUP BY status, workType",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) if is_missing_pending_work_table_error(&e) => return Ok(HashMap::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (status, work_type, count) = row?;
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            let entry = depths.entry(work_type).or_default();
+            match status.as_str() {
+                "queued" => entry.queued = count,
+                "failed" => entry.failed = count,
+                _ => {}
+            }
+        }
+        Ok(depths)
+    })
+    .await
 }
 
 /// Map a Rust `WorkKind` to the Swift `PendingWork.Kind.rawValue` string
@@ -145,11 +165,17 @@ pub async fn snapshot(
         })?;
     let processing_gate = state.processing_gate.current();
 
-    // Per-kind queue depth + failure counters live in the Swift app's domain
-    // (PendingWork rows). Lane 4 pushes them via `_internal/queue-depth`; we
-    // read the latest atomic snapshot here and default to 0/0 for any kind
-    // Swift hasn't reported yet so the snapshot still works pre-first-push.
-    let depths_snap = queue_depths_snapshot();
+    // Per-kind queue depth + failure counters come from `pending_work` on
+    // every snapshot read. This keeps Activity in sync with the same durable
+    // queue Conversations / backfill use, with no process-global push cache.
+    let depths_snap = pending_work_depths_by_kind(&state.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("pending_work depth query error: {e}"),
+            )
+        })?;
 
     let kinds: Vec<KindRow> = ALL_KINDS
         .iter()
@@ -164,9 +190,7 @@ pub async fn snapshot(
                 queued: qd.queued,
                 failed: qd.failed,
                 last_done_at: None,
-                paused_until: state
-                    .pause_store
-                    .paused_until(&PauseTargetId::Kind(*k)),
+                paused_until: state.pause_store.paused_until(&PauseTargetId::Kind(*k)),
             }
         })
         .collect();
@@ -174,9 +198,7 @@ pub async fn snapshot(
     let capture: Vec<CaptureRow> = ALL_CAPTURES
         .iter()
         .map(|c| {
-            let paused = state
-                .pause_store
-                .paused_until(&PauseTargetId::Capture(*c));
+            let paused = state.pause_store.paused_until(&PauseTargetId::Capture(*c));
             CaptureRow {
                 kind: *c,
                 // We don't yet observe live capture state from the Rust daemon
@@ -283,23 +305,16 @@ pub async fn inflight(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /v1/activity/_internal/queue-depth` — Swift → Rust loopback for
-/// per-`PendingWork.Kind` queue / failure counts (Issue #41 — frozen
-/// interface I1).
+/// `POST /v1/activity/_internal/queue-depth` — legacy Swift → Rust loopback.
 ///
-/// Same loopback enforcement as `_internal/inflight`: the daemon binds to
-/// 127.0.0.1 only (see `lib.rs::run`), and the route still passes through
-/// the bearer-auth middleware. Replaces the entire depths map atomically;
-/// no deltas, no per-key partial updates.
+/// Activity snapshots are now DB-authoritative and do not read this payload.
+/// Keep accepting the old route as a compatibility no-op so older Swift builds
+/// do not fail their internal reporter while users upgrade both processes.
 pub async fn internal_queue_depth(
     State(_state): State<AppState>,
     Json(body): Json<QueueDepthUpdate>,
 ) -> StatusCode {
-    let mut g = match queue_depths_state().write() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *g = body.depths;
+    let _ = body.depths.len();
     StatusCode::NO_CONTENT
 }
 
@@ -321,10 +336,7 @@ pub async fn internal_queue_depth(
 /// Body: a fully-formed `GateState` (typed sum, snake_case discriminator).
 /// Bearer-authed via the `authed` middleware. Loopback is enforced by the
 /// listener bind (`127.0.0.1` only — see `lib.rs`).
-pub async fn gate_state(
-    State(state): State<AppState>,
-    Json(body): Json<GateState>,
-) -> StatusCode {
+pub async fn gate_state(State(state): State<AppState>, Json(body): Json<GateState>) -> StatusCode {
     // Uses the write-side `WritableProcessingGate` trait — read-only stub
     // gates (e.g. `#[cfg(test)] AlwaysAllowedGate`) cannot be wired here
     // by mistake, since they don't implement the writable trait at all.
@@ -337,6 +349,25 @@ mod tests {
     use super::*;
     use std::num::NonZeroU32;
 
+    #[test]
+    fn pending_work_missing_table_detection_is_specific() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let missing_pending_work = conn
+            .prepare("SELECT status FROM pending_work")
+            .expect_err("pending_work table should be absent");
+        assert!(is_missing_pending_work_table_error(&missing_pending_work));
+
+        let missing_other_table = conn
+            .prepare("SELECT status FROM some_other_table")
+            .expect_err("other table should be absent");
+        assert!(!is_missing_pending_work_table_error(&missing_other_table));
+
+        let syntax_error = conn
+            .prepare("SELECT FROM")
+            .expect_err("invalid SQL should fail");
+        assert!(!is_missing_pending_work_table_error(&syntax_error));
+    }
+
     // --- Issue #34: wire-format round-trip for `PauseTargetId` ---
     //
     // The `validate_target_id` helper used to live here; it's gone now.
@@ -347,10 +378,7 @@ mod tests {
     #[test]
     fn pause_request_decodes_every_workkind() {
         for k in ALL_KINDS {
-            let json = format!(
-                r#"{{"target":"kind","id":"{}","minutes":5}}"#,
-                k.as_str()
-            );
+            let json = format!(r#"{{"target":"kind","id":"{}","minutes":5}}"#, k.as_str());
             let req: PauseRequest =
                 serde_json::from_str(&json).expect("valid kind body must decode");
             assert_eq!(req.target, PauseTargetId::Kind(k));
@@ -374,9 +402,8 @@ mod tests {
     #[test]
     fn pause_request_rejects_zero_minutes_via_serde() {
         // NonZeroU32 makes `minutes: 0` unrepresentable — serde rejects.
-        let err = serde_json::from_str::<PauseRequest>(
-            r#"{"target":"kind","id":"ocr","minutes":0}"#,
-        );
+        let err =
+            serde_json::from_str::<PauseRequest>(r#"{"target":"kind","id":"ocr","minutes":0}"#);
         assert!(err.is_err(), "minutes=0 must fail at the serde layer");
     }
 
@@ -391,17 +418,15 @@ mod tests {
 
     #[test]
     fn pause_request_rejects_capture_with_kind_id() {
-        let err = serde_json::from_str::<PauseRequest>(
-            r#"{"target":"capture","id":"ocr","minutes":5}"#,
-        );
+        let err =
+            serde_json::from_str::<PauseRequest>(r#"{"target":"capture","id":"ocr","minutes":5}"#);
         assert!(err.is_err(), "capture+ocr must fail at the serde layer");
     }
 
     #[test]
     fn pause_request_rejects_unknown_target() {
-        let err = serde_json::from_str::<PauseRequest>(
-            r#"{"target":"nope","id":"ocr","minutes":5}"#,
-        );
+        let err =
+            serde_json::from_str::<PauseRequest>(r#"{"target":"nope","id":"ocr","minutes":5}"#);
         assert!(err.is_err(), "unknown target must fail at the serde layer");
     }
 

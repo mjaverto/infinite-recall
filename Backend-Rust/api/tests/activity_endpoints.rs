@@ -88,9 +88,10 @@ use infinite_recall_api::activity::traits::{
     WritableProcessingGate,
 };
 use infinite_recall_api::activity::types::{
-    BlockReason, CaptureKind, GateState, InFlight, PauseTargetId, ProcessBreakdown,
-    ResourceSample, ThermalState, WaitCondition, WorkKind,
+    BlockReason, CaptureKind, GateState, InFlight, PauseTargetId, ProcessBreakdown, ResourceSample,
+    ThermalState, WaitCondition, WorkKind,
 };
+use infinite_recall_api::db::SqlitePool;
 use infinite_recall_api::routes;
 use infinite_recall_api::state::AppState;
 
@@ -243,7 +244,13 @@ fn make_state(
     sampler: Arc<dyn ResourceSampler>,
     gate: Arc<dyn ProcessingGate>,
 ) -> AppState {
-    make_state_with_writer(pause_store, inflight, sampler, gate, Arc::new(NoopWritableGate))
+    make_state_with_writer(
+        pause_store,
+        inflight,
+        sampler,
+        gate,
+        Arc::new(NoopWritableGate),
+    )
 }
 
 fn make_state_with_writer(
@@ -255,8 +262,7 @@ fn make_state_with_writer(
 ) -> AppState {
     let pool = infinite_recall_api::db::open_in_memory_pool()
         .expect("in-memory pool — Stream A should expose a test helper");
-    let write_pool = infinite_recall_api::db::open_in_memory_pool()
-        .expect("in-memory write pool");
+    let write_pool = infinite_recall_api::db::open_in_memory_pool().expect("in-memory write pool");
     let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
     AppState {
         pool,
@@ -291,6 +297,31 @@ fn auth_header() -> (axum::http::HeaderName, axum::http::HeaderValue) {
 async fn json_body(resp: axum::response::Response) -> Value {
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
     serde_json::from_slice(&bytes).expect("response body is valid JSON")
+}
+
+async fn seed_pending_work(pool: &SqlitePool, rows: &[(&str, &str)]) {
+    let rows = rows
+        .iter()
+        .map(|(status, work_type)| ((*status).to_string(), (*work_type).to_string()))
+        .collect::<Vec<_>>();
+    infinite_recall_api::db::with_conn(pool, move |c| {
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_work (
+                status TEXT NOT NULL,
+                workType TEXT NOT NULL
+            );
+            DELETE FROM pending_work;",
+        )?;
+        for (status, work_type) in rows {
+            c.execute(
+                "INSERT INTO pending_work (status, workType) VALUES (?1, ?2)",
+                rusqlite::params![status, work_type],
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("seed pending_work rows");
 }
 
 // ---------------------------------------------------------------------
@@ -371,7 +402,10 @@ async fn snapshot_returns_200_with_full_shape() {
     assert_eq!(g["state"], json!("allowed"));
     assert!(g["since"].is_string());
     assert!(g.get("reason").is_none(), "Allowed must not carry reason");
-    assert!(g.get("waiting_for").is_none(), "Allowed must not carry waiting_for");
+    assert!(
+        g.get("waiting_for").is_none(),
+        "Allowed must not carry waiting_for"
+    );
 
     // `generated_at` is ISO-8601 string.
     assert!(body["generated_at"].is_string());
@@ -438,7 +472,9 @@ async fn pause_returns_paused_until() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = json_body(resp).await;
-    let s = body["paused_until"].as_str().expect("paused_until is a string");
+    let s = body["paused_until"]
+        .as_str()
+        .expect("paused_until is a string");
     let parsed: DateTime<Utc> = s.parse().expect("paused_until is iso8601");
     let delta = parsed - Utc::now();
     assert!(
@@ -468,7 +504,9 @@ async fn paused_kind_visible_in_snapshot() {
         .uri("/v1/activity/pause")
         .header(&k, v.clone())
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json!({"target":"kind","id":"ocr","minutes":1}).to_string()))
+        .body(Body::from(
+            json!({"target":"kind","id":"ocr","minutes":1}).to_string(),
+        ))
         .unwrap();
     let resp = app.clone().oneshot(pause_req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -488,7 +526,9 @@ async fn paused_kind_visible_in_snapshot() {
         .iter()
         .find(|row| row["kind"] == "ocr")
         .expect("snapshot must contain a row for every WorkKind");
-    let pu = ocr["paused_until"].as_str().expect("ocr.paused_until is set");
+    let pu = ocr["paused_until"]
+        .as_str()
+        .expect("ocr.paused_until is set");
     let parsed: DateTime<Utc> = pu.parse().expect("iso8601");
     let delta = parsed - Utc::now();
     assert!(
@@ -614,7 +654,10 @@ async fn inflight_loopback_round_trip() {
         .find(|r| r["kind"] == "transcribe")
         .unwrap();
     let inf = &transcribe["in_flight"];
-    assert!(!inf.is_null(), "in_flight must be populated after loopback POST");
+    assert!(
+        !inf.is_null(),
+        "in_flight must be populated after loopback POST"
+    );
     assert_eq!(inf["label"], json!("Transcribing 14:22:01→14:25:00 (en)"));
 
     // Clearing form: in_flight: null
@@ -638,26 +681,42 @@ async fn inflight_loopback_round_trip() {
     assert!(inflight.snapshot().get(&WorkKind::Transcribe).is_none());
 }
 
-/// Issue #41 — `_internal/queue-depth` updates the per-kind queue / failure
-/// counters; the next snapshot reflects them on the matching `KindRow`.
-///
-/// Validates the frozen interface I1 wire shape (camelCase keys mapped to
-/// `PendingWork.Kind.rawValue` on the Swift side) and confirms the
-/// snapshot route degrades to 0/0 for any kind Swift hasn't reported yet
-/// (here: `summarize`, which is omitted from the payload).
+/// Activity queue counts are DB-authoritative: `/snapshot` reads
+/// `pending_work` directly and ignores the legacy `_internal/queue-depth`
+/// push payload.
 #[tokio::test]
-async fn queue_depth_loopback_round_trip() {
-    let app = make_default_app();
+async fn queue_depth_snapshot_reads_pending_work_not_loopback_cache() {
+    let state = make_state(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    seed_pending_work(
+        &state.pool,
+        &[
+            ("queued", "transcribe"),
+            ("queued", "transcribe"),
+            ("failed", "ocr"),
+            ("queued", "summarize"),
+            ("failed", "extractMemory"),
+            ("failed", "extractActionItems"),
+            ("failed", "extractActionItems"),
+            ("claimed", "transcribe"),
+            ("dead", "ocr"),
+            ("unknown", "summarize"),
+            ("queued", "notARealWorkKind"),
+        ],
+    )
+    .await;
+    let app = routes::router(state);
     let (k, v) = auth_header();
 
-    // Push the frozen-interface payload — note `summarize` is intentionally
-    // omitted so we can also assert the missing-key default.
+    // Legacy push is accepted but must not override DB truth.
     let body = json!({
         "depths": {
-            "transcribe":         { "queued": 47, "failed": 0 },
-            "ocr":                { "queued": 2,  "failed": 1 },
-            "extractMemory":      { "queued": 5,  "failed": 0 },
-            "extractActionItems": { "queued": 0,  "failed": 3 },
+            "transcribe": { "queued": 99, "failed": 99 },
+            "summarize":  { "queued": 99, "failed": 99 }
         }
     });
     let req = Request::builder()
@@ -670,7 +729,6 @@ async fn queue_depth_loopback_round_trip() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Snapshot must surface the depths on each KindRow.
     let snap_req = Request::builder()
         .method(Method::GET)
         .uri("/v1/activity/snapshot")
@@ -687,29 +745,37 @@ async fn queue_depth_loopback_round_trip() {
             .unwrap_or_else(|| panic!("snapshot missing row for `{wire}`"))
     };
 
-    let transcribe = row_for("transcribe");
-    assert_eq!(transcribe["queued"], json!(47));
-    assert_eq!(transcribe["failed"], json!(0));
+    assert_eq!(row_for("transcribe")["queued"], json!(2));
+    assert_eq!(row_for("transcribe")["failed"], json!(0));
+    assert_eq!(row_for("ocr")["queued"], json!(0));
+    assert_eq!(row_for("ocr")["failed"], json!(1));
+    assert_eq!(row_for("summarize")["queued"], json!(1));
+    assert_eq!(row_for("summarize")["failed"], json!(0));
+    assert_eq!(row_for("extract_memory")["queued"], json!(0));
+    assert_eq!(row_for("extract_memory")["failed"], json!(1));
+    assert_eq!(row_for("extract_action_items")["queued"], json!(0));
+    assert_eq!(row_for("extract_action_items")["failed"], json!(2));
+}
 
-    let ocr = row_for("ocr");
-    assert_eq!(ocr["queued"], json!(2));
-    assert_eq!(ocr["failed"], json!(1));
-
-    // `extract_memory` is the snake_case wire form for the WorkKind whose
-    // Swift rawValue is `extractMemory`.
-    let extract_memory = row_for("extract_memory");
-    assert_eq!(extract_memory["queued"], json!(5));
-    assert_eq!(extract_memory["failed"], json!(0));
-
-    let extract_action_items = row_for("extract_action_items");
-    assert_eq!(extract_action_items["queued"], json!(0));
-    assert_eq!(extract_action_items["failed"], json!(3));
-
-    // `summarize` was omitted from the payload — must default to 0/0
-    // rather than disappearing or crashing the snapshot.
-    let summarize = row_for("summarize");
-    assert_eq!(summarize["queued"], json!(0));
-    assert_eq!(summarize["failed"], json!(0));
+/// Fresh installs may not have run the Swift `pending_work` migration yet.
+/// Snapshot should still be 200 with every queue/failure count at zero.
+#[tokio::test]
+async fn queue_depth_snapshot_missing_pending_work_table_is_empty() {
+    let app = make_default_app();
+    let (k, v) = auth_header();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let snap = json_body(resp).await;
+    for row in snap["kinds"].as_array().expect("kinds is an array") {
+        assert_eq!(row["queued"], json!(0), "queued not empty for row {row}");
+        assert_eq!(row["failed"], json!(0), "failed not empty for row {row}");
+    }
 }
 
 /// Auth: missing bearer → 401.
@@ -1051,7 +1117,11 @@ async fn gate_state_post_updates_snapshot() {
 
     // Direct `current()` read on the gate matches what we POSTed.
     match gate.current() {
-        GateState::Blocked { reason, waiting_for, .. } => {
+        GateState::Blocked {
+            reason,
+            waiting_for,
+            ..
+        } => {
             assert_eq!(reason, BlockReason::DeviceActive);
             assert_eq!(
                 waiting_for,

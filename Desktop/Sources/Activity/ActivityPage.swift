@@ -17,12 +17,78 @@
 
 import SwiftUI
 
+// MARK: - Power gate helpers
+
+/// Local Activity-page power blocker. The wire model currently exposes the
+/// power gate as `.onBattery`; this helper keeps the battery-vs-Low-Power-Mode
+/// distinction available for UI copy and tests without broadening the API.
+enum ActivityPowerBlock: Equatable {
+    case battery
+    case lowPowerMode
+}
+
+func activityPowerBlock(resources: ResourceSample, queued: UInt32) -> ActivityPowerBlock? {
+    guard queued > 0 else { return nil }
+    if resources.onBattery { return .battery }
+    if resources.lowPower { return .lowPowerMode }
+    return nil
+}
+
+func activitySuppressesRunNow(_ gate: GateState?) -> Bool {
+    guard case .blocked(let reason, _, _) = gate else { return false }
+    switch reason {
+    case .thermal, .locked, .deviceActive, .manualPause:
+        return true
+    case .onBattery, .initializing:
+        return false
+    }
+}
+
+func activityCorrectedGate(
+    snapshotGate: GateState,
+    resources: ResourceSample,
+    queued: UInt32,
+    thermalState: ProcessInfo.ThermalState,
+    isRunOnceActive: Bool,
+    runOnceStartedAt: Date?,
+    now: Date = Date()
+) -> GateState {
+    if thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue {
+        return .blocked(reason: .thermal, since: snapshotGate.since, waitingFor: .thermalCooldown)
+    }
+    if isRunOnceActive {
+        return .allowed(since: runOnceStartedAt ?? now)
+    }
+    if activitySuppressesRunNow(snapshotGate) {
+        return snapshotGate
+    }
+    if activityPowerBlock(resources: resources, queued: queued) != nil {
+        return .blocked(reason: .onBattery, since: snapshotGate.since, waitingFor: .acPower)
+    }
+    return snapshotGate
+}
+
+func activityShouldShowRunNowButton(
+    snapshotGate: GateState?,
+    correctedGate: GateState?,
+    resources: ResourceSample?,
+    queued: UInt32,
+    isThermalBlocked: Bool,
+    isRunOnceActive: Bool
+) -> Bool {
+    if isThermalBlocked || activitySuppressesRunNow(snapshotGate) { return false }
+    if isRunOnceActive { return true }
+    guard let resources, activityPowerBlock(resources: resources, queued: queued) != nil else { return false }
+    return correctedGate?.blockReason == .onBattery
+}
+
 // MARK: - Page
 
 struct ActivityPage: View {
     /// Stream F's real ActivityMonitorService singleton. Polls the local
     /// Rust daemon and surfaces snapshot via @Published.
     @StateObject private var service = ActivityMonitorService.shared
+    @StateObject private var scheduler = BatteryAwareScheduler.shared
 
     @State private var captureToConfirm: CaptureKind? = nil
     @State private var captureMinutesToConfirm: UInt32 = 5
@@ -109,7 +175,17 @@ struct ActivityPage: View {
     // MARK: Snapshot accessors
 
     private var snapshot: ActivitySnapshot? { service.snapshot }
-    private var gate: GateState? { snapshot?.processingGate }
+    private var gate: GateState? {
+        guard let snap = snapshot else { return nil }
+        return activityCorrectedGate(
+            snapshotGate: snap.processingGate,
+            resources: snap.resources,
+            queued: totalQueued,
+            thermalState: scheduler.thermalState,
+            isRunOnceActive: scheduler.isRunOnceActive,
+            runOnceStartedAt: scheduler.runOnceStartedAt
+        )
+    }
     private var kinds: [KindRow] { snapshot?.kinds ?? [] }
     private var captures: [CaptureRow] { snapshot?.capture ?? [] }
     private var resources: ResourceSample? { snapshot?.resources }
@@ -117,6 +193,19 @@ struct ActivityPage: View {
     private var totalQueued: UInt32 { kinds.reduce(0) { $0 + $1.queued } }
     private var totalInFlight: Int { kinds.filter { $0.inFlight != nil }.count }
     private var isEmptyState: Bool { totalInFlight == 0 && totalQueued == 0 }
+    private var isThermalBlocked: Bool {
+        scheduler.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+    }
+    private var shouldShowRunNowButton: Bool {
+        activityShouldShowRunNowButton(
+            snapshotGate: snapshot?.processingGate,
+            correctedGate: gate,
+            resources: resources,
+            queued: totalQueued,
+            isThermalBlocked: isThermalBlocked,
+            isRunOnceActive: scheduler.isRunOnceActive
+        )
+    }
 
     // MARK: - Banner
 
@@ -138,6 +227,9 @@ struct ActivityPage: View {
                 }
             }
             Spacer()
+            if shouldShowRunNowButton {
+                runNowButton
+            }
         }
         .padding(14)
         .background(
@@ -149,6 +241,35 @@ struct ActivityPage: View {
                 )
         )
         .accessibilityIdentifier("activity_gate_banner")
+    }
+
+    private var runNowButton: some View {
+        let running = scheduler.isRunOnceActive
+        return Button {
+            Task { await scheduler.runOnceIgnoringPower() }
+        } label: {
+            HStack(spacing: 6) {
+                if running {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.75)
+                    Text("Running…")
+                } else {
+                    Image(systemName: "bolt.fill")
+                    Text("Run now")
+                }
+            }
+            .scaledFont(size: 12, weight: .semibold)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.borderless)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(OmiColors.backgroundPrimary.opacity(0.8))
+        )
+        .disabled(running || totalQueued == 0)
+        .accessibilityIdentifier("activity_run_now_button")
     }
 
     private struct BannerInfo {
@@ -206,6 +327,14 @@ struct ActivityPage: View {
                 color: OmiColors.warning
             )
         case .onBattery:
+            if let res = resources, activityPowerBlock(resources: res, queued: queued) == .lowPowerMode {
+                return BannerInfo(
+                    icon: "bolt.slash.fill",
+                    title: "Low Power Mode — \(queued) item\(queued == 1 ? "" : "s") queued",
+                    detail: "Turn off Low Power Mode or run now.",
+                    color: OmiColors.warning
+                )
+            }
             return BannerInfo(
                 icon: "battery.25",
                 title: "Waiting for AC power — \(queued) item\(queued == 1 ? "" : "s") queued",
@@ -678,7 +807,11 @@ struct ActivityPage: View {
         let wait = waitingForDescription(waitingFor)
         switch reason {
         case .deviceActive: return "Waiting for idle. Resumes after \(wait)."
-        case .onBattery:    return "Waiting for AC power."
+        case .onBattery:
+            if let res = resources, activityPowerBlock(resources: res, queued: totalQueued) == .lowPowerMode {
+                return "Waiting for Low Power Mode to turn off."
+            }
+            return "Waiting for AC power."
         case .thermal:      return "Waiting for thermal cooldown."
         case .locked:       return "Resumes when you unlock."
         case .manualPause:  return "Manually paused."

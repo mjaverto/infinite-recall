@@ -126,6 +126,13 @@ public final class ActivityMonitorService: ObservableObject {
         self.lastError = nil
     }
 
+    /// Production-safe immediate refresh for one-shot scheduling state flips.
+    /// Uses the same guarded fetch path as the 1 Hz poller, so overlapping
+    /// refreshes coalesce instead of piling up network calls.
+    public func refreshNow() async {
+        await fetchOnce()
+    }
+
     /// Surface a banner when `_internal/*` POSTs (inflight, queue-depth,
     /// gate-state) have failed `consecutive` times in a row. Routed through
     /// `InternalPostFailureTracker` so duplicate counters don't drift.
@@ -222,7 +229,7 @@ public final class ActivityMonitorService: ObservableObject {
         defer { isFetching = false }
         do {
             let snap = try await APIClient.shared.getActivitySnapshot()
-            self.snapshot = snap
+            self.snapshot = await snapshotWithAuthoritativeQueueDepth(snap)
             self.lastError = nil
         } catch APIError.daemonNotConfigured {
             // Distinct UI message: tells the user the daemon URL is unset
@@ -232,6 +239,50 @@ public final class ActivityMonitorService: ObservableObject {
             self.lastError = APIError.daemonNotConfigured.localizedDescription
         } catch {
             self.lastError = "snapshot failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func snapshotWithAuthoritativeQueueDepth(_ snap: ActivitySnapshot) async -> ActivitySnapshot {
+        do {
+            let depth = try await PendingWorkStorage.shared.depthSummary()
+            return Self.snapshot(snap, applying: depth)
+        } catch {
+            // If the DB is not initialized yet, keep the daemon snapshot. The
+            // Rust endpoint also reads `pending_work`; this overlay mainly
+            // protects against stale legacy queue-depth pushes while Swift and
+            // Rust are upgraded together.
+            return snap
+        }
+    }
+
+    nonisolated static func snapshot(_ snap: ActivitySnapshot, applying depth: PendingWorkDepth) -> ActivitySnapshot {
+        let updatedKinds = snap.kinds.map { row -> KindRow in
+            let key = pendingWorkKey(for: row.kind)
+            return KindRow(
+                kind: row.kind,
+                inFlight: row.inFlight,
+                queued: UInt32(clamping: depth.queued[key] ?? 0),
+                failed: UInt32(clamping: depth.failed[key] ?? 0),
+                lastDoneAt: row.lastDoneAt,
+                pausedUntil: row.pausedUntil
+            )
+        }
+        return ActivitySnapshot(
+            kinds: updatedKinds,
+            capture: snap.capture,
+            resources: snap.resources,
+            processingGate: snap.processingGate,
+            generatedAt: snap.generatedAt
+        )
+    }
+
+    nonisolated private static func pendingWorkKey(for kind: WorkKind) -> String {
+        switch kind {
+        case .transcribe: return PendingWork.Kind.transcribe.rawValue
+        case .ocr: return PendingWork.Kind.ocr.rawValue
+        case .summarize: return PendingWork.Kind.summarize.rawValue
+        case .extractMemory: return PendingWork.Kind.extractMemory.rawValue
+        case .extractActionItems: return PendingWork.Kind.extractActionItems.rawValue
         }
     }
 

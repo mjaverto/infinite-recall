@@ -5165,45 +5165,6 @@ extension APIClient {
     }
   }
 
-  /// POST /v1/activity/_internal/queue-depth — Swift→Rust loopback, called by
-  /// `BatteryAwareScheduler`'s debounced delegate listener whenever
-  /// `PendingWorkStorage` mutates. Pushes per-kind `(queued, failed)` counts
-  /// into the daemon's snapshot so the Activity panel reflects depth without
-  /// polling SQLite from Rust. Mirrors `reportInFlight` byte-for-byte.
-  ///
-  /// Body shape (frozen interface I1):
-  ///     { "depths": { "<kind.rawValue>": { "queued": N, "failed": M }, … } }
-  ///
-  /// Returns when the daemon answers 204. Throws `APIError.daemonNotConfigured`
-  /// when `IR_API_URL` is unset (caller should treat that as "daemon not up").
-  func reportQueueDepth(_ depths: [PendingWork.Kind: (queued: Int, failed: Int)]) async throws {
-    let base = try rustBackendURL
-    guard let url = URL(string: base + "v1/activity/_internal/queue-depth") else {
-      throw APIError.invalidResponse
-    }
-
-    var encoded: [String: QueueDepthEntry] = [:]
-    for (kind, counts) in depths {
-      encoded[kind.rawValue] = QueueDepthEntry(queued: counts.queued, failed: counts.failed)
-    }
-    let body = QueueDepthUpdate(depths: encoded)
-
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.allHTTPHeaderFields = try activityHeaders()
-    request.httpBody = try Self.makeActivityEncoder().encode(body)
-    request.timeoutInterval = 5
-
-    let (_, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse else {
-      throw APIError.invalidResponse
-    }
-    if http.statusCode == 401 { throw APIError.unauthorized }
-    guard (200...299).contains(http.statusCode) else {
-      throw APIError.httpError(statusCode: http.statusCode)
-    }
-  }
-
   /// POST /v1/activity/_internal/gate-state — Swift→Rust loopback (issue #32).
   ///
   /// Called by `ProcessingGateReporter` when its computed `GateState`
@@ -5233,13 +5194,4 @@ extension APIClient {
   }
 }
 
-/// Wire shape for `POST /v1/activity/_internal/queue-depth` (interface I1).
-private struct QueueDepthEntry: Codable {
-  let queued: Int
-  let failed: Int
-}
-
-private struct QueueDepthUpdate: Codable {
-  let depths: [String: QueueDepthEntry]
-}
 // === /activity:F ===

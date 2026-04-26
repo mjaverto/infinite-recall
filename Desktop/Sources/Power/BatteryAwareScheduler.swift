@@ -94,6 +94,10 @@ public final class BatteryAwareScheduler: ObservableObject {
   @Published public private(set) var thermalState: ProcessInfo.ThermalState = .nominal
   @Published public private(set) var pendingWorkCount: Int = 0
   @Published public private(set) var isDraining: Bool = false
+  @Published public private(set) var isRunOnceIgnoringPowerActive: Bool = false
+  @Published public private(set) var runOnceStartedAt: Date? = nil
+
+  public var isRunOnceActive: Bool { isRunOnceIgnoringPowerActive }
 
   /// True when the macOS screen is locked. Updated by direct subscription to
   /// `.screenDidLock` / `.screenDidUnlock` (posted by AppState lifecycle observers).
@@ -115,10 +119,18 @@ public final class BatteryAwareScheduler: ObservableObject {
   @AppStorage("battery_override_allowHeavyWork")
   public var userOverride: Bool = false
 
+  /// Non-persistent, one-shot override used by Activity's “Run now” button.
+  /// Separate from `userOverride` so quitting/relaunching never leaves the
+  /// battery gate disabled.
+  private var oneShotOverride: Bool = false
+
   /// Single source of truth for "may I run a Whisper pass right now?".
   /// This reflects the *committed* power state — it lags real hardware by
   /// up to `acTransitionDebounceSeconds` on any transition after launch.
   public var allowHeavyWork: Bool {
+    if oneShotOverride {
+      return thermalState.rawValue < ProcessInfo.ThermalState.serious.rawValue
+    }
     if userOverride { return true }
     if committedSource != .ac { return false }
     if isLowPowerMode { return false }
@@ -141,6 +153,7 @@ public final class BatteryAwareScheduler: ObservableObject {
   /// kinds (`.transcribe`, `.ocr`, …) keep using `allowHeavyWork`, so their
   /// behavior is unchanged.
   public var allowAutonomousAIWork: Bool {
+    if oneShotOverride { return allowHeavyWork }
     guard allowHeavyWork else { return false }
     if isScreenLocked { return true }
     let threshold = TimeInterval(IdleAIController.shared.idleTimeoutMinutes * 60)
@@ -153,7 +166,9 @@ public final class BatteryAwareScheduler: ObservableObject {
       return "Up to date"
     }
     let qualifier: String
-    if userOverride {
+    if oneShotOverride {
+      qualifier = "running now"
+    } else if userOverride {
       qualifier = "override"
     } else if source == .battery {
       qualifier = "battery"
@@ -191,43 +206,7 @@ public final class BatteryAwareScheduler: ObservableObject {
   /// Worker tag embedded in `claimedBy` column so sweeper can identify orphans.
   private var workerTag: String { "PowerWorkBridge#\(ProcessInfo.processInfo.processIdentifier)" }
 
-  // MARK: - Queue-depth debouncer (Lane 4)
-
-  /// Coalesces a burst of `pendingWorkStorageDidMutate` callbacks into a
-  /// single Rust push. We pick 250 ms so a typical drain (ack → enqueue →
-  /// ack within tens of ms) emits exactly one POST while still feeling
-  /// instant in the Activity panel.
-  nonisolated fileprivate static let queueDepthDebounceMs: Int = 250
-
-  /// Nonisolated so the storage actor's executor (which calls
-  /// `pendingWorkStorageDidMutate`) can call `schedule()` without hopping
-  /// to the main actor first. Fire block is installed in `init()` so unit
-  /// tests that exercise the delegate without `start()` still get the
-  /// debounce path.
-  nonisolated private let queueDepthDebouncer = QueueDepthDebouncer(
-    debounceMs: BatteryAwareScheduler.queueDepthDebounceMs
-  )
-
-  private var didWireQueueDepthDelegate = false
-
-  #if DEBUG
-  /// Test hook: when set, `pushQueueDepthNow()` invokes this and returns
-  /// before touching `PendingWorkStorage` or `APIClient`. The debounce-test
-  /// uses it to count fires under rapid mutation without a live daemon.
-  internal var _testQueueDepthHook: (@Sendable () -> Void)?
-  #endif
-
-  private init() {
-    // Install the queue-depth debouncer's fire block now so a unit-test
-    // harness that exercises `pendingWorkStorageDidMutate` directly (without
-    // calling `start()`) still gets the debounce path. Production calls
-    // `start()`, which additionally registers us as the storage delegate.
-    queueDepthDebouncer.install { [weak self] in
-      Task { @MainActor in
-        await self?.pushQueueDepthNow()
-      }
-    }
-  }
+  private init() {}
 
   /// Wire up to the shared `PowerStateMonitor` and start watching for
   /// transitions. Idempotent.
@@ -314,18 +293,8 @@ public final class BatteryAwareScheduler: ObservableObject {
     // mistake "still false" for "just transitioned to false".
     self.lastAutonomousAllow = self.allowAutonomousAIWork
 
-    // Register with the storage actor so mutations push depth to the Rust
-    // daemon (debounced). Idempotent across repeated start() calls. Also
-    // emit one immediate hydration push so the Activity panel doesn't sit
-    // at "—" until the first mutation arrives.
-    if !didWireQueueDepthDelegate {
-      didWireQueueDepthDelegate = true
-      Task { [weak self] in
-        guard let self else { return }
-        await PendingWorkStorage.shared.setDelegate(self)
-        await self.pushQueueDepthNow()
-      }
-    }
+    // Queue depth is read from `pending_work` by Activity snapshots; no
+    // Swift→Rust queue-depth bridge is needed here.
   }
 
   /// Stop watching for transitions. Mainly for tests.
@@ -384,6 +353,26 @@ public final class BatteryAwareScheduler: ObservableObject {
         await self.drain()
       }
     }
+  }
+
+  /// Run the current queue once even if the normal battery / idle gate is
+  /// closed. This is intentionally non-persistent: it does not touch
+  /// `userOverride`, and it clears only after this explicit drain returns.
+  /// Reconnecting AC while the drain is in flight does not end the run-once
+  /// session; the one-shot state remains active until `defer` runs below.
+  public func runOnceIgnoringPower() async {
+    guard !isRunOnceIgnoringPowerActive else { return }
+    let startedAt = Date()
+    oneShotOverride = true
+    isRunOnceIgnoringPowerActive = true
+    runOnceStartedAt = startedAt
+    lastAllow = allowHeavyWork
+    lastAutonomousAllow = allowAutonomousAIWork
+    await refreshRunOnceSurfaces()
+    defer {
+      clearOneShotOverride()
+    }
+    await drain()
   }
 
   /// Drain the queue by claiming and executing items one at a time.
@@ -582,6 +571,24 @@ public final class BatteryAwareScheduler: ObservableObject {
 
   // MARK: - Internal
 
+  private func clearOneShotOverride() {
+    guard oneShotOverride || isRunOnceIgnoringPowerActive || runOnceStartedAt != nil else { return }
+    oneShotOverride = false
+    isRunOnceIgnoringPowerActive = false
+    runOnceStartedAt = nil
+    lastAllow = allowHeavyWork
+    lastAutonomousAllow = allowAutonomousAIWork
+    reevaluateAutonomousReadiness()
+    Task { @MainActor [weak self] in
+      await self?.refreshRunOnceSurfaces()
+    }
+  }
+
+  private func refreshRunOnceSurfaces() async {
+    await ProcessingGateReporter.shared.refreshNow()
+    await ActivityMonitorService.shared.refreshNow()
+  }
+
   /// Called whenever any input signal updates. Debounces power-source
   /// transitions by `acTransitionDebounceSeconds` before committing a new
   /// `allowHeavyWork` value and (if the new value is true) triggering drain.
@@ -697,104 +704,18 @@ public final class BatteryAwareScheduler: ObservableObject {
     self.isScreenLocked = locked
     self.reevaluateAutonomousReadiness()
   }
+
+  public func _testBeginRunOnceIgnoringPower() {
+    oneShotOverride = true
+    isRunOnceIgnoringPowerActive = true
+    runOnceStartedAt = Date()
+    lastAllow = allowHeavyWork
+    lastAutonomousAllow = allowAutonomousAIWork
+  }
+
+  public func _testEndRunOnceIgnoringPower() {
+    clearOneShotOverride()
+  }
   #endif
 
-  // MARK: - Queue-depth push (Lane 4)
-
-  /// Pull the latest depth summary from `PendingWorkStorage` and POST it to
-  /// the Rust daemon. Called from the debouncer's fire block and once at
-  /// `start()` for hydration. Errors are caught — `daemonNotConfigured`
-  /// (interface I2 from Lane 1) is logged at one line; everything else
-  /// flows through `ActivityReportLogger` like the inflight reporter.
-  fileprivate func pushQueueDepthNow() async {
-    #if DEBUG
-    if let hook = _testQueueDepthHook {
-      hook()
-      return
-    }
-    #endif
-
-    let summary: PendingWorkDepth
-    do {
-      summary = try await PendingWorkStorage.shared.depthSummary()
-    } catch {
-      log("BatteryAwareScheduler: depthSummary failed: \(error.localizedDescription)")
-      return
-    }
-
-    var depths: [PendingWork.Kind: (queued: Int, failed: Int)] = [:]
-    for kind in PendingWork.Kind.allCases {
-      depths[kind] = (
-        queued: summary.queued[kind.rawValue] ?? 0,
-        failed: summary.failed[kind.rawValue] ?? 0
-      )
-    }
-
-    do {
-      try await APIClient.shared.reportQueueDepth(depths)
-      InternalPostFailureTracker.shared.reportSuccess(.queueDepth)
-    } catch APIError.daemonNotConfigured {
-      log("BatteryAwareScheduler: daemon not configured; queue-depth push skipped")
-    } catch {
-      ActivityReportLogger.shared.log(
-        error: error, context: "reportQueueDepth")
-      InternalPostFailureTracker.shared.reportFailure(.queueDepth, error: error)
-    }
-  }
-}
-
-// MARK: - PendingWorkStorageDelegate (Lane 4)
-
-extension BatteryAwareScheduler: PendingWorkStorageDelegate {
-  /// Called from the `PendingWorkStorage` actor's executor after each
-  /// committed mutation. We bounce off the actor immediately and let the
-  /// debouncer coalesce bursts into one Rust push.
-  nonisolated func pendingWorkStorageDidMutate(_ storage: PendingWorkStorage) {
-    queueDepthDebouncer.schedule()
-  }
-}
-
-// MARK: - Queue-depth debouncer
-
-/// Cancel-and-reschedule debouncer dedicated to the queue-depth push. Owns
-/// a private serial `DispatchQueue` so mutator callbacks (which arrive on
-/// the storage actor's executor) don't contend with the main actor.
-///
-/// `@unchecked Sendable` is sound here because every read/write of `item`
-/// and `fireBlock` happens on `queue` (the same serial executor).
-fileprivate final class QueueDepthDebouncer: @unchecked Sendable {
-  private let queue = DispatchQueue(label: "BatteryAwareScheduler.queueDepth")
-  private var item: DispatchWorkItem?
-  private var fireBlock: (@Sendable () -> Void)?
-  private let debounceMs: Int
-
-  init(debounceMs: Int) {
-    self.debounceMs = debounceMs
-  }
-
-  /// Install (or replace) the closure invoked when the debounce window
-  /// closes. Must be called before `schedule()` produces an effect.
-  func install(fireBlock: @escaping @Sendable () -> Void) {
-    queue.async { [self] in
-      self.fireBlock = fireBlock
-    }
-  }
-
-  /// Cancel any pending work item and schedule a fresh one `debounceMs`
-  /// from now. Safe to call from any thread/actor.
-  func schedule() {
-    queue.async { [self] in
-      item?.cancel()
-      guard let fireBlock = fireBlock else {
-        // No fire block installed yet (scheduler hasn't called start()).
-        // Drop silently — the next mutation after start() will schedule.
-        return
-      }
-      let work = DispatchWorkItem {
-        fireBlock()
-      }
-      item = work
-      queue.asyncAfter(deadline: .now() + .milliseconds(debounceMs), execute: work)
-    }
-  }
 }

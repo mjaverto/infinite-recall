@@ -57,9 +57,34 @@ final class ProcessingGateReporterTests: XCTestCase {
     XCTAssertTrue(state.isAllowed, "empty queue + battery should be Allowed; got \(state)")
   }
 
+  func test_allowed_while_run_once_override_active() {
+    let now = Date()
+    var inputs = baseline(now: now, idleSeconds: 0, threshold: 120, pending: 5)
+    inputs.onBattery = true
+    inputs.isLowPowerMode = true
+    inputs.isRunOnceIgnoringPowerActive = true
+
+    let state = computeGateState(inputs, now: now)
+    XCTAssertTrue(state.isAllowed, "run-once should report Allowed during explicit drain; got \(state)")
+  }
+
+  func test_run_once_does_not_bypass_serious_thermal() {
+    let now = Date()
+    var inputs = baseline(now: now, idleSeconds: 0, threshold: 120, pending: 5)
+    inputs.onBattery = true
+    inputs.isLowPowerMode = true
+    inputs.thermalState = .serious
+    inputs.thermalSince = now.addingTimeInterval(-60)
+    inputs.isRunOnceIgnoringPowerActive = true
+
+    let state = computeGateState(inputs, now: now)
+    XCTAssertEqual(state.blockReason, .thermal)
+    XCTAssertEqual(state.waitingFor, .thermalCooldown)
+  }
+
   // MARK: - Priority ordering
 
-  func test_locked_beats_thermal() {
+  func test_thermal_beats_locked() {
     let now = Date()
     var inputs = baseline(now: now)
     inputs.isScreenLocked = true
@@ -68,8 +93,8 @@ final class ProcessingGateReporterTests: XCTestCase {
     inputs.thermalSince = now.addingTimeInterval(-60)
 
     let state = computeGateState(inputs, now: now)
-    XCTAssertEqual(state.blockReason, .locked)
-    XCTAssertEqual(state.waitingFor, .unlock)
+    XCTAssertEqual(state.blockReason, .thermal)
+    XCTAssertEqual(state.waitingFor, .thermalCooldown)
   }
 
   func test_thermal_beats_battery() {
@@ -160,6 +185,40 @@ final class ProcessingGateReporterTests: XCTestCase {
     let state = computeGateState(inputs, now: now)
     XCTAssertEqual(state.blockReason, .onBattery)
     XCTAssertEqual(state.waitingFor, .acPower)
+  }
+
+  func test_blocked_on_ac_low_power_with_queued_work_mirrors_scheduler() {
+    let now = Date()
+    var inputs = baseline(now: now, pending: 5)
+    inputs.onBattery = false
+    inputs.isLowPowerMode = true
+
+    let state = computeGateState(inputs, now: now)
+
+    XCTAssertEqual(
+      state.blockReason, .onBattery,
+      "AC + Low Power Mode + queued work must Block to mirror scheduler; got \(state)")
+    XCTAssertEqual(state.waitingFor, .acPower)
+  }
+
+  func test_ac_low_power_run_once_allows_then_reverts_to_power_block() {
+    let now = Date()
+    var inputs = baseline(now: now, pending: 5)
+    inputs.onBattery = false
+    inputs.isLowPowerMode = true
+
+    XCTAssertEqual(computeGateState(inputs, now: now).blockReason, .onBattery)
+
+    inputs.isRunOnceIgnoringPowerActive = true
+    XCTAssertTrue(
+      computeGateState(inputs, now: now).isAllowed,
+      "run-once should bypass AC + Low Power Mode gate")
+
+    inputs.isRunOnceIgnoringPowerActive = false
+    XCTAssertEqual(
+      computeGateState(inputs, now: now).blockReason,
+      .onBattery,
+      "after run-once ends, AC + Low Power Mode + queued work should be blocked again")
   }
 
   func test_blocked_device_active_remaining_clamped_above_zero() {
