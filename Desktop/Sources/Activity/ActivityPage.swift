@@ -284,7 +284,9 @@ struct ActivityPage: View {
                 .fill(OmiColors.backgroundPrimary.opacity(0.8))
         )
         .disabled(running || totalQueued == 0)
-        .accessibilityLabel("Run now — process \(totalQueued) queued item\(totalQueued == 1 ? "" : "s")")
+        .accessibilityLabel(running
+            ? "Processing queued items"
+            : "Run now — process \(totalQueued) queued item\(totalQueued == 1 ? "" : "s")")
         .accessibilityIdentifier("activity_run_now_button")
     }
 
