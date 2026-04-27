@@ -18,10 +18,11 @@
 import SwiftUI
 
 extension BlockReason {
-    /// True when this reason should not be replaced by `.onBattery` in the
-    /// activity banner. Used by `activityCorrectedGate` so power blocks don't
-    /// mask more-specific reasons.
-    var dominatesPowerBlock: Bool {
+    /// True when this reason outranks the `.onBattery` substitution in
+    /// `activityCorrectedGate` — the activity banner keeps this reason
+    /// instead of swapping in a power block, so more-specific gates aren't
+    /// masked by battery state.
+    var outranksOnBattery: Bool {
         switch self {
         case .thermal, .locked, .deviceActive, .manualPause: return true
         case .onBattery, .initializing: return false
@@ -73,7 +74,7 @@ func activityCorrectedGate(
     if isRunOnceActive {
         return .allowed(since: runOnceStartedAt ?? now)
     }
-    if snapshotGate.blockReason?.dominatesPowerBlock == true {
+    if snapshotGate.blockReason?.outranksOnBattery == true {
         return snapshotGate
     }
     if activityPowerBlock(resources: resources, queued: queued) != nil {
