@@ -67,6 +67,11 @@ actor PendingWorkStorage {
     private let depthCaps: [String: Int] = [
         PendingWork.Kind.transcribe.rawValue:         5_000,
         PendingWork.Kind.ocr.rawValue:               50_000,
+        // KG extraction is bounded by the local memory count; a 100k cap
+        // gives plenty of headroom for the historical backfill on first
+        // launch while still preventing a runaway producer from filling
+        // the queue table.
+        PendingWork.Kind.extractKG.rawValue:        100_000,
     ]
     private let defaultDepthCap = 10_000
     private let maxPayloadBytes = 64 * 1024   // 64 KB
