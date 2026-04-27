@@ -85,7 +85,6 @@ struct BrainMapEmptyStateView: View {
   var body: some View {
     let mode = BrainMapEmptyStateClassifier.mode(
       state: progress.state,
-      totalNodes: progress.totalNodes,
       totalMemories: progress.totalMemories,
       processedMemories: progress.processedMemories
     )
@@ -218,7 +217,6 @@ struct MemoryGraphInlineCard: View {
   private func inlineEmptyCopy(progress: KGBuildProgress) -> String {
     let mode = BrainMapEmptyStateClassifier.mode(
       state: progress.state,
-      totalNodes: progress.totalNodes,
       totalMemories: progress.totalMemories,
       processedMemories: progress.processedMemories
     )
