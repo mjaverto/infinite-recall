@@ -92,6 +92,7 @@ func activityShouldShowRunNowButton(
 ) -> Bool {
     if isThermalBlocked || snapshotGate?.blockReason?.disablesRunNowOverride == true { return false }
     if isRunOnceActive { return true }
+    if snapshotGate?.blockReason == .deviceActive && queued > 0 { return true }
     guard let resources, activityPowerBlock(resources: resources, queued: queued) != nil else { return false }
     return correctedGate?.blockReason == .onBattery
 }
