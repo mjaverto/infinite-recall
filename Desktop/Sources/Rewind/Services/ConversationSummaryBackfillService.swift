@@ -310,6 +310,19 @@ actor ConversationSummaryBackfillService {
         try await writeBack(sessionId: sessionId, structured: structured)
         log("ConversationSummaryBackfillService: session \(sessionId) → \"\(structured.title)\" (\(mode))")
         await notifyConversationListNeedsRefresh()
+
+        // Fire-and-forget: now that the conversation has its final title +
+        // overview, hand it off to the local-integration outbox. This is the
+        // unambiguous "conversation finished" moment in the local-first fork
+        // (the legacy `memory_created` WebSocket handler is dead code). We
+        // pass `String(sessionId)` because the API route
+        // `GET /v1/conversations/{id}` parses the path as `i64` straight off
+        // `transcription_sessions.id` — the sessionId IS the conversation id
+        // in this fork; there is no separate column or resolver.
+        Task.detached(priority: .utility) {
+            await LocalIntegrationDispatcher.shared.enqueueDispatch(conversationId: String(sessionId))
+        }
+
         return .summarized
     }
 
