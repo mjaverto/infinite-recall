@@ -73,11 +73,11 @@ final class ActivityPagePowerGateTests: XCTestCase {
         let res = resources(onBattery: false, lowPower: true)
         let corrected = GateState.blocked(reason: .onBattery, since: now, waitingFor: .acPower)
 
-        for reason in [BlockReason.thermal, .locked, .deviceActive, .manualPause] {
+        for reason in [BlockReason.thermal, .locked, .manualPause] {
             let snapshotGate = GateState.blocked(
                 reason: reason,
                 since: now,
-                waitingFor: reason == .deviceActive ? .idleFor(seconds: 60) : .manual
+                waitingFor: .manual
             )
             XCTAssertFalse(activityShouldShowRunNowButton(
                 snapshotGate: snapshotGate,
@@ -88,5 +88,99 @@ final class ActivityPagePowerGateTests: XCTestCase {
                 isRunOnceActive: false
             ), "Run now should stay hidden for \(reason)")
         }
+    }
+
+    func test_runNowButtonShownForDeviceActiveWithQueuedWork() {
+        let res = resources(onBattery: false, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .deviceActive,
+            since: now,
+            waitingFor: .idleFor(seconds: 60)
+        )
+
+        XCTAssertTrue(activityShouldShowRunNowButton(
+            snapshotGate: snapshotGate,
+            correctedGate: snapshotGate,
+            resources: res,
+            queued: 2,
+            isThermalBlocked: false,
+            isRunOnceActive: false
+        ), "Run now should be visible when device is active so the user can override the idle gate.")
+    }
+
+    func test_runNowButtonHiddenForDeviceActiveWhenQueueEmpty() {
+        let res = resources(onBattery: false, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .deviceActive,
+            since: now,
+            waitingFor: .idleFor(seconds: 60)
+        )
+
+        XCTAssertFalse(activityShouldShowRunNowButton(
+            snapshotGate: snapshotGate,
+            correctedGate: snapshotGate,
+            resources: res,
+            queued: 0,
+            isThermalBlocked: false,
+            isRunOnceActive: false
+        ), "Run now should stay hidden when device is active but the queue is empty — nothing to process.")
+    }
+
+    func test_correctedGateOverridesInitializingForAcLowPower() {
+        let res = resources(onBattery: false, lowPower: true)
+        let snapshotGate = GateState.blocked(
+            reason: .initializing,
+            since: now,
+            waitingFor: .manual
+        )
+
+        let corrected = activityCorrectedGate(
+            snapshotGate: snapshotGate,
+            resources: res,
+            queued: 3,
+            thermalState: .nominal,
+            isRunOnceActive: false,
+            runOnceStartedAt: nil,
+            now: now
+        )
+
+        XCTAssertEqual(corrected.blockReason, .onBattery, ".initializing must NOT dominate the power block — corrected gate should swap to .onBattery.")
+        XCTAssertEqual(corrected.waitingFor, .acPower)
+    }
+
+    func test_runNowButtonVisibleDuringRunOnceWhileDeviceActive() {
+        let res = resources(onBattery: false, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .deviceActive,
+            since: now,
+            waitingFor: .idleFor(seconds: 60)
+        )
+
+        XCTAssertTrue(activityShouldShowRunNowButton(
+            snapshotGate: snapshotGate,
+            correctedGate: .allowed(since: now),
+            resources: res,
+            queued: 2,
+            isThermalBlocked: false,
+            isRunOnceActive: true
+        ), "Run now should remain visible during run-once even when the snapshot gate is still .deviceActive.")
+    }
+
+    func test_runNowButtonHiddenForThermalReasonEvenWhenThermalFlagFalse() {
+        let res = resources(onBattery: false, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .thermal,
+            since: now,
+            waitingFor: .thermalCooldown
+        )
+
+        XCTAssertFalse(activityShouldShowRunNowButton(
+            snapshotGate: snapshotGate,
+            correctedGate: snapshotGate,
+            resources: res,
+            queued: 2,
+            isThermalBlocked: false,
+            isRunOnceActive: false
+        ), "Run now must hide for .thermal via disablesRunNowOverride alone, independent of the isThermalBlocked flag.")
     }
 }
