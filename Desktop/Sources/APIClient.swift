@@ -676,6 +676,7 @@ struct ServerConversation: Codable, Identifiable, Equatable {
       && lhs.finishedAt == rhs.finishedAt && lhs.structured == rhs.structured
       && lhs.status == rhs.status && lhs.discarded == rhs.discarded && lhs.deleted == rhs.deleted
       && lhs.starred == rhs.starred && lhs.folderId == rhs.folderId && lhs.source == rhs.source
+      && lhs.summaryState == rhs.summaryState
   }
 
   let id: String
@@ -699,6 +700,7 @@ struct ServerConversation: Codable, Identifiable, Equatable {
   var starred: Bool
   let folderId: String?
   let inputDeviceName: String?
+  var summaryState: String
 
   enum CodingKeys: String, CodingKey {
     case id
@@ -719,6 +721,7 @@ struct ServerConversation: Codable, Identifiable, Equatable {
     case starred
     case folderId = "folder_id"
     case inputDeviceName = "input_device_name"
+    case summaryState = "summary_state"
   }
 
   init(from decoder: Decoder) throws {
@@ -743,6 +746,7 @@ struct ServerConversation: Codable, Identifiable, Equatable {
     starred = try container.decodeIfPresent(Bool.self, forKey: .starred) ?? false
     folderId = try container.decodeIfPresent(String.self, forKey: .folderId)
     inputDeviceName = try container.decodeIfPresent(String.self, forKey: .inputDeviceName)
+    summaryState = try container.decodeIfPresent(String.self, forKey: .summaryState) ?? "pending"
   }
 
   /// Memberwise initializer for creating from local storage
@@ -764,7 +768,8 @@ struct ServerConversation: Codable, Identifiable, Equatable {
     isLocked: Bool,
     starred: Bool,
     folderId: String?,
-    inputDeviceName: String?
+    inputDeviceName: String?,
+    summaryState: String = "pending"
   ) {
     self.id = id
     self.createdAt = createdAt
@@ -784,6 +789,7 @@ struct ServerConversation: Codable, Identifiable, Equatable {
     self.starred = starred
     self.folderId = folderId
     self.inputDeviceName = inputDeviceName
+    self.summaryState = summaryState
   }
 
   /// Returns the title from structured data, or a derived one from the overview.
@@ -847,41 +853,24 @@ struct ServerConversation: Codable, Identifiable, Equatable {
   }
 }
 
-// MARK: - Summary pending inference (shared across ConversationRowView /
-// ConversationDetailView so the list and detail views render identical
-// pending-state copy without diverging logic). Pure UI inference from
-// existing `ServerConversation` fields — no model changes, no DB queries.
+// MARK: - Summary display state
+//
+// The DB column `summary_state` is the source of truth — written explicitly by
+// the summarize pipeline (`done`), the placeholder/dead-letter paths
+// (`unavailable`), or left at the default (`pending`). The list and detail
+// views read this enum so badge/copy can branch without re-deriving state from
+// title/overview heuristics.
+enum SummaryDisplayState { case done, pending, unavailable }
+
 extension ServerConversation {
-  /// True when the recording finished but the LLM has not yet produced a
-  /// title/overview.
-  ///
-  /// Conditions (all must hold):
-  ///   - `status == .completed` (finished, not actively recording)
-  ///   - `structured.overview` is empty/whitespace
-  ///   - we have evidence the session contains audio: either a non-empty
-  ///     `cachedPreview` snippet (passed by callers from
-  ///     `appState.conversationPreviews[id]`), OR `transcriptSegments` is
-  ///     non-empty, OR `(finishedAt - startedAt)` is greater than ~10 s.
-  ///
-  /// - Parameter cachedPreview: optional cached preview text from
-  ///   `AppState.conversationPreviews[id]`. Pass `nil` from callers that
-  ///   don't have AppState in scope (e.g. detail view).
-  func isSummaryPending(cachedPreview: String?) -> Bool {
-    guard status == .completed else { return false }
-    let overview = structured.overview
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard overview.isEmpty else { return false }
-    if let cached = cachedPreview,
-       !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      return true
+  var summaryDisplayState: SummaryDisplayState {
+    switch summaryState {
+    case "done": return .done
+    case "unavailable": return .unavailable
+    default:
+      logError("ServerConversation.summaryDisplayState: unknown summary_state value \"\(summaryState)\" — falling back to .pending")
+      return .pending
     }
-    if !transcriptSegments.isEmpty {
-      return true
-    }
-    if let start = startedAt, let end = finishedAt {
-      return end.timeIntervalSince(start) > 10
-    }
-    return false
   }
 }
 

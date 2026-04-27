@@ -1135,6 +1135,7 @@ actor RewindDatabase {
                 t.column("backendSynced", .boolean).notNull().defaults(to: false)
                 t.column("createdAt", .datetime).notNull()
                 t.column("updatedAt", .datetime).notNull()
+                t.column("summary_state", .text).notNull().defaults(to: "pending")
             }
 
             // Transcript segments (child)
@@ -2456,6 +2457,26 @@ actor RewindDatabase {
             // every UI reload — index it so a backlog doesn't full-scan.
             try db.create(index: "idx_local_integration_outbox_integration_id",
                           on: "local_integration_outbox", columns: ["integrationId"])
+        }
+
+        migrator.registerMigration("addSummaryStateColumn") { db in
+            try db.execute(sql: """
+                ALTER TABLE transcription_sessions
+                  ADD COLUMN summary_state TEXT NOT NULL DEFAULT 'pending'
+                """)
+            try db.execute(sql: """
+                UPDATE transcription_sessions
+                  SET summary_state = CASE
+                    WHEN title IS NOT NULL
+                         AND title NOT IN ('', 'Short Recording', 'Ambient Audio', 'Summary Unavailable')
+                         AND overview IS NOT NULL AND overview != ''
+                      THEN 'done'
+                    WHEN title IN ('Short Recording', 'Ambient Audio', 'Summary Unavailable')
+                         AND (overview IS NULL OR overview = '')
+                      THEN 'unavailable'
+                    ELSE 'pending'
+                  END
+                """)
         }
 
         try migrator.migrate(queue)

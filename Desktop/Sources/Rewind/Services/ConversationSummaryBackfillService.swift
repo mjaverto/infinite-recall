@@ -374,6 +374,7 @@ actor ConversationSummaryBackfillService {
             SELECT s.id FROM transcription_sessions AS s
              WHERE s.finishedAt IS NOT NULL
                AND s.deleted = 0
+               AND s.summary_state = 'pending'
                AND ((s.title IS NULL OR s.title = '')
                     OR (s.overview IS NULL OR s.overview = ''))
                AND EXISTS (
@@ -403,8 +404,9 @@ actor ConversationSummaryBackfillService {
         let sql = """
             SELECT id FROM transcription_sessions
              WHERE finishedAt IS NOT NULL
-               AND (title IS NULL OR title = '')
-               AND (overview IS NULL OR overview = '')
+               AND summary_state = 'pending'
+               AND ((title IS NULL OR title = '')
+                    OR (overview IS NULL OR overview = ''))
              ORDER BY finishedAt DESC
              LIMIT 1
             """
@@ -424,12 +426,17 @@ actor ConversationSummaryBackfillService {
         }
 
         if onlyIfNeedsSummary {
+            // Filter must match `fetchEligibleSessionIds`'s OR-shape — otherwise
+            // a session enqueued because (e.g.) only `overview` is empty gets
+            // skipped here when it has a placeholder title, and the same row
+            // bounces between enqueue and skip on every drain.
             let needsSummarySQL = """
                 SELECT COUNT(*) FROM transcription_sessions
                  WHERE id = ?
                    AND finishedAt IS NOT NULL
-                   AND (title IS NULL OR title = '')
-                   AND (overview IS NULL OR overview = '')
+                   AND summary_state = 'pending'
+                   AND ((title IS NULL OR title = '')
+                        OR (overview IS NULL OR overview = ''))
                 """
             let needsSummary = try await dbQueue.read { db in
                 try Int.fetchOne(db, sql: needsSummarySQL, arguments: [sessionId]) ?? 0
@@ -512,6 +519,7 @@ actor ConversationSummaryBackfillService {
                    overview = ?,
                    emoji = ?,
                    category = ?,
+                   summary_state = 'unavailable',
                    updatedAt = ?
              WHERE id = ?
             """
@@ -521,6 +529,27 @@ actor ConversationSummaryBackfillService {
                 arguments: [title, overview, emoji, category, Date(), sessionId]
             )
         }
+    }
+
+    /// Mark a session unsummarizable without overwriting its title/overview.
+    /// Used when the dead-letter path or skip path needs to break the
+    /// re-enqueue loop without touching the visible structured fields.
+    func writeUnsummarizableState(sessionId: Int64, reason: String) async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw TranscriptionStorageError.databaseNotInitialized
+        }
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE transcription_sessions
+                       SET summary_state = 'unavailable',
+                           updatedAt = ?
+                     WHERE id = ?
+                    """,
+                arguments: [Date(), sessionId]
+            )
+        }
+        log("ConversationSummaryBackfillService: marked session \(sessionId) summary_state=unavailable (\(reason))")
     }
 
     /// Write the LLM-generated structured fields back to the session row.
@@ -534,6 +563,7 @@ actor ConversationSummaryBackfillService {
                    overview = ?,
                    emoji = ?,
                    category = ?,
+                   summary_state = 'done',
                    updatedAt = ?
              WHERE id = ?
             """

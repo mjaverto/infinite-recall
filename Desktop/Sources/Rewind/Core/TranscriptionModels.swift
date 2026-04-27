@@ -64,7 +64,21 @@ struct TranscriptionSessionRecord: Codable, FetchableRecord, PersistableRecord, 
     var starred: Bool
     var folderId: String?
 
+    // MARK: - Summary State
+    /// Explicit summary lifecycle: "pending" | "done" | "unavailable"
+    var summaryState: String
+
     static let databaseTableName = "transcription_sessions"
+
+    enum CodingKeys: String, CodingKey {
+        case id, startedAt, finishedAt, source, language, timezone, inputDeviceName
+        case status, retryCount, lastError, backendId, backendSynced
+        case createdAt, updatedAt
+        case title, overview, emoji, category, actionItemsJson, eventsJson
+        case geolocationJson, photosJson, appsResultsJson
+        case conversationStatus, discarded, deleted, isLocked, starred, folderId
+        case summaryState = "summary_state"
+    }
 
     // MARK: - Initialization
 
@@ -100,7 +114,8 @@ struct TranscriptionSessionRecord: Codable, FetchableRecord, PersistableRecord, 
         deleted: Bool = false,
         isLocked: Bool = false,
         starred: Bool = false,
-        folderId: String? = nil
+        folderId: String? = nil,
+        summaryState: String = "pending"
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -134,6 +149,7 @@ struct TranscriptionSessionRecord: Codable, FetchableRecord, PersistableRecord, 
         self.isLocked = isLocked
         self.starred = starred
         self.folderId = folderId
+        self.summaryState = summaryState
     }
 
     // MARK: - Persistence Callbacks
@@ -346,7 +362,8 @@ extension TranscriptionSessionRecord {
             deleted: conversation.deleted,
             isLocked: conversation.isLocked,
             starred: conversation.starred,
-            folderId: conversation.folderId
+            folderId: conversation.folderId,
+            summaryState: conversation.summaryState
         )
     }
 
@@ -391,6 +408,7 @@ extension TranscriptionSessionRecord {
         self.isLocked = conversation.isLocked
         self.starred = conversation.starred
         self.folderId = conversation.folderId
+        self.summaryState = conversation.summaryState
 
         // Mark as synced
         self.backendId = conversation.id
@@ -526,7 +544,8 @@ extension TranscriptionSessionRecord {
             isLocked: isLocked,
             starred: starred,
             folderId: folderId,
-            inputDeviceName: inputDeviceName
+            inputDeviceName: inputDeviceName,
+            summaryState: summaryState
         )
     }
 }
