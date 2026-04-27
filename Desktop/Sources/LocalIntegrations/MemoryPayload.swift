@@ -95,12 +95,19 @@ struct MemoryPayload: Codable {
 
     // Decode tagsJson if present and well-formed; otherwise fall back to
     // the single-element category array (matching the conversation path's
-    // tag convention), filtered for empty strings.
-    if let json = record.tagsJson,
-      let data = json.data(using: .utf8),
-      let decoded = try? JSONDecoder().decode([String].self, from: data)
-    {
-      self.tags = decoded
+    // tag convention), filtered for empty strings. Decode errors are
+    // logged so a shape drift (e.g. extractor regression writing objects
+    // instead of strings) doesn't degrade silently across every export.
+    if let json = record.tagsJson, let data = json.data(using: .utf8) {
+      do {
+        self.tags = try JSONDecoder().decode([String].self, from: data)
+      } catch {
+        logError(
+          "MemoryPayload: tagsJson decode failed for memory id=\(record.id ?? 0)",
+          error: error
+        )
+        self.tags = record.category.isEmpty ? [] : [record.category]
+      }
     } else {
       self.tags = record.category.isEmpty ? [] : [record.category]
     }

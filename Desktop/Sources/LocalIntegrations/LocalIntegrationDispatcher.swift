@@ -67,11 +67,18 @@ actor LocalIntegrationDispatcher {
     }
 
     // Snapshot enabled integrations.
+    // NOTE: a failure here (e.g. DB corruption / disk full) currently has
+    // no per-integration UI surface — we can't enumerate rows to mark
+    // them when the lister itself failed. Surfacing this would require a
+    // global integration-system health row; tracked as a design gap.
     let enabled: [LocalIntegrationRecord]
     do {
       enabled = try await LocalIntegrationStorage.shared.listEnabled()
     } catch {
-      logError("LocalIntegrationDispatcher: listEnabled failed", error: error)
+      logError(
+        "LocalIntegrationDispatcher: listEnabled failed — exports for memory=\(payload.id) silently dropped, no per-integration UI surface (see /private/tmp/omi-dev.log)",
+        error: error
+      )
       return
     }
     if enabled.isEmpty {
