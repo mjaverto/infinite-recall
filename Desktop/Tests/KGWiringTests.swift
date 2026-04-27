@@ -92,7 +92,6 @@ final class KGWiringTests: XCTestCase {
         for state: BuildState in [.building, .pausedThermal, .pausedBattery, .pausedNotIdle, .modelNotReady] {
             let mode = BrainMapEmptyStateClassifier.mode(
                 state: state,
-                totalNodes: 0,
                 totalMemories: 100,
                 processedMemories: 5
             )
@@ -106,7 +105,6 @@ final class KGWiringTests: XCTestCase {
     func testClassifierReturnsNotStartedWhenIdleAndUntouched() {
         let mode = BrainMapEmptyStateClassifier.mode(
             state: .idleNoWork,
-            totalNodes: 0,
             totalMemories: 50,
             processedMemories: 0
         )
@@ -116,7 +114,6 @@ final class KGWiringTests: XCTestCase {
     func testClassifierReturnsCompleteEmptyWhenIdleAndProcessedAllZero() {
         let mode = BrainMapEmptyStateClassifier.mode(
             state: .idleNoWork,
-            totalNodes: 0,
             totalMemories: 50,
             processedMemories: 50
         )
@@ -126,7 +123,6 @@ final class KGWiringTests: XCTestCase {
     func testClassifierReturnsCompleteEmptyWhenNoMemoriesAtAll() {
         let mode = BrainMapEmptyStateClassifier.mode(
             state: .idleNoWork,
-            totalNodes: 0,
             totalMemories: 0,
             processedMemories: 0
         )
@@ -194,5 +190,94 @@ final class KGWiringTests: XCTestCase {
         await KGProgressPublisher.shared.recordDrainSample(seconds: 0.6)
         // No crash + tick still works.
         await KGProgressPublisher.shared.tick()
+    }
+
+    // MARK: - Cluster D3 — saturating progress invariants
+
+    func testBuildProgressClampsProcessedOverTotal() {
+        let p = KGBuildProgress(
+            totalMemories: 10,
+            processedMemories: 15,   // race window, clamp to total
+            succeededMemories: 12,
+            totalNodes: 0,
+            state: .building,
+            etaSeconds: nil
+        )
+        XCTAssertEqual(p.totalMemories, 10)
+        XCTAssertEqual(p.processedMemories, 10, "processed must clamp to total")
+        XCTAssertEqual(p.succeededMemories, 10, "succeeded must clamp to processed")
+    }
+
+    func testBuildProgressClampsSucceededOverProcessed() {
+        let p = KGBuildProgress(
+            totalMemories: 10,
+            processedMemories: 4,
+            succeededMemories: 9,    // bogus — succeeded must trail processed
+            totalNodes: 0,
+            state: .building,
+            etaSeconds: nil
+        )
+        XCTAssertEqual(p.processedMemories, 4)
+        XCTAssertEqual(p.succeededMemories, 4, "succeeded must clamp to processed")
+    }
+
+    func testBuildProgressClampsNegativeInputs() {
+        let p = KGBuildProgress(
+            totalMemories: -1,
+            processedMemories: -5,
+            succeededMemories: -3,
+            totalNodes: -2,
+            state: .idleNoWork,
+            etaSeconds: nil
+        )
+        XCTAssertEqual(p.totalMemories, 0)
+        XCTAssertEqual(p.processedMemories, 0)
+        XCTAssertEqual(p.succeededMemories, 0)
+        XCTAssertEqual(p.totalNodes, 0)
+    }
+
+    // MARK: - Cluster H1 — extractKG depth cap
+
+    func testExtractKGNotCapDroppedAtLowDepth() async throws {
+        // Cluster H1: the depthCaps entry for extractKG must be high enough
+        // that a single enqueue at low queue depth doesn't trigger a
+        // cap-drop. We use the recentDrops counter delta to detect cap-drop
+        // — a nil return from `enqueue` could also mean a dedup hit, which
+        // is fine for this assertion.
+        let storage = PendingWorkStorage.shared
+        let dropsBefore = await storage.recentDrops
+
+        let key = "extractKG-test-\(UUID().uuidString)"
+        let payload = try JSONSerialization.data(withJSONObject: ["memory_id": Int64.max])
+        _ = try await storage.enqueue(
+            workType: PendingWork.Kind.extractKG.rawValue,
+            payload: payload,
+            dedupKey: key
+        )
+
+        let dropsAfter = await storage.recentDrops
+        XCTAssertEqual(
+            dropsAfter, dropsBefore,
+            "extractKG must not be cap-dropped at low queue depth (recentDrops bumped)"
+        )
+    }
+
+    // MARK: - Cluster K — classifier no longer takes totalNodes
+
+    func testClassifierIsPureFunctionOfStateAndCounts() {
+        // Same (state, totals) must produce same mode regardless of
+        // anything else — the only inputs are the three params.
+        XCTAssertEqual(
+            BrainMapEmptyStateClassifier.mode(state: .idleNoWork, totalMemories: 5, processedMemories: 0),
+            .backfillNotStarted
+        )
+        XCTAssertEqual(
+            BrainMapEmptyStateClassifier.mode(state: .idleNoWork, totalMemories: 5, processedMemories: 5),
+            .backfillCompleteEmpty
+        )
+        XCTAssertEqual(
+            BrainMapEmptyStateClassifier.mode(state: .building, totalMemories: 5, processedMemories: 2),
+            .backfillRunningNoNodesYet
+        )
     }
 }
