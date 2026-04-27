@@ -126,6 +126,15 @@ public final class ActivityMonitorService: ObservableObject {
         self.lastError = nil
     }
 
+    /// POST /v1/activity/processes/:pid/terminate — ask the Rust daemon to
+    /// SIGTERM the LocalModel worker child for `pid` so its memory is
+    /// reclaimed. launchd `KeepAlive=true` will respawn it on the next
+    /// request, which is fine — this is a memory-reclaim button ("Unload"),
+    /// not a permanent stop.
+    public func terminateProcess(pid: Int32) async throws {
+        try await APIClient.shared.terminateActivityProcess(pid: pid)
+    }
+
     /// Production-safe immediate refresh for one-shot scheduling state flips.
     /// Uses the same guarded fetch path as the 1 Hz poller, so overlapping
     /// refreshes coalesce instead of piling up network calls.

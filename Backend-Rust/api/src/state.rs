@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::activity::terminate::LocalModelGate;
 use crate::activity::{InflightRegistry, PauseStore, ProcessingGate, ResourceSampler, WritableProcessingGate};
 use crate::db::SqlitePool;
 
@@ -53,4 +54,11 @@ pub struct AppState {
     /// Lagged receivers are simply expected to re-poll on their next tick.
     pub pause_tx: broadcast::Sender<PauseChange>,
     // === /activity:A ===
+    // === activity:lane-d ===
+    /// LocalModel allowlist gate for `POST /v1/activity/processes/:pid/terminate`.
+    /// Production wires `ProcLocalModelGate` (re-discovers the LocalModel pid
+    /// set on every call — does NOT trust the 2 s sampler cache, which would
+    /// leave a TOCTOU window for pid-recycle). Tests inject a stub.
+    pub local_model_gate: Arc<dyn LocalModelGate>,
+    // === /activity:lane-d ===
 }

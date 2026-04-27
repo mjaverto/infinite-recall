@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 actor APIClient {
   static let shared = APIClient()
@@ -5126,6 +5127,52 @@ extension APIClient {
     guard (200...299).contains(http.statusCode) else {
       throw APIError.httpError(statusCode: http.statusCode)
     }
+  }
+
+  /// POST /v1/activity/processes/:pid/terminate — ask the Rust daemon to
+  /// SIGTERM the LocalModel worker child for `pid` so its memory is reclaimed.
+  /// 204 on success. 404 if the pid is not in the LocalModel allowlist or no
+  /// longer alive; 5xx if the kill itself failed.
+  func terminateActivityProcess(pid: Int32) async throws {
+    let base = try rustBackendURL
+    guard let url = URL(string: base + "v1/activity/processes/\(pid)/terminate") else {
+      throw APIError.invalidResponse
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.allHTTPHeaderFields = try activityHeaders()
+    request.timeoutInterval = 10  // 5s server-side grace + SIGKILL + margin
+
+    let (data, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw APIError.invalidResponse
+    }
+    if http.statusCode == 401 { throw APIError.unauthorized }
+    guard (200...299).contains(http.statusCode) else {
+      // Try to surface the daemon's `{error: "..."}` payload so 5xx failures
+      // show up in logs instead of being a silent "HTTP 500". Best-effort —
+      // a non-JSON body is fine, we just fall through to the bare httpError.
+      if let detail = Self.decodeErrorDetail(from: data) {
+        Self.terminateLog.error(
+          "terminateActivityProcess pid=\(pid, privacy: .public) http=\(http.statusCode, privacy: .public) detail=\(detail, privacy: .public)"
+        )
+      }
+      throw APIError.httpError(statusCode: http.statusCode)
+    }
+  }
+
+  /// Logger for the terminate path so 5xx daemon errors surface in log streams.
+  private static let terminateLog = Logger(
+    subsystem: "me.omi.desktop", category: "APIClient.terminate"
+  )
+
+  /// Best-effort decode of `{error: String}` (the daemon's standard error
+  /// envelope, see `routes/activity.rs::terminate_process`). Returns `nil` if
+  /// the body isn't JSON or doesn't have an `error` field.
+  private static func decodeErrorDetail(from data: Data) -> String? {
+    struct ErrorBody: Decodable { let error: String }
+    return (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error
   }
 
   /// POST /v1/activity/_internal/inflight — Swift→Rust loopback, called by

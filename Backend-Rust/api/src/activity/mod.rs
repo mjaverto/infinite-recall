@@ -15,6 +15,7 @@ pub mod gate;
 pub mod inflight;
 pub mod pause_store;
 pub mod resources;
+pub mod terminate;
 pub mod traits;
 pub mod types;
 

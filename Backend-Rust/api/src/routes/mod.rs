@@ -63,6 +63,13 @@ pub fn router(state: AppState) -> Router {
             post(activity::gate_state),
         )
         // === /activity:32 ===
+        // === activity:lane-d ===
+        // Hard-kill a tracked LocalModel worker (mlx-lm / mlx-vlm) by pid.
+        .route(
+            "/v1/activity/processes/:pid/terminate",
+            post(activity::terminate_process),
+        )
+        // === /activity:lane-d ===
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

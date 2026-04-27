@@ -79,6 +79,13 @@ pub async fn run() -> Result<()> {
     let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
     // === /activity:A ===
 
+    // === activity:lane-d ===
+    // Production LocalModel allowlist gate for the terminate route. Re-runs
+    // pid discovery on every call (does not trust the sampler's 2 s cache).
+    let local_model_gate: Arc<dyn activity::terminate::LocalModelGate> =
+        Arc::new(activity::terminate::ProcLocalModelGate::new());
+    // === /activity:lane-d ===
+
     let state = AppState {
         pool,
         write_pool,
@@ -91,6 +98,9 @@ pub async fn run() -> Result<()> {
         processing_gate_writer,
         pause_tx,
         // === /activity:A ===
+        // === activity:lane-d ===
+        local_model_gate,
+        // === /activity:lane-d ===
     };
     let app = routes::router(state);
 

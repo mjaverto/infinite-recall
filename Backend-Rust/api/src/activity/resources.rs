@@ -1,8 +1,12 @@
-//! Stream C: `SystemResourceSampler` — process-tree CPU/RSS + system GPU sampler.
+//! Stream C: `SystemResourceSampler` — process-tree CPU/memory + system GPU sampler.
 //!
 //! Implements [`ResourceSampler`] using:
-//! - `libproc::pid_rusage::pidinfo::<TaskInfo>` for self + Swift PID + mlx-lm PID
-//!   CPU/RSS deltas.
+//! - `libproc::proc_pid::pidinfo::<TaskInfo>` for self + Swift PID + mlx-lm PID
+//!   CPU deltas.
+//! - `libproc::pid_rusage::pidrusage::<RUsageInfoV4>` for `ri_phys_footprint`,
+//!   the field Activity Monitor's "Memory" column reads. We do NOT use
+//!   `pti_resident_size` (plain RSS) — it under-reports MLX workers by
+//!   excluding compressed / swapped pages.
 //! - PID discovery order:
 //!   1. pidfile under `~/Library/Application Support/InfiniteRecall/{swift,mlxlm}.pid`
 //!   2. `pgrep -f` against the well-known executable pattern
@@ -22,6 +26,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use libproc::pid_rusage::{pidrusage, RUsageInfoV4};
 use libproc::proc_pid;
 use libproc::task_info::TaskInfo;
 
@@ -159,14 +164,14 @@ impl ResourceSampler for SystemResourceSampler {
         // 3. sample
         let breakdown = sample_processes(&pids);
         let cpu_total: f32 = breakdown.iter().map(|p| p.cpu_percent).sum();
-        let rss_total: u32 = breakdown.iter().map(|p| p.rss_mb).sum();
+        let mem_total: u32 = breakdown.iter().map(|p| p.mem_mb).sum();
         let gpu = sample_gpu_percent();
         let thermal = sample_thermal();
         let (on_battery, low_power) = sample_power();
 
         let sample = ResourceSample {
             cpu_percent: cpu_total,
-            rss_mb: rss_total,
+            mem_mb: mem_total,
             gpu_system_percent: gpu,
             thermal_state: thermal,
             on_battery,
@@ -614,13 +619,38 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// libproc CPU/RSS sampling
+// libproc CPU/memory sampling
 // ---------------------------------------------------------------------------
 
-/// Samples CPU% and RSS for each pid by reading task_info twice ~250ms apart.
+/// Returns `ri_phys_footprint` (in bytes) for `pid` via `pidrusage::<RUsageInfoV4>`.
+///
+/// **CRITICAL: do NOT replace this body with `pidrusage::<RUsageInfoV4>(pid).map(|r| r.memory_used())`.**
+/// `PIDRUsage::memory_used()` is hardcoded to return `ri_resident_size` (plain RSS),
+/// which is exactly the value that motivated this fix — it excludes compressed
+/// and swapped pages and under-reports MLX workers vs. Activity Monitor's
+/// "Memory" column. We deliberately read `ri_phys_footprint` directly.
+fn pid_phys_footprint(pid: i32) -> Option<u64> {
+    match pidrusage::<RUsageInfoV4>(pid) {
+        Ok(r) => Some(r.ri_phys_footprint),
+        Err(e) => {
+            tracing::debug!(
+                component = "activity.resources",
+                pid,
+                error = %e,
+                "pidrusage failed"
+            );
+            None
+        }
+    }
+}
+
+/// Samples CPU% and memory for each pid by reading task_info twice ~250ms apart,
+/// plus one `pidrusage` call for `ri_phys_footprint`.
 ///
 /// CPU% is computed as `(delta_user_ns + delta_sys_ns) /
-/// (elapsed_ns * num_cores) * 100`. RSS is taken from the second sample.
+/// (elapsed_ns * num_cores) * 100`. Memory is `ri_phys_footprint` from the
+/// second sample window — the same metric Activity Monitor's "Memory" column
+/// surfaces, so MLX worker rows align with what users see in Activity Monitor.
 ///
 /// Pids that disappear between calls are silently dropped.
 fn sample_processes(pids: &[(String, i32, Option<ProcessKind>)]) -> Vec<ProcessBreakdown> {
@@ -657,9 +687,14 @@ fn sample_processes(pids: &[(String, i32, Option<ProcessKind>)]) -> Vec<ProcessB
             0.0
         };
 
-        // pti_resident_size is bytes; convert to MB (1024^2 to stay consistent
-        // with Activity Monitor "Memory" column reporting).
-        let rss_mb = (after.pti_resident_size / (1024 * 1024)) as u32;
+        // ri_phys_footprint is bytes; convert to MB (1024^2 to stay consistent
+        // with Activity Monitor "Memory" column reporting). If pidrusage
+        // fails between the two TaskInfo calls (PID exited), drop this row
+        // for symmetry with the existing CPU-delta drop.
+        let Some(phys_footprint) = pid_phys_footprint(pid) else {
+            continue;
+        };
+        let mem_mb = (phys_footprint / (1024 * 1024)) as u32;
 
         // For known kinds the discovery label wins: `proc_pid::name` would
         // collapse mlx-lm and mlx-vlm to `python3.11`/`uv`, making the rows
@@ -678,7 +713,7 @@ fn sample_processes(pids: &[(String, i32, Option<ProcessKind>)]) -> Vec<ProcessB
             name: display_name,
             pid,
             cpu_percent,
-            rss_mb,
+            mem_mb,
             kind,
         });
     }
@@ -1056,7 +1091,7 @@ mod tests {
         // process_breakdown is identical because we returned the cached clone.
         assert_eq!(a.process_breakdown.len(), b.process_breakdown.len());
         assert_eq!(a.process_breakdown[0].pid, b.process_breakdown[0].pid);
-        assert_eq!(a.process_breakdown[0].rss_mb, b.process_breakdown[0].rss_mb);
+        assert_eq!(a.process_breakdown[0].mem_mb, b.process_breakdown[0].mem_mb);
         assert!((a.cpu_percent - b.cpu_percent).abs() < f32::EPSILON);
     }
 
@@ -1536,6 +1571,34 @@ Currently in use:
             !child_rows.is_empty(),
             "expected at least one 'mlx-lm child' row in {pids:?}"
         );
+    }
+
+    /// Regression: `mem_mb` must come from `ri_phys_footprint` (matches
+    /// Activity Monitor "Memory" column), not `ri_resident_size`. Sampling
+    /// our own pid must yield a strictly positive footprint and a sane
+    /// upper bound — a test process should never report >64 GiB. We do
+    /// NOT cross-check against `getrusage(RUSAGE_SELF).ru_maxrss`: on
+    /// macOS that's bytes-not-KB and reports peak-not-current, so it's
+    /// the wrong oracle.
+    #[test]
+    fn mem_mb_uses_phys_footprint_for_self_pid() {
+        let me = std::process::id() as i32;
+        let breakdown = sample_processes(&[("self".to_string(), me, Some(ProcessKind::Core))]);
+        assert_eq!(breakdown.len(), 1, "expected exactly one row for self");
+        let row = &breakdown[0];
+        assert!(
+            row.mem_mb > 0,
+            "phys_footprint sampled to 0 MB — likely the wrong field is being read"
+        );
+        assert!(
+            row.mem_mb < 65_536,
+            "phys_footprint of {} MB exceeds the 64 GiB sanity ceiling for the test process",
+            row.mem_mb
+        );
+
+        // And independently confirm the underlying helper agrees with libproc.
+        let footprint = pid_phys_footprint(me).expect("pidrusage must succeed for self");
+        assert!(footprint > 0, "ri_phys_footprint must be > 0 for live self");
     }
 
     /// Helper: unique tempdir under env::temp_dir.

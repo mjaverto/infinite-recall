@@ -254,29 +254,29 @@ public struct ProcessBreakdown: Codable, Hashable {
     public let name: String
     public let pid: Int32
     public let cpuPercent: Float
-    public let rssMb: UInt32
+    public let memMb: UInt32
     public let kind: ProcessKind?
 
     enum CodingKeys: String, CodingKey {
         case name
         case pid
         case cpuPercent = "cpu_percent"
-        case rssMb = "rss_mb"
+        case memMb = "mem_mb"
         case kind
     }
 
-    public init(name: String, pid: Int32, cpuPercent: Float, rssMb: UInt32, kind: ProcessKind? = nil) {
+    public init(name: String, pid: Int32, cpuPercent: Float, memMb: UInt32, kind: ProcessKind? = nil) {
         self.name = name
         self.pid = pid
         self.cpuPercent = cpuPercent
-        self.rssMb = rssMb
+        self.memMb = memMb
         self.kind = kind
     }
 }
 
 public struct ResourceSample: Codable, Hashable {
     public let cpuPercent: Float
-    public let rssMb: UInt32
+    public let memMb: UInt32
     public let gpuSystemPercent: Float?
     public let thermalState: ThermalState
     public let onBattery: Bool
@@ -285,7 +285,7 @@ public struct ResourceSample: Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case cpuPercent = "cpu_percent"
-        case rssMb = "rss_mb"
+        case memMb = "mem_mb"
         case gpuSystemPercent = "gpu_system_percent"
         case thermalState = "thermal_state"
         case onBattery = "on_battery"
@@ -295,7 +295,7 @@ public struct ResourceSample: Codable, Hashable {
 
     public init(
         cpuPercent: Float,
-        rssMb: UInt32,
+        memMb: UInt32,
         gpuSystemPercent: Float?,
         thermalState: ThermalState,
         onBattery: Bool,
@@ -303,7 +303,7 @@ public struct ResourceSample: Codable, Hashable {
         processBreakdown: [ProcessBreakdown]
     ) {
         self.cpuPercent = cpuPercent
-        self.rssMb = rssMb
+        self.memMb = memMb
         self.gpuSystemPercent = gpuSystemPercent
         self.thermalState = thermalState
         self.onBattery = onBattery

@@ -210,7 +210,11 @@ pub struct ProcessBreakdown {
     pub name: String,
     pub pid: i32,
     pub cpu_percent: f32,
-    pub rss_mb: u32,
+    /// Memory in MB, sourced from `ri_phys_footprint` (matches the value
+    /// Activity Monitor's "Memory" column displays). NOT plain RSS — RSS
+    /// excludes compressed/swapped regions and undercounts MLX worker
+    /// rows by a wide margin.
+    pub mem_mb: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ProcessKind>,
 }
@@ -220,8 +224,8 @@ pub struct ProcessBreakdown {
 pub struct ResourceSample {
     /// Sum of `process_breakdown[*].cpu_percent`.
     pub cpu_percent: f32,
-    /// Sum of `process_breakdown[*].rss_mb`.
-    pub rss_mb: u32,
+    /// Sum of `process_breakdown[*].mem_mb`.
+    pub mem_mb: u32,
     /// System-wide GPU utilisation, when available (Apple Silicon).
     pub gpu_system_percent: Option<f32>,
     pub thermal_state: ThermalState,
@@ -488,7 +492,7 @@ mod tests {
 
     #[test]
     fn process_kind_unknown_variant_decodes_future_wire_values() {
-        let json = r#"{"name":"future-proc","pid":9999,"cpu_percent":1.0,"rss_mb":10,"kind":"future_unknown"}"#;
+        let json = r#"{"name":"future-proc","pid":9999,"cpu_percent":1.0,"mem_mb":10,"kind":"future_unknown"}"#;
         let p: ProcessBreakdown = serde_json::from_str(json).unwrap();
         assert_eq!(p.kind, Some(ProcessKind::Unknown));
 

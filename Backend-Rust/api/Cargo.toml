@@ -44,6 +44,12 @@ hex = "0.4"
 # CLI args / env
 dirs = "5"
 
+# === activity:lane-d terminate endpoint ===
+# Direct POSIX `kill(2)` for the LocalModel worker terminate route.
+# Smaller than `nix`. Lane A is forbidden from editing Cargo.toml so this
+# add is owned by Lane D — no coordination race.
+libc = "0.2"
+
 # === activity:stream-C resource sampler ===
 # macOS process-tree CPU/RSS sampler used by Activity Tab.
 libproc = "0.14"
@@ -57,3 +63,8 @@ activity_test_wiring = []
 
 [dev-dependencies]
 tempfile = "3"
+# === activity:lane-d ===
+# `libc` is in [dependencies] (used by the terminate route handler);
+# integration tests at `tests/terminate_endpoint.rs` use it directly to
+# probe pid liveness post-kill, so no extra dev-dep is needed.
+# === /activity:lane-d ===

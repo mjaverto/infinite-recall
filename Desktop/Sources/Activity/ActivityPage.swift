@@ -4,7 +4,7 @@
 //
 // Layout (per UX scenarios 1–9 in plan):
 //   • Header banner — color-coded `processing_gate` reason
-//   • 3 resource cards — CPU%, RSS, system-wide GPU(?)
+//   • 3 resource cards — CPU%, memory (phys_footprint), system-wide GPU(?)
 //     - CPU card expands into per-process breakdown (Swift / Rust / mlx-lm)
 //   • In-flight section — one row per kind currently running
 //   • Live capture section — Audio + Screen with confirm sheet on pause
@@ -16,6 +16,7 @@
 // these are no-op fallbacks (see `ActivityMonitorServiceFallback` below).
 
 import SwiftUI
+import os.log
 
 extension BlockReason {
     /// True when this reason outranks the `.onBattery` substitution in
@@ -109,9 +110,41 @@ struct ActivityPage: View {
     @State private var captureToConfirm: CaptureKind? = nil
     @State private var captureMinutesToConfirm: UInt32 = 5
 
+    // Unload (LocalModel kill) state. Per-pid sets are required so multiple
+    // concurrent unloads each track their own spinner / hidden-row state.
+    @State private var unloadingPids: Set<Int32> = []
+    @State private var hiddenPids: Set<Int32> = []
+    @State private var pendingUnload: PendingUnload? = nil
+    @State private var unloadErrorMessage: String? = nil
+
     /// Drives the per-row "elapsed timer" updates without polling the service.
     @State private var tick = Date()
     private let tickTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    /// Identifiable wrapper around the pid we're about to unload, so we can
+    /// drive `.alert(item:)` (which requires Identifiable). The dialog also
+    /// needs the process name for copy.
+    fileprivate struct PendingUnload: Identifiable {
+        let pid: Int32
+        let name: String
+        var id: Int32 { pid }
+    }
+
+    /// Identifiable wrapper for `.alert(item:)` — required because Swift's
+    /// `String` is not `Identifiable`.
+    ///
+    /// `id` derives from `message` so identity is stable across SwiftUI
+    /// re-renders of the computed binding. A `UUID()`-per-render here would
+    /// make every body recomputation look like a brand-new alert and cause
+    /// flicker / re-presentation.
+    fileprivate struct UnloadErrorIdentifier: Identifiable {
+        let message: String
+        var id: String { message }
+    }
+
+    /// Subsystem-wide logger for the Activity page. Matches the pattern used
+    /// elsewhere in the app (`Logger(subsystem: "me.omi.desktop", category: ...)`).
+    private static let log = Logger(subsystem: "me.omi.desktop", category: "ActivityPage")
 
     var body: some View {
         ScrollView {
@@ -148,6 +181,28 @@ struct ActivityPage: View {
         // === /activity:C1 ===
         .sheet(item: $captureToConfirm) { kind in
             captureConfirmSheet(kind: kind)
+        }
+        .alert(item: $pendingUnload) { pending in
+            Alert(
+                title: Text("Unload \(pending.name)?"),
+                message: Text(
+                    "Free memory used by \(pending.name) (pid \(pending.pid)) now? launchd will restart the model automatically within seconds."
+                ),
+                primaryButton: .destructive(Text("Unload")) {
+                    Task { await performUnload(pid: pending.pid) }
+                },
+                secondaryButton: .cancel()
+            )
+        }
+        .alert(item: Binding(
+            get: { unloadErrorMessage.map { UnloadErrorIdentifier(message: $0) } },
+            set: { if $0 == nil { unloadErrorMessage = nil } }
+        )) { err in
+            Alert(
+                title: Text("Couldn't unload"),
+                message: Text(err.message),
+                dismissButton: .default(Text("OK"))
+            )
         }
         .accessibilityIdentifier("activity_page")
     }
@@ -418,7 +473,7 @@ struct ActivityPage: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
                 cpuCard
-                rssCard
+                memoryCard
                 gpuCard
             }
             if let res = resources, !res.processBreakdown.isEmpty {
@@ -435,11 +490,12 @@ struct ActivityPage: View {
         )
     }
 
-    private var rssCard: some View {
+    private var memoryCard: some View {
         StatCard(
-            title: "Memory (RSS)",
-            value: resources.map { rssString($0.rssMb) } ?? "—",
-            subtitle: "resident"
+            title: "Memory",
+            value: resources.map { memString($0.memMb) } ?? "—",
+            subtitle: "resident",
+            help: "Physical memory footprint, including compressed pages and unified-memory allocations. Approximates Activity Monitor's Memory column."
         )
     }
 
@@ -452,7 +508,7 @@ struct ActivityPage: View {
         )
     }
 
-    private func rssString(_ mb: UInt32) -> String {
+    private func memString(_ mb: UInt32) -> String {
         if mb >= 1024 {
             return String(format: "%.2f GB", Double(mb) / 1024.0)
         }
@@ -460,7 +516,11 @@ struct ActivityPage: View {
     }
 
     private func processBreakdownView(_ procs: [ProcessBreakdown]) -> some View {
-        let sortedProcs = procs.sorted { $0.cpuPercent > $1.cpuPercent }
+        // Filter out optimistically-hidden rows so a killed LocalModel
+        // disappears immediately rather than lingering for up to a snapshot
+        // tick (CACHE_TTL ~2s) until the daemon's process list re-syncs.
+        let visible = procs.filter { !hiddenPids.contains($0.pid) }
+        let sortedProcs = visible.sorted { $0.cpuPercent > $1.cpuPercent }
         let localModels = sortedProcs.filter { $0.kind == .localModel }
         let others = sortedProcs.filter { $0.kind != .localModel }
         return VStack(alignment: .leading, spacing: 6) {
@@ -516,10 +576,77 @@ struct ActivityPage: View {
                 .scaledFont(size: 12, weight: .medium)
                 .foregroundColor(OmiColors.textPrimary)
                 .frame(width: 50, alignment: .trailing)
-            Text(rssString(p.rssMb))
+            Text(memString(p.memMb))
                 .scaledFont(size: 12)
                 .foregroundColor(OmiColors.textTertiary)
                 .frame(width: 70, alignment: .trailing)
+            // Issue: launchd's `KeepAlive=true` on the MLX/VLM lifecycle
+            // plists means killing the worker child is a one-shot memory
+            // reclaim, not a permanent stop — launchd respawns within
+            // seconds. Surface as "Unload", not "Stop".
+            if p.kind == .localModel {
+                Button {
+                    pendingUnload = PendingUnload(pid: p.pid, name: p.name)
+                } label: {
+                    if unloadingPids.contains(p.pid) {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.6)
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: "eject.circle")
+                            .scaledFont(size: 14)
+                            .foregroundColor(OmiColors.textTertiary)
+                    }
+                }
+                .buttonStyle(.borderless)
+                .disabled(unloadingPids.contains(p.pid))
+                .accessibilityLabel("Unload \(p.name) process \(p.pid)")
+                .accessibilityIdentifier("activity_unload_button_\(p.pid)")
+                .help("Unload \(p.name) — free its memory. launchd will restart it automatically within seconds.")
+            }
+        }
+    }
+
+    /// Trigger the kill on the daemon. Optimistically hides the row so the
+    /// user sees instant feedback (the daemon's process-list cache TTL is
+    /// up to 2 s). 404 = the process already died on its own; treat as a
+    /// silent no-op so we don't surface "404" to a user who clicked a
+    /// stale row. Real failures (5xx, network) re-show the row and surface
+    /// via `.alert`.
+    private func performUnload(pid: Int32) async {
+        unloadingPids.insert(pid)
+        hiddenPids.insert(pid)
+        defer { unloadingPids.remove(pid) }
+
+        do {
+            try await service.terminateProcess(pid: pid)
+        } catch APIError.httpError(statusCode: 404) {
+            // Process already gone — leave hidden, no error toast.
+            Self.log.info("terminate returned 404 for pid \(pid, privacy: .public), already gone")
+            return
+        } catch {
+            // Real failure: un-hide so the user sees the row come back, and
+            // surface an explanatory alert.
+            hiddenPids.remove(pid)
+            let detail: String
+            if let apiErr = error as? APIError {
+                switch apiErr {
+                case .httpError(statusCode: let code):
+                    detail = "the local API returned HTTP \(code)"
+                case .unauthorized:
+                    detail = "the local API rejected the request"
+                case .invalidResponse:
+                    detail = "the local API returned an invalid response"
+                case .decodingError(let err):
+                    detail = "the local API returned an unexpected response (\(err.localizedDescription))"
+                default:
+                    detail = error.localizedDescription
+                }
+            } else {
+                detail = error.localizedDescription
+            }
+            unloadErrorMessage = "Could not unload pid \(pid): \(detail)"
         }
     }
 

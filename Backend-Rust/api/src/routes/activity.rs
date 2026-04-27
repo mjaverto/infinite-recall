@@ -9,7 +9,12 @@
 //! impls are owned by Streams B/C/D and the idle-gate agent — the Phase 0
 //! contract (`activity/contract.md`) is the source of truth.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use chrono::Utc;
 use rusqlite::{Error as RusqliteError, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -342,6 +347,116 @@ pub async fn gate_state(State(state): State<AppState>, Json(body): Json<GateStat
     // by mistake, since they don't implement the writable trait at all.
     state.processing_gate_writer.set(body);
     StatusCode::NO_CONTENT
+}
+
+/// `POST /v1/activity/processes/:pid/terminate` — hard-kill a tracked
+/// LocalModel worker.
+///
+/// Returns:
+/// * `204` — process is gone (graceful exit within the SIGTERM grace window
+///   OR forcibly killed via SIGKILL after the 5 s grace).
+/// * `404` — pid is not currently tracked as a `LocalModel` worker. The gate
+///   re-runs PID discovery on every call (does NOT trust the sampler's 2 s
+///   cache) AND does a fresh `proc_pid::pidinfo` aliveness check, both as
+///   defense-in-depth against PID-recycle between the snapshot the UI saw
+///   and our `kill(2)` syscall.
+/// * `500 {error: <msg>}` — `kill(2)` failed for any reason other than
+///   `ESRCH` (which is treated as success — the pid being already gone is
+///   exactly the post-condition we wanted).
+///
+/// Uses `tokio::time::sleep` for the grace-window poll so the async runtime
+/// worker isn't blocked for 5 s. `libc::kill` chosen over `nix` to keep the
+/// dep tree small.
+pub async fn terminate_process(
+    State(state): State<AppState>,
+    Path(pid): Path<i32>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    use crate::activity::terminate as t;
+
+    // Gate 1: pid must be in the LocalModel allowlist (fresh discovery, not
+    // the cached snapshot — the cache can be 2 s stale, leaving a TOCTOU
+    // window for pid-recycle).
+    if !state.local_model_gate.is_local_model(pid) {
+        tracing::info!(
+            component = "activity.terminate",
+            pid,
+            "rejecting terminate: pid not in LocalModel allowlist"
+        );
+        return Err((StatusCode::NOT_FOUND, Json(json!({
+            "error": "pid_not_local_model",
+        }))));
+    }
+
+    // Gate 2: defense-in-depth — process must still be alive RIGHT NOW
+    // (between the gate check above and the kill(2) syscall below). If
+    // discovery cached a stale pid + the kernel recycled it in the
+    // intervening microseconds, this catches it before we signal.
+    //
+    // We MUST distinguish ESRCH ("gone, what we want") from EPERM / other
+    // inspect failures. Conflating them and 404-ing would silently hide a
+    // real failure mode — the Swift client treats 404 as "already dead, no
+    // toast", so a real error would never surface to the user.
+    match t::pid_status(pid) {
+        t::PidStatus::Gone => {
+            tracing::info!(
+                component = "activity.terminate",
+                pid,
+                "rejecting terminate: pid no longer alive between gate and kill"
+            );
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "pid_not_alive" })),
+            ));
+        }
+        t::PidStatus::Alive => {
+            // Fall through to kill.
+        }
+        t::PidStatus::InspectFailed(errno) => {
+            // Don't 404 — `kill(2)` has its own ESRCH handling and may
+            // succeed where `kill(pid, 0)` failed (rare, but possible if
+            // the EPERM came from a transient ptrace race or sandbox
+            // weirdness). Log so support can diagnose.
+            tracing::warn!(
+                component = "activity.terminate",
+                pid,
+                errno,
+                "pid_status inspect failed; falling through to kill anyway"
+            );
+        }
+    }
+
+    match t::terminate_pid(pid).await {
+        Ok(t::TerminateOutcome::GracefulExit) => {
+            tracing::info!(
+                component = "activity.terminate",
+                pid,
+                outcome = "graceful",
+                "terminated LocalModel worker via SIGTERM"
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(t::TerminateOutcome::KilledForcibly) => {
+            tracing::warn!(
+                component = "activity.terminate",
+                pid,
+                outcome = "sigkill",
+                "LocalModel worker did not exit within 5 s grace; SIGKILL'd"
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            tracing::error!(
+                component = "activity.terminate",
+                pid,
+                error = %e,
+                "kill(2) failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

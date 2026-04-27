@@ -8,7 +8,7 @@
 ## Goals
 
 In-app **Activity** tab giving the user:
-1. Live process-tree CPU/RSS + system-wide GPU.
+1. Live process-tree CPU/memory + system-wide GPU.
 2. Human-readable in-flight task list, one row per `WorkKind`.
 3. Per-kind / per-capture **Pause for N min** with persistence across restart.
 4. Honest explanation of *why* nothing is in-flight (idle gate vs battery
@@ -63,16 +63,16 @@ Field names are snake_case on the wire. Swift mirrors live in
   ],
   "resources": {
     "cpu_percent": 142.0,
-    "rss_mb": 2342,
+    "mem_mb": 2342,
     "gpu_system_percent": 38.0,
     "thermal_state": "fair",
     "on_battery": false,
     "low_power": false,
     "process_breakdown": [
-      { "name": "api",     "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84,   "kind": "core" },
-      { "name": "swift",   "pid": 1235, "cpu_percent": 51.2, "rss_mb": 760,  "kind": "core" },
-      { "name": "mlx-lm",  "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498, "kind": "local_model" },
-      { "name": "mlx-vlm", "pid": 1237, "cpu_percent": 14.0, "rss_mb": 1102, "kind": "local_model" }
+      { "name": "api",     "pid": 1234, "cpu_percent": 12.4, "mem_mb": 84,   "kind": "core" },
+      { "name": "swift",   "pid": 1235, "cpu_percent": 51.2, "mem_mb": 760,  "kind": "core" },
+      { "name": "mlx-lm",  "pid": 1236, "cpu_percent": 78.4, "mem_mb": 1498, "kind": "local_model" },
+      { "name": "mlx-vlm", "pid": 1237, "cpu_percent": 14.0, "mem_mb": 1102, "kind": "local_model" }
     ]
   },
   "processing_gate": {

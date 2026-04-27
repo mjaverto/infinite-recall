@@ -99,15 +99,15 @@ final class ActivityModelsTests: XCTestCase {
       ],
       "resources": {
         "cpu_percent": 142.0,
-        "rss_mb": 2342,
+        "mem_mb": 2342,
         "gpu_system_percent": 38.0,
         "thermal_state": "fair",
         "on_battery": false,
         "low_power": false,
         "process_breakdown": [
-          { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84 },
-          { "name": "Infinite Recall",     "pid": 1235, "cpu_percent": 51.2, "rss_mb": 760 },
-          { "name": "mlx-lm.server",       "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498 }
+          { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "mem_mb": 84 },
+          { "name": "Infinite Recall",     "pid": 1235, "cpu_percent": 51.2, "mem_mb": 760 },
+          { "name": "mlx-lm.server",       "pid": 1236, "cpu_percent": 78.4, "mem_mb": 1498 }
         ]
       },
       "processing_gate": {
@@ -160,7 +160,7 @@ final class ActivityModelsTests: XCTestCase {
         // Resources — every field
         let res = snap.resources
         XCTAssertEqual(res.cpuPercent, 142.0, accuracy: 0.001)
-        XCTAssertEqual(res.rssMb, 2342)
+        XCTAssertEqual(res.memMb, 2342)
         XCTAssertEqual(res.gpuSystemPercent ?? -1, 38.0, accuracy: 0.001)
         XCTAssertEqual(res.thermalState, .fair)
         XCTAssertFalse(res.onBattery)
@@ -169,7 +169,7 @@ final class ActivityModelsTests: XCTestCase {
         XCTAssertEqual(res.processBreakdown[2].name, "mlx-lm.server")
         XCTAssertEqual(res.processBreakdown[2].pid, 1236)
         XCTAssertEqual(res.processBreakdown[2].cpuPercent, 78.4, accuracy: 0.001)
-        XCTAssertEqual(res.processBreakdown[2].rssMb, 1498)
+        XCTAssertEqual(res.processBreakdown[2].memMb, 1498)
 
         // Gate state — issue #35: `processingGate` is now a sum-type
         // mirror of Rust's `GateState`. Pattern-match and assert each
@@ -210,7 +210,7 @@ final class ActivityModelsTests: XCTestCase {
         let json = """
         {
           "cpu_percent": 8.0,
-          "rss_mb": 100,
+          "mem_mb": 100,
           "gpu_system_percent": null,
           "thermal_state": "nominal",
           "on_battery": true,
@@ -396,7 +396,7 @@ final class ActivityModelsTests: XCTestCase {
         ]
         for (wire, expected) in cases {
             let json = """
-            { "cpu_percent": 0, "rss_mb": 0, "gpu_system_percent": null,
+            { "cpu_percent": 0, "mem_mb": 0, "gpu_system_percent": null,
               "thermal_state": "\(wire)", "on_battery": false, "low_power": false,
               "process_breakdown": [] }
             """
@@ -594,7 +594,7 @@ final class ActivityModelsTests: XCTestCase {
 
     func testProcessBreakdownDecodesLocalModelKind() throws {
         let json = """
-        { "name": "mlx-lm", "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498,
+        { "name": "mlx-lm", "pid": 1236, "cpu_percent": 78.4, "mem_mb": 1498,
           "kind": "local_model" }
         """
         let p = try Self.makeDecoder()
@@ -604,7 +604,7 @@ final class ActivityModelsTests: XCTestCase {
 
     func testProcessBreakdownDecodesCoreKind() throws {
         let json = """
-        { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84,
+        { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "mem_mb": 84,
           "kind": "core" }
         """
         let p = try Self.makeDecoder()
@@ -614,7 +614,7 @@ final class ActivityModelsTests: XCTestCase {
 
     func testProcessBreakdownDecodesUnknownKindAsUnknown() throws {
         let json = """
-        { "name": "future-proc", "pid": 9999, "cpu_percent": 1.0, "rss_mb": 10,
+        { "name": "future-proc", "pid": 9999, "cpu_percent": 1.0, "mem_mb": 10,
           "kind": "future_unknown" }
         """
         let p = try Self.makeDecoder()
@@ -624,7 +624,7 @@ final class ActivityModelsTests: XCTestCase {
 
     func testProcessBreakdownDecodesMissingKindAsNil() throws {
         let json = """
-        { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84 }
+        { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "mem_mb": 84 }
         """
         let p = try Self.makeDecoder()
             .decode(ProcessBreakdown.self, from: json.data(using: .utf8)!)

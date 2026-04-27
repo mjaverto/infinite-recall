@@ -14,7 +14,7 @@ final class ActivityMonitorServiceQueueDepthTests: XCTestCase {
             capture: [],
             resources: ResourceSample(
                 cpuPercent: 0,
-                rssMb: 0,
+                memMb: 0,
                 gpuSystemPercent: nil,
                 thermalState: .nominal,
                 onBattery: false,

@@ -179,7 +179,7 @@ impl ResourceSampler for FakeSampler {
     fn sample(&self) -> ResourceSample {
         ResourceSample {
             cpu_percent: 12.5,
-            rss_mb: 256,
+            mem_mb: 256,
             gpu_system_percent: Some(33.3),
             thermal_state: ThermalState::Nominal,
             on_battery: false,
@@ -188,7 +188,7 @@ impl ResourceSampler for FakeSampler {
                 name: "infinite-recall-api".into(),
                 pid: 4242,
                 cpu_percent: 12.5,
-                rss_mb: 256,
+                mem_mb: 256,
                 kind: None,
             }],
         }
@@ -261,10 +261,12 @@ fn make_state_with_writer(
     gate: Arc<dyn ProcessingGate>,
     gate_writer: Arc<dyn WritableProcessingGate>,
 ) -> AppState {
+    use infinite_recall_api::activity::terminate::{LocalModelGate, ProcLocalModelGate};
     let pool = infinite_recall_api::db::open_in_memory_pool()
         .expect("in-memory pool — Stream A should expose a test helper");
     let write_pool = infinite_recall_api::db::open_in_memory_pool().expect("in-memory write pool");
     let (pause_tx, _pause_rx) = tokio::sync::broadcast::channel(64);
+    let local_model_gate: Arc<dyn LocalModelGate> = Arc::new(ProcLocalModelGate::new());
     AppState {
         pool,
         write_pool,
@@ -275,6 +277,7 @@ fn make_state_with_writer(
         processing_gate: gate,
         processing_gate_writer: gate_writer,
         pause_tx,
+        local_model_gate,
     }
 }
 
@@ -389,7 +392,7 @@ async fn snapshot_returns_200_with_full_shape() {
     // `resources` populated by FakeSampler.
     let res = &body["resources"];
     assert_eq!(res["cpu_percent"], json!(12.5));
-    assert_eq!(res["rss_mb"], json!(256));
+    assert_eq!(res["mem_mb"], json!(256));
     assert_eq!(res["gpu_system_percent"], json!(33.3));
     assert_eq!(res["thermal_state"], json!("nominal"));
     assert_eq!(res["on_battery"], json!(false));
