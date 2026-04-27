@@ -1,25 +1,5 @@
 import Foundation
 
-// MARK: - Lane B local DTOs
-//
-// These mirror what Lane A is concurrently defining in
-// `Desktop/Sources/FileIndexing/KnowledgeGraphStorage.swift`.
-// At integration merge, the duplicate is caught and one definition kept.
-// Shape (name, fields, types, Sendable) MUST stay identical.
-
-struct ExtractedKGNode: Sendable, Equatable {
-  let id: String
-  let label: String
-  let type: KnowledgeGraphNodeType
-  let aliases: [String]
-}
-
-struct ExtractedKGEdge: Sendable, Equatable {
-  let sourceId: String
-  let targetId: String
-  let label: String
-}
-
 // MARK: - Outcome
 
 struct KGExtraction: Sendable {
