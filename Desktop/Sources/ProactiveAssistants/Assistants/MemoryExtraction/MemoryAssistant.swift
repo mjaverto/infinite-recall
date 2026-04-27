@@ -245,12 +245,9 @@ actor MemoryAssistant: ProactiveAssistant {
 
         do {
             let inserted = try await MemoryStorage.shared.insertLocalMemory(record)
+            // KG extraction is enqueued atomically inside `insertLocalMemory`
+            // so the memory and its `.extractKG` work item can never split.
             log("Memory: Saved to SQLite (id: \(inserted.id ?? -1))")
-            // Enqueue KG extraction for the new memory. Best-effort: a failed
-            // enqueue is logged inside the service; do NOT fail the insert.
-            if let mid = inserted.id {
-                await KGBackfillService.shared.enqueueExtractKG(memoryId: mid, reason: "MemoryAssistant.insert")
-            }
             return inserted
         } catch {
             logError("Memory: Failed to save to SQLite", error: error)

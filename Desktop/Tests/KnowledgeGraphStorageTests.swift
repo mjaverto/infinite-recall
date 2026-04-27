@@ -31,6 +31,47 @@ final class KnowledgeGraphStorageTests: XCTestCase {
     private func cleanup(_ memoryIds: [Int64]) async {
         for mid in memoryIds {
             try? await KnowledgeGraphStorage.shared.removeProvenance(forMemoryId: mid)
+            // Also strip the seeded `memories` row so subsequent runs of
+            // these tests don't accumulate fixtures. The B3 guard rejects
+            // upserts against missing/deleted rows, which is why we seed
+            // one in the first place — see `seedMemoryRow`.
+            try? await deleteMemoryRow(id: mid)
+        }
+    }
+
+    /// Insert a minimal `memories` row at the given id so `upsert()`'s
+    /// existence check (Cluster B3) passes. Uses `INSERT OR REPLACE` so a
+    /// stale row from a previous run is overwritten cleanly. Mirrors the
+    /// column set the migration test uses, which is known to match the
+    /// live schema.
+    private func seedMemoryRow(id: Int64) async throws {
+        // Force the migrator to run before requesting the queue. Mirrors the
+        // pattern in `test_migration_addsKGExtractionStatusColumn`.
+        _ = try await KnowledgeGraphStorage.shared.memoriesWithExtractedKGCount()
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw XCTSkip("database queue unavailable")
+        }
+        let now = Date()
+        try await dbQueue.write { db in
+            // Drop any stale row first so we can reuse the id deterministically.
+            try db.execute(sql: "DELETE FROM memories WHERE id = ?", arguments: [id])
+            try db.execute(
+                sql: """
+                    INSERT INTO memories (
+                        id, backendId, backendSynced, content, category,
+                        reviewed, manuallyAdded, isRead, isDismissed, deleted,
+                        createdAt, updatedAt
+                    ) VALUES (?, ?, 0, ?, 'manual', 0, 0, 0, 0, 0, ?, ?)
+                """,
+                arguments: [id, "fixture-\(id)", "fixture for memory \(id)", now, now]
+            )
+        }
+    }
+
+    private func deleteMemoryRow(id: Int64) async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+        try await dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM memories WHERE id = ?", arguments: [id])
         }
     }
 
@@ -119,6 +160,7 @@ final class KnowledgeGraphStorageTests: XCTestCase {
     func test_upsert_atomic_badEdgeRollsBackEverything() async throws {
         let memoryId = nextMemoryId()
         defer { Task { await self.cleanup([memoryId]) } }
+        try await seedMemoryRow(id: memoryId)
 
         let goodNode1 = makeNode(id: "atomic-alpha-\(memoryId)")
         let goodNode2 = makeNode(id: "atomic-beta-\(memoryId)")
@@ -155,6 +197,7 @@ final class KnowledgeGraphStorageTests: XCTestCase {
     func test_upsert_idempotent_secondCallNoOps() async throws {
         let memoryId = nextMemoryId()
         defer { Task { await self.cleanup([memoryId]) } }
+        try await seedMemoryRow(id: memoryId)
 
         let n1 = makeNode(id: "idem-one-\(memoryId)", aliases: ["alias-1"])
         let n2 = makeNode(id: "idem-two-\(memoryId)")
@@ -184,6 +227,8 @@ final class KnowledgeGraphStorageTests: XCTestCase {
         let memA = nextMemoryId()
         let memB = nextMemoryId()
         defer { Task { await self.cleanup([memA, memB]) } }
+        try await seedMemoryRow(id: memA)
+        try await seedMemoryRow(id: memB)
 
         let sharedRaw = "shared-x-\(memA)-\(memB)"
         let nodeA = makeNode(id: sharedRaw, label: "X", aliases: ["a"])
@@ -217,6 +262,8 @@ final class KnowledgeGraphStorageTests: XCTestCase {
         let memA = nextMemoryId()
         let memB = nextMemoryId()
         defer { Task { await self.cleanup([memA, memB]) } }
+        try await seedMemoryRow(id: memA)
+        try await seedMemoryRow(id: memB)
 
         let sharedId = "cascade-shared-\(memA)-\(memB)"
         let aOnlyId = "cascade-aonly-\(memA)"
@@ -255,6 +302,8 @@ final class KnowledgeGraphStorageTests: XCTestCase {
         let memA = nextMemoryId()
         let memB = nextMemoryId()
         defer { Task { await self.cleanup([memA, memB]) } }
+        try await seedMemoryRow(id: memA)
+        try await seedMemoryRow(id: memB)
 
         let baseline = try await KnowledgeGraphStorage.shared.memoriesWithExtractedKGCount()
 
@@ -286,6 +335,7 @@ final class KnowledgeGraphStorageTests: XCTestCase {
     func test_clearAll_wipesProvenanceTables() async throws {
         let memoryId = nextMemoryId()
         // No defer cleanup — clearAll handles it.
+        try await seedMemoryRow(id: memoryId)
 
         _ = try await KnowledgeGraphStorage.shared.upsert(
             memoryId: memoryId,
@@ -356,5 +406,88 @@ final class KnowledgeGraphStorageTests: XCTestCase {
             )
         }
         XCTAssertNil(status, "kg_extraction_status must default to NULL on a fresh memory row")
+    }
+
+    // MARK: - 8. Cluster B3 — upsert aborts cleanly against missing memory
+
+    func test_upsert_abortsWhenMemoryMissing() async throws {
+        // No seed — memory row never existed. Upsert must return zero
+        // counts and write no provenance.
+        let memoryId = nextMemoryId()
+        defer { Task { await self.cleanup([memoryId]) } }
+
+        let result = try await KnowledgeGraphStorage.shared.upsert(
+            memoryId: memoryId,
+            nodes: [makeNode(id: "missing-\(memoryId)")],
+            edges: []
+        )
+        XCTAssertEqual(result.nodesInserted, 0,
+                       "upsert against a missing memory must not insert nodes")
+        XCTAssertEqual(result.nodesMerged, 0)
+        XCTAssertEqual(result.edgesInserted, 0)
+
+        let exists = try await nodeExists("missing-\(memoryId)")
+        XCTAssertFalse(exists, "no node row should be written for a missing memory")
+
+        let provCount = try await nodeProvenanceRowCount(memoryId: memoryId)
+        XCTAssertEqual(provCount, 0, "no provenance should be written for a missing memory")
+    }
+
+    func test_upsert_abortsWhenMemorySoftDeleted() async throws {
+        let memoryId = nextMemoryId()
+        defer { Task { await self.cleanup([memoryId]) } }
+
+        // Seed and immediately mark deleted = 1.
+        try await seedMemoryRow(id: memoryId)
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            return XCTFail("database queue unavailable")
+        }
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE memories SET deleted = 1 WHERE id = ?",
+                arguments: [memoryId]
+            )
+        }
+
+        let result = try await KnowledgeGraphStorage.shared.upsert(
+            memoryId: memoryId,
+            nodes: [makeNode(id: "deleted-\(memoryId)")],
+            edges: []
+        )
+        XCTAssertEqual(result.nodesInserted, 0,
+                       "upsert against a soft-deleted memory must abort")
+        let exists = try await nodeExists("deleted-\(memoryId)")
+        XCTAssertFalse(exists, "no node row should be written for a deleted memory")
+    }
+
+    // MARK: - 9. Cluster B2 — terminalStatus written atomically with provenance
+
+    func test_upsert_terminalStatusWrittenAtomicallyWithProvenance() async throws {
+        let memoryId = nextMemoryId()
+        defer { Task { await self.cleanup([memoryId]) } }
+        try await seedMemoryRow(id: memoryId)
+
+        _ = try await KnowledgeGraphStorage.shared.upsert(
+            memoryId: memoryId,
+            nodes: [makeNode(id: "atomic-status-\(memoryId)")],
+            edges: [],
+            terminalStatus: .succeeded
+        )
+
+        let provCount = try await nodeProvenanceRowCount(memoryId: memoryId)
+        XCTAssertEqual(provCount, 1)
+
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            return XCTFail("database queue unavailable")
+        }
+        let status: String? = try await dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT kg_extraction_status FROM memories WHERE id = ?",
+                arguments: [memoryId]
+            )
+        }
+        XCTAssertEqual(status, KGExtractionStatus.succeeded.rawValue,
+                       "terminalStatus must be written in the same transaction as provenance")
     }
 }

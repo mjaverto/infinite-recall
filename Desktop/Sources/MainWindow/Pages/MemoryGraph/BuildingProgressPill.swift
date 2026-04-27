@@ -67,6 +67,16 @@ struct BuildingProgressPill: View {
       if total == 0 {
         return "Brain map ready"
       }
+      // Cluster E3: queue is idle but we never finished processing every
+      // memory. The dead-letter handler marks unrecoverable rows as
+      // `kg_extraction_status = 'failed'`, but those still bump
+      // `processedMemories`. A genuine `processed < total` here means rows
+      // got dropped (cap-drop) or were lost before the handler ran. Surface
+      // it instead of falsely showing "up to date".
+      if processed < total {
+        let missing = total - processed
+        return "Stuck — \(missing) memor\(missing == 1 ? "y" : "ies") failed to extract"
+      }
       return "Brain map up to date — \(nodes) entities"
     case .building:
       if let eta = progress.etaSeconds, eta > 0 {

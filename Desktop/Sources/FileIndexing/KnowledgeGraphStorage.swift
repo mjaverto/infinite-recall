@@ -177,13 +177,21 @@ actor KnowledgeGraphStorage {
 extension KnowledgeGraphStorage {
 
     /// Single atomic transaction: upserts nodes, upserts edges, writes
-    /// provenance rows for both. Idempotent on (memoryId, nodeId) and
+    /// provenance rows for both, and (optionally) writes the memory's
+    /// `kg_extraction_status`. Idempotent on (memoryId, nodeId) and
     /// (memoryId, edgeId). On shared nodeId across memories, aliases are
     /// merged and the first-writer label/type wins unless an incoming
     /// alias promotes a better canonical.
+    ///
+    /// Pass `terminalStatus` to atomically transition `memories.kg_extraction_status`
+    /// in the same transaction as the upsert. Without this, a crash between
+    /// `upsert` and a follow-up `setKGExtractionStatus` call would leave
+    /// provenance written but status NULL — the row would then be re-extracted
+    /// on next launch (idempotent on data, wasted LLM cost).
     func upsert(memoryId: Int64,
                 nodes: [ExtractedKGNode],
-                edges: [ExtractedKGEdge]) async throws -> KGUpsertResult {
+                edges: [ExtractedKGEdge],
+                terminalStatus: KGExtractionStatus? = nil) async throws -> KGUpsertResult {
         let db = try await ensureDB()
 
         // Validate inputs up front so a bad row aborts before we touch the
@@ -218,9 +226,32 @@ extension KnowledgeGraphStorage {
         var nodesInserted = 0
         var nodesMerged = 0
         var edgesInserted = 0
+        var aborted = false
 
         try await db.write { database in
             let now = Date()
+
+            // Guard race: deletion may have raced with this drain. The
+            // PowerWorkBridge handler pre-checks `memories.deleted` BEFORE
+            // calling `upsert`, but a concurrent `deleteMemory` can land
+            // between the pre-check and the write here. Re-check inside the
+            // same transaction so the cascade in `removeProvenance` doesn't
+            // miss orphans we'd otherwise write. The onboarding sentinel
+            // (-1) bypasses the check because no row exists for it.
+            if memoryId != ONBOARDING_SENTINEL {
+                let row = try Row.fetchOne(
+                    database,
+                    sql: "SELECT deleted FROM memories WHERE id = ?",
+                    arguments: [memoryId]
+                )
+                let exists = row != nil
+                let isDeleted: Bool = (row?["deleted"] as Bool?) ?? false
+                if !exists || isDeleted {
+                    log("KnowledgeGraphStorage: upsert aborted — memory \(memoryId) not found or deleted")
+                    aborted = true
+                    return
+                }
+            }
 
             for node in nodes {
                 let canonical = Self.canonicalize(node.id)
@@ -296,6 +327,21 @@ extension KnowledgeGraphStorage {
                     arguments: [memoryId, edgeId]
                 )
             }
+
+            // Final statement of the transaction: write the terminal status
+            // so a crash between provenance + status is structurally
+            // impossible. Skip the onboarding sentinel (no real memory row).
+            if let status = terminalStatus, memoryId != ONBOARDING_SENTINEL {
+                try database.execute(
+                    sql: "UPDATE memories SET kg_extraction_status = ?, updatedAt = ? WHERE id = ?",
+                    arguments: [status.rawValue, Date(), memoryId]
+                )
+            }
+        }
+
+        if aborted {
+            // Memory was deleted during the upsert — return zero counts.
+            return KGUpsertResult(nodesInserted: 0, nodesMerged: 0, edgesInserted: 0)
         }
 
         return KGUpsertResult(

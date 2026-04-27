@@ -14,6 +14,34 @@ struct KGBuildProgress: Sendable, Equatable {
     let totalNodes: Int
     let state: BuildState
     let etaSeconds: Int?
+
+    /// Saturating init: enforces `processed ≤ total` and `succeeded ≤ processed`.
+    /// Lane C originally took counts from independent SQL reads — a window
+    /// between reads could legitimately produce `processed > total` (e.g. a
+    /// memory got soft-deleted between the two queries). Clamp here so the
+    /// pill never renders "5/3 memories" and so the empty-state classifier
+    /// can trust its inputs. Logs when clamping fires so we still see the
+    /// underlying source of drift.
+    init(
+        totalMemories: Int,
+        processedMemories: Int,
+        succeededMemories: Int,
+        totalNodes: Int,
+        state: BuildState,
+        etaSeconds: Int?
+    ) {
+        let clampedProcessed = min(max(0, processedMemories), max(0, totalMemories))
+        let clampedSucceeded = min(max(0, succeededMemories), clampedProcessed)
+        if clampedProcessed != processedMemories || clampedSucceeded != succeededMemories {
+            log("KGBuildProgress: clamped counters total=\(totalMemories) processed=\(processedMemories)→\(clampedProcessed) succeeded=\(succeededMemories)→\(clampedSucceeded)")
+        }
+        self.totalMemories = max(0, totalMemories)
+        self.processedMemories = clampedProcessed
+        self.succeededMemories = clampedSucceeded
+        self.totalNodes = max(0, totalNodes)
+        self.state = state
+        self.etaSeconds = etaSeconds
+    }
 }
 
 /// Build-time state. The UI's precedence ladder maps these to user-visible
@@ -42,11 +70,12 @@ enum EmptyStateMode: Sendable, Equatable {
 ///
 /// Caller is expected to invoke this only when the populated graph is not
 /// being shown (i.e. `totalNodes == 0` or the VM has elected to suppress
-/// the SceneKit view because there's nothing to render yet).
+/// the SceneKit view because there's nothing to render yet). The
+/// `totalNodes` parameter was removed in the consensus review pass — it
+/// duplicated the caller's gate without adding signal here.
 enum BrainMapEmptyStateClassifier {
     static func mode(
         state: BuildState,
-        totalNodes: Int,
         totalMemories: Int,
         processedMemories: Int
     ) -> EmptyStateMode {
@@ -80,6 +109,16 @@ actor KGProgressPublisher {
     private var lastEmittedAt: Date?
     private var lastSnapshot: KGBuildProgress?
     private var coalesceTask: Task<Void, Never>?
+    /// Cluster I — single-flight flush. When `true` and a flush is already
+    /// scheduled or in-flight, emit() returns without spawning a second timer
+    /// and `flushTrailing` will re-run on completion.
+    private var pendingTrailingFlush: Bool = false
+    /// Cluster E2 — low-frequency poller so paused / model-not-ready states
+    /// surface even when no `.extractKG` handler tick has fired. Started on
+    /// first subscriber, stopped when the subscriber count drops to zero.
+    /// Polls every `pollSeconds`; the 250ms emit throttle prevents flooding.
+    private var pollTask: Task<Void, Never>?
+    private let pollSeconds: TimeInterval = 5.0
 
     /// Last N drain durations, used to compute ETA.
     private var drainSamples: [TimeInterval] = []
@@ -115,10 +154,43 @@ actor KGProgressPublisher {
         if let snap = lastSnapshot {
             continuation.yield(snap)
         }
+        // Cluster E2: ensure poller is running so paused / model-not-ready
+        // states surface without waiting for a handler-driven tick. Also
+        // schedule an immediate sample for first paint.
+        startPollerIfNeeded()
+        Task { [weak self] in await self?.tick() }
     }
 
     private func removeContinuation(id: UUID) {
         continuations.removeValue(forKey: id)
+        if continuations.isEmpty {
+            stopPoller()
+        }
+    }
+
+    // MARK: - Polling (Cluster E2)
+
+    private func startPollerIfNeeded() {
+        guard pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            guard let self = self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(self.pollSeconds * 1_000_000_000))
+                if Task.isCancelled { return }
+                await self.pollTickIfActive()
+            }
+        }
+    }
+
+    private func stopPoller() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
+    /// Poll-driven tick. Bails out if no subscribers remain (raced cancel).
+    private func pollTickIfActive() async {
+        guard !continuations.isEmpty else { return }
+        await tick()
     }
 
     // MARK: - Public
@@ -134,8 +206,11 @@ actor KGProgressPublisher {
 
     /// Sample DB counters + scheduler state, build a `KGBuildProgress`, and
     /// emit on the stream (subject to throttle/coalesce).
+    /// On DB read failure the tick is skipped — emitting a 0/0 snapshot
+    /// would be indistinguishable from "backfill complete empty" and
+    /// would silently corrupt the UI's state machine.
     func tick() async {
-        let snap = await sample()
+        guard let snap = await sample() else { return }
         await emit(snap)
     }
 
@@ -143,7 +218,7 @@ actor KGProgressPublisher {
     /// (e.g. "model became ready") where the user is waiting for the pill to
     /// flip.
     func emitNow() async {
-        let snap = await sample()
+        guard let snap = await sample() else { return }
         coalesceTask?.cancel()
         coalesceTask = nil
         deliver(snap)
@@ -151,14 +226,26 @@ actor KGProgressPublisher {
 
     // MARK: - Sampling
 
-    private func sample() async -> KGBuildProgress {
+    /// Returns nil on DB read failure. Caller must skip the emit.
+    private func sample() async -> KGBuildProgress? {
         async let totalMemoriesAsync = totalMemoryCount()
         async let processedAsync = processedAndSucceededCounts()
         async let totalNodesAsync = totalNodesCount()
 
-        let totalMemories = (try? await totalMemoriesAsync) ?? 0
-        let (processed, succeeded) = (try? await processedAsync) ?? (0, 0)
-        let totalNodes = (try? await totalNodesAsync) ?? 0
+        let totalMemories: Int
+        let processed: Int
+        let succeeded: Int
+        let totalNodes: Int
+        do {
+            totalMemories = try await totalMemoriesAsync
+            (processed, succeeded) = try await processedAsync
+            totalNodes = try await totalNodesAsync
+        } catch {
+            // Don't emit — a 0/0 snapshot here would render as
+            // "backfill complete empty" and lie to the user.
+            logError("KGProgressPublisher: sample DB read failed; skipping tick", error: error)
+            return nil
+        }
 
         let state = await deriveState(processedMemories: processed, totalMemories: totalMemories)
         let eta = computeETA(
@@ -260,8 +347,9 @@ actor KGProgressPublisher {
                     SELECT COUNT(*)
                     FROM memories
                     WHERE deleted = 0
-                      AND kg_extraction_status = 'succeeded'
-                """
+                      AND kg_extraction_status = ?
+                """,
+                arguments: [KGExtractionStatus.succeeded.rawValue]
             ) ?? 0
             return (processed, succeeded)
         }
@@ -283,8 +371,14 @@ actor KGProgressPublisher {
         if let last = lastEmittedAt, now.timeIntervalSince(last) < throttleSeconds {
             // Stash the latest snapshot for diagnostic replay.
             lastSnapshot = snapshot
-            // Queue (or replace) a trailing emit.
-            coalesceTask?.cancel()
+            // Single-flight (cluster I): if a flush is already pending, just
+            // mark that another should run on completion and return. The
+            // previous cancel-then-replace pattern raced with `flushTrailing`
+            // re-entrant runs; flipping to a flag avoids that entirely.
+            if coalesceTask != nil {
+                pendingTrailingFlush = true
+                return
+            }
             let delay = throttleSeconds - now.timeIntervalSince(last)
             coalesceTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
@@ -297,11 +391,27 @@ actor KGProgressPublisher {
     }
 
     private func flushTrailing() async {
-        coalesceTask = nil
         // Re-sample so the trailing emit reflects the freshest DB state, not
-        // the snapshot that was queued at throttle-start.
+        // the snapshot that was queued at throttle-start. If the DB read
+        // fails we skip the emit — a 0/0 snapshot would lie.
         let snap = await sample()
-        deliver(snap)
+        // Single-flight: re-check for queued work BEFORE clearing the slot
+        // (cluster I). If another tick landed during the sample, run another
+        // pass without spawning a parallel coalesce timer.
+        let needsAnother = pendingTrailingFlush
+        pendingTrailingFlush = false
+        coalesceTask = nil
+        if let snap = snap {
+            deliver(snap)
+        }
+        if needsAnother {
+            // Re-emit the latest state immediately. Use Task here to avoid
+            // unbounded recursion if multiple flushes pile up; the actor
+            // reentry will serialize them anyway.
+            Task { [weak self] in
+                await self?.flushTrailing()
+            }
+        }
     }
 
     private func deliver(_ snapshot: KGBuildProgress) {

@@ -314,10 +314,8 @@ actor InsightAssistant: ProactiveAssistant {
 
         do {
             let inserted = try await MemoryStorage.shared.insertLocalMemory(record)
+            // KG extraction is enqueued atomically inside `insertLocalMemory`.
             log("Insight: Saved to SQLite (id: \(inserted.id ?? -1)) with tags \(tags)")
-            if let mid = inserted.id {
-                await KGBackfillService.shared.enqueueExtractKG(memoryId: mid, reason: "InsightAssistant.insert")
-            }
             return inserted
         } catch {
             logError("Insight: Failed to save to SQLite", error: error)

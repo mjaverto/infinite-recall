@@ -48,7 +48,12 @@ actor KGBackfillService {
                 return
             }
         } catch {
-            logError("KGBackfillService: failed to check migration_status; will attempt anyway", error: error)
+            // Cluster D4: surface the read error loudly. We still proceed
+            // (the dedup key + status filter limits blast radius — at worst
+            // we re-enqueue rows that already have a live work item, which
+            // PendingWorkStorage's UNIQUE dedup index will collapse to a
+            // no-op), but a transient DB error must not hide.
+            logError("KGBackfillService: WARNING — migration_status read failed; proceeding with backfill anyway. Per-row dedup will absorb duplicates.", error: error)
         }
 
         do {
@@ -73,26 +78,56 @@ actor KGBackfillService {
 
         log("KGBackfillService: enqueueing \(memoryIds.count) memory(ies) for KG extraction")
         var enqueued = 0
+        var capDropped = 0
+        var failed = 0
         for id in memoryIds {
             do {
                 let payload = try JSONEncoder().encode(PendingPayload(memory_id: id))
-                _ = try await PendingWorkStorage.shared.enqueue(
+                // `enqueue` returns nil for both dedup-hits and cap-drops.
+                // We can't distinguish them from the return value alone
+                // without breaking the API; instead infer cap-drop by
+                // observing `recentDrops` deltas. Simpler: if the result is
+                // nil AND no dedup row exists for this memory, count it as
+                // cap-drop (this is the case the consensus review wants
+                // counted as a failure). If we can't tell, we err on the
+                // side of treating nil as success (dedup hit) so an
+                // already-enqueued row doesn't re-trigger a re-run.
+                let beforeDrops = await PendingWorkStorage.shared.recentDrops
+                let rowId = try await PendingWorkStorage.shared.enqueue(
                     workType: Self.workType,
                     payload: payload,
                     dedupKey: Self.dedupKey(forMemoryId: id)
                 )
-                enqueued += 1
+                let afterDrops = await PendingWorkStorage.shared.recentDrops
+                if rowId != nil {
+                    enqueued += 1
+                } else if afterDrops > beforeDrops {
+                    // Cap-drop — log loudly so the operator sees it; D1
+                    // partial-enqueue path will take over.
+                    capDropped += 1
+                    log("KGBackfillService: cap-drop for memory \(id) — queue at depth limit")
+                } else {
+                    // Dedup hit — already-active row exists for this memory.
+                    // Treat as already enqueued for the completion check.
+                    enqueued += 1
+                }
             } catch {
+                failed += 1
                 logError("KGBackfillService: enqueue failed for memory \(id)", error: error)
             }
         }
 
-        log("KGBackfillService: enqueued \(enqueued)/\(memoryIds.count) extractKG jobs")
+        log("KGBackfillService: enqueued \(enqueued)/\(memoryIds.count) extractKG jobs (cap-dropped=\(capDropped), failed=\(failed))")
 
-        // Mark complete: the migration is "all eligible memories enqueued".
-        // Per-row retry / dead-letter is owned by PendingWorkStorage; this
-        // service shouldn't loop on outcomes.
-        try? await markComplete()
+        // Cluster D1: only mark complete when every eligible row landed in
+        // the queue. Otherwise the next launch will retry the misses.
+        // Per-row retry / dead-letter is still owned by PendingWorkStorage;
+        // this service only owns the all-enqueued invariant.
+        if enqueued == memoryIds.count {
+            try? await markComplete()
+        } else {
+            log("KGBackfillService: NOT marking complete — \(memoryIds.count - enqueued) row(s) failed to enqueue; will retry on next launch")
+        }
     }
 
     /// Durable enqueue for a single memory id. Used by the live insert path
