@@ -848,10 +848,8 @@ actor FocusAssistant: ProactiveAssistant {
 
         do {
             let insertedMemory = try await MemoryStorage.shared.insertLocalMemory(memoryRecord)
+            // KG extraction is enqueued atomically inside `insertLocalMemory`.
             log("Focus: Saved to memories (id: \(insertedMemory.id ?? -1)) with tags \(tags)")
-            if let mid = insertedMemory.id {
-                await KGBackfillService.shared.enqueueExtractKG(memoryId: mid, reason: "FocusAssistant.insert")
-            }
             return insertedMemory.id
         } catch {
             logError("Focus: Failed to save to memories table", error: error)

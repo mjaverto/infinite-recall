@@ -326,6 +326,9 @@ actor MemoryStorage {
                     guard let recordId = newRecord.id else {
                         throw MemoryStorageError.syncFailed("Record ID is nil after insert")
                     }
+                    // Atomic enqueue inside the same transaction so the
+                    // memory + work item can never split on a crash.
+                    try Self.enqueueExtractKGInline(database: database, memoryId: recordId)
                     return (recordId, true)
                 } catch let dbError as DatabaseError where dbError.resultCode == .SQLITE_CONSTRAINT {
                     // Race: another sync path already inserted this backendId — update instead
@@ -339,14 +342,8 @@ actor MemoryStorage {
             }
         }
 
-        // Server-originated insert → enqueue extractKG. Updates / dedup hits
-        // skip enqueue (the row was already considered for extraction when it
-        // first landed locally).
         if result.wasInsert {
-            await KGBackfillService.shared.enqueueExtractKG(
-                memoryId: result.recordId,
-                reason: "syncServerMemory"
-            )
+            log("MemoryStorage: syncServerMemory inserted \(result.recordId) with KG work enqueued atomically")
         }
         return result.recordId
     }
@@ -388,7 +385,11 @@ actor MemoryStorage {
                 } else {
                     do {
                         let inserted = try MemoryRecord.from(memory).inserted(database)
-                        if let rid = inserted.id { insertedIds.append(rid) }
+                        if let rid = inserted.id {
+                            insertedIds.append(rid)
+                            // Atomic enqueue inside the same transaction.
+                            try Self.enqueueExtractKGInline(database: database, memoryId: rid)
+                        }
                     } catch let dbError as DatabaseError where dbError.resultCode == .SQLITE_CONSTRAINT {
                         // Race: record already exists — update instead
                         if var record = try MemoryRecord.filter(Column("backendId") == memory.id).fetchOne(database) {
@@ -401,11 +402,8 @@ actor MemoryStorage {
             return (skipped, adopted, insertedIds)
         }
 
-        // Server-originated INSERTs → enqueue extractKG once the transaction
-        // has committed. Adopted orphans were already enqueued at their
-        // original insertLocalMemory site, so we skip them here.
-        for id in insertedIds {
-            await KGBackfillService.shared.enqueueExtractKG(memoryId: id, reason: "syncServerMemories")
+        if !insertedIds.isEmpty {
+            log("MemoryStorage: syncServerMemories inserted \(insertedIds.count) with KG work enqueued atomically")
         }
 
         if skipped > 0 || adopted > 0 {
@@ -417,8 +415,17 @@ actor MemoryStorage {
 
     // MARK: - Local Extraction Operations
 
-    /// Insert a locally extracted memory (before backend sync)
-    /// Used by MemoryAssistant and InsightAssistant
+    /// Insert a locally extracted memory (before backend sync) and atomically
+    /// enqueue an `.extractKG` work item for it inside the same transaction.
+    /// Used by MemoryAssistant, InsightAssistant, and FocusAssistant.
+    ///
+    /// Atomicity: a crash between the memory insert and the KG work enqueue
+    /// would leave a memory with a NULL `kg_extraction_status` and no pending
+    /// work item — the row would be invisible to both the backfill (which
+    /// only picks up rows whose status is NULL — but the dedup key is missing
+    /// so it'd actually be rescued, _but_ the status-vs-work-item invariant
+    /// is the more important one to keep clean for the progress publisher).
+    /// Doing both writes in one transaction removes the window entirely.
     @discardableResult
     func insertLocalMemory(_ record: MemoryRecord) async throws -> MemoryRecord {
         let db = try await ensureInitialized()
@@ -427,12 +434,53 @@ actor MemoryStorage {
         insertRecord.backendSynced = false  // Mark as not yet synced
 
         let recordToInsert = insertRecord
-        let inserted = try await db.write { database in
-            try recordToInsert.inserted(database)
+        let inserted: MemoryRecord = try await db.write { database in
+            let saved = try recordToInsert.inserted(database)
+            // Enqueue extractKG inline so the memory + work item land in the
+            // same transaction. Mirrors `PendingWorkStorage.enqueue` SQL but
+            // skips the depth-cap check (a single live insert can't exceed
+            // the cap on its own, and even if it did, leaving a memory
+            // un-extracted is preferable to dropping it on the floor here).
+            if let memoryId = saved.id, memoryId != ONBOARDING_SENTINEL {
+                try Self.enqueueExtractKGInline(
+                    database: database,
+                    memoryId: memoryId
+                )
+            }
+            return saved
         }
 
-        log("MemoryStorage: Inserted local memory (id: \(inserted.id ?? -1))")
+        log("MemoryStorage: Inserted local memory (id: \(inserted.id ?? -1)) with KG work enqueued atomically")
         return inserted
+    }
+
+    /// Inline SQL to enqueue an `.extractKG` work item, used by
+    /// `insertLocalMemory` (and the deferred sync paths) so the queue insert
+    /// can ride inside the same `db.write` transaction as the memory insert.
+    /// Idempotent on the dedup key — duplicate live rows are silently skipped
+    /// the same way `PendingWorkStorage.enqueue` does it.
+    fileprivate static func enqueueExtractKGInline(
+        database: Database,
+        memoryId: Int64
+    ) throws {
+        struct PendingPayload: Codable { let memory_id: Int64 }
+        let payload = try JSONEncoder().encode(PendingPayload(memory_id: memoryId))
+        let now = Date()
+        let dedupKey = "extractKG:\(memoryId)"
+        do {
+            try database.execute(
+                sql: """
+                    INSERT INTO pending_work
+                        (workType, payload, status, attempts, maxAttempts,
+                         scheduledFor, dedupKey, createdAt, updatedAt)
+                    VALUES (?, ?, 'queued', 0, 8, ?, ?, ?, ?)
+                """,
+                arguments: ["extractKG", payload, now, dedupKey, now, now]
+            )
+        } catch let dbError as DatabaseError where dbError.resultCode == .SQLITE_CONSTRAINT {
+            // Live dedup row already exists — no-op.
+            log("MemoryStorage: extractKG dedup hit for memory \(memoryId), skipping inline enqueue")
+        }
     }
 
     /// Mark a local memory as synced with backend ID
@@ -526,13 +574,13 @@ actor MemoryStorage {
     }
 
     /// Update the `kg_extraction_status` column on a memory row.
-    /// Values used by Lane C handler: "succeeded", "empty", "failed".
-    func setKGExtractionStatus(id: Int64, status: String) async throws {
+    /// Values used by Lane C handler: `.succeeded`, `.empty`, `.failed`.
+    func setKGExtractionStatus(id: Int64, status: KGExtractionStatus) async throws {
         let db = try await ensureInitialized()
         try await db.write { database in
             try database.execute(
                 sql: "UPDATE memories SET kg_extraction_status = ?, updatedAt = ? WHERE id = ?",
-                arguments: [status, Date(), id]
+                arguments: [status.rawValue, Date(), id]
             )
         }
     }
@@ -597,14 +645,34 @@ actor MemoryStorage {
     func deleteAllMemories() async throws {
         let db = try await ensureInitialized()
 
-        try await db.write { database in
+        // Snapshot the affected memory ids inside the same transaction that
+        // soft-deletes them so KG provenance cascade can't miss a row that
+        // was concurrently inserted between the snapshot and the UPDATE.
+        let affectedIds: [Int64] = try await db.write { database in
+            let ids = try Int64.fetchAll(
+                database,
+                sql: "SELECT id FROM memories WHERE deleted = 0"
+            )
             try database.execute(
                 sql: "UPDATE memories SET deleted = 1, updatedAt = ? WHERE deleted = 0",
                 arguments: [Date()]
             )
+            return ids
         }
 
-        log("MemoryStorage: Soft deleted all memories")
+        // Cascade KG provenance for every affected row. Failures are logged
+        // per-id but don't abort the loop — the memory soft-delete already
+        // succeeded, and partial provenance survival is preferable to zero
+        // cascade.
+        for memoryId in affectedIds {
+            do {
+                try await KnowledgeGraphStorage.shared.removeProvenance(forMemoryId: memoryId)
+            } catch {
+                logError("MemoryStorage: KG provenance removal failed for memory \(memoryId)", error: error)
+            }
+        }
+
+        log("MemoryStorage: Soft deleted all memories (\(affectedIds.count) rows; KG cascade attempted)")
     }
 
     /// Update content by backend ID
