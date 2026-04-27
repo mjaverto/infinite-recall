@@ -307,7 +307,7 @@ actor MemoryStorage {
     func syncServerMemory(_ memory: ServerMemory) async throws -> Int64 {
         let db = try await ensureInitialized()
 
-        return try await db.write { database -> Int64 in
+        let result: (recordId: Int64, wasInsert: Bool) = try await db.write { database -> (Int64, Bool) in
             // Check if memory already exists by backendId
             if var existingRecord = try MemoryRecord
                 .filter(Column("backendId") == memory.id)
@@ -318,7 +318,7 @@ actor MemoryStorage {
                 guard let recordId = existingRecord.id else {
                     throw MemoryStorageError.syncFailed("Record ID is nil after update")
                 }
-                return recordId
+                return (recordId, false)
             } else {
                 // Insert new record, catching UNIQUE constraint from concurrent syncs
                 do {
@@ -326,18 +326,29 @@ actor MemoryStorage {
                     guard let recordId = newRecord.id else {
                         throw MemoryStorageError.syncFailed("Record ID is nil after insert")
                     }
-                    return recordId
+                    return (recordId, true)
                 } catch let dbError as DatabaseError where dbError.resultCode == .SQLITE_CONSTRAINT {
                     // Race: another sync path already inserted this backendId — update instead
                     if var record = try MemoryRecord.filter(Column("backendId") == memory.id).fetchOne(database) {
                         record.updateFrom(memory)
                         try record.update(database)
-                        return record.id ?? 0
+                        return (record.id ?? 0, false)
                     }
                     throw dbError
                 }
             }
         }
+
+        // Server-originated insert → enqueue extractKG. Updates / dedup hits
+        // skip enqueue (the row was already considered for extraction when it
+        // first landed locally).
+        if result.wasInsert {
+            await KGBackfillService.shared.enqueueExtractKG(
+                memoryId: result.recordId,
+                reason: "syncServerMemory"
+            )
+        }
+        return result.recordId
     }
 
     /// Sync multiple ServerMemory objects to local storage (batch upsert)
@@ -345,9 +356,10 @@ actor MemoryStorage {
     func syncServerMemories(_ memories: [ServerMemory]) async throws {
         let db = try await ensureInitialized()
 
-        let (skipped, adopted) = try await db.write { database -> (Int, Int) in
+        let (skipped, adopted, insertedIds) = try await db.write { database -> (Int, Int, [Int64]) in
             var skipped = 0
             var adopted = 0
+            var insertedIds: [Int64] = []
             for memory in memories {
                 if var existingRecord = try MemoryRecord
                     .filter(Column("backendId") == memory.id)
@@ -375,7 +387,8 @@ actor MemoryStorage {
                     adopted += 1
                 } else {
                     do {
-                        _ = try MemoryRecord.from(memory).inserted(database)
+                        let inserted = try MemoryRecord.from(memory).inserted(database)
+                        if let rid = inserted.id { insertedIds.append(rid) }
                     } catch let dbError as DatabaseError where dbError.resultCode == .SQLITE_CONSTRAINT {
                         // Race: record already exists — update instead
                         if var record = try MemoryRecord.filter(Column("backendId") == memory.id).fetchOne(database) {
@@ -385,7 +398,14 @@ actor MemoryStorage {
                     }
                 }
             }
-            return (skipped, adopted)
+            return (skipped, adopted, insertedIds)
+        }
+
+        // Server-originated INSERTs → enqueue extractKG once the transaction
+        // has committed. Adopted orphans were already enqueued at their
+        // original insertLocalMemory site, so we skip them here.
+        for id in insertedIds {
+            await KGBackfillService.shared.enqueueExtractKG(memoryId: id, reason: "syncServerMemories")
         }
 
         if skipped > 0 || adopted > 0 {
@@ -505,6 +525,18 @@ actor MemoryStorage {
         log("MemoryStorage: Marked all memories as read")
     }
 
+    /// Update the `kg_extraction_status` column on a memory row.
+    /// Values used by Lane C handler: "succeeded", "empty", "failed".
+    func setKGExtractionStatus(id: Int64, status: String) async throws {
+        let db = try await ensureInitialized()
+        try await db.write { database in
+            try database.execute(
+                sql: "UPDATE memories SET kg_extraction_status = ?, updatedAt = ? WHERE id = ?",
+                arguments: [status, Date(), id]
+            )
+        }
+    }
+
     /// Soft delete a memory
     func deleteMemory(id: Int64) async throws {
         let db = try await ensureInitialized()
@@ -519,6 +551,14 @@ actor MemoryStorage {
             try record.update(database)
         }
 
+        // Cascade KG provenance removal so any nodes/edges only this memory
+        // contributed to are pruned.
+        do {
+            try await KnowledgeGraphStorage.shared.removeProvenance(forMemoryId: id)
+        } catch {
+            logError("MemoryStorage: KG provenance removal failed for memory \(id)", error: error)
+        }
+
         log("MemoryStorage: Soft deleted memory \(id)")
     }
 
@@ -526,11 +566,28 @@ actor MemoryStorage {
     func deleteMemoryByBackendId(_ backendId: String) async throws {
         let db = try await ensureInitialized()
 
+        // Resolve the local rowid first so we can prune KG provenance after.
+        let localIds: [Int64] = try await db.read { database in
+            try Int64.fetchAll(
+                database,
+                sql: "SELECT id FROM memories WHERE backendId = ?",
+                arguments: [backendId]
+            )
+        }
+
         try await db.write { database in
             try database.execute(
                 sql: "UPDATE memories SET deleted = 1, updatedAt = ? WHERE backendId = ?",
                 arguments: [Date(), backendId]
             )
+        }
+
+        for localId in localIds {
+            do {
+                try await KnowledgeGraphStorage.shared.removeProvenance(forMemoryId: localId)
+            } catch {
+                logError("MemoryStorage: KG provenance removal failed for memory \(localId)", error: error)
+            }
         }
 
         log("MemoryStorage: Soft deleted memory with backendId \(backendId)")
