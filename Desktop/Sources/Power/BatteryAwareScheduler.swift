@@ -20,6 +20,7 @@ public struct PendingWork: Identifiable, Equatable, Sendable {
     case extractMemory
     case extractActionItems
     case summarize
+    case extractKG
   }
 
   public let id: UUID
@@ -459,17 +460,19 @@ public final class BatteryAwareScheduler: ObservableObject {
       // rate-limit. The previous swallowing made S1's silent 401 loop
       // invisible; surface failures via ActivityReportLogger so the next
       // breakage is observable in `/private/tmp/omi-dev.log`.
-      Task {
-        do {
-          try await APIClient.shared.reportInFlight(
-            kind: Self.toWireWorkKind(work.kind),
-            inFlight: inflightEntry
-          )
-          InternalPostFailureTracker.shared.reportSuccess(.inflight)
-        } catch {
-          ActivityReportLogger.shared.log(
-            error: error, context: "reportInFlight(start:\(work.kind.rawValue))")
-          InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
+      if let wireKind = Self.toWireWorkKind(work.kind) {
+        Task {
+          do {
+            try await APIClient.shared.reportInFlight(
+              kind: wireKind,
+              inFlight: inflightEntry
+            )
+            InternalPostFailureTracker.shared.reportSuccess(.inflight)
+          } catch {
+            ActivityReportLogger.shared.log(
+              error: error, context: "reportInFlight(start:\(work.kind.rawValue))")
+            InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
+          }
         }
       }
       // === /activity:G ===
@@ -482,17 +485,19 @@ public final class BatteryAwareScheduler: ObservableObject {
         }
         // === activity:G ===
         self.inFlight[work.kind] = nil
-        Task {
-          do {
-            try await APIClient.shared.reportInFlight(
-              kind: Self.toWireWorkKind(work.kind),
-              inFlight: nil
-            )
-            InternalPostFailureTracker.shared.reportSuccess(.inflight)
-          } catch {
-            ActivityReportLogger.shared.log(
-              error: error, context: "reportInFlight(done:\(work.kind.rawValue))")
-            InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
+        if let wireKind = Self.toWireWorkKind(work.kind) {
+          Task {
+            do {
+              try await APIClient.shared.reportInFlight(
+                kind: wireKind,
+                inFlight: nil
+              )
+              InternalPostFailureTracker.shared.reportSuccess(.inflight)
+            } catch {
+              ActivityReportLogger.shared.log(
+                error: error, context: "reportInFlight(done:\(work.kind.rawValue))")
+              InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
+            }
           }
         }
         // === /activity:G ===
@@ -500,17 +505,19 @@ public final class BatteryAwareScheduler: ObservableObject {
         try? await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
         // === activity:G ===
         self.inFlight[work.kind] = nil
-        Task {
-          do {
-            try await APIClient.shared.reportInFlight(
-              kind: Self.toWireWorkKind(work.kind),
-              inFlight: nil
-            )
-            InternalPostFailureTracker.shared.reportSuccess(.inflight)
-          } catch {
-            ActivityReportLogger.shared.log(
-              error: error, context: "reportInFlight(fail:\(work.kind.rawValue))")
-            InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
+        if let wireKind = Self.toWireWorkKind(work.kind) {
+          Task {
+            do {
+              try await APIClient.shared.reportInFlight(
+                kind: wireKind,
+                inFlight: nil
+              )
+              InternalPostFailureTracker.shared.reportSuccess(.inflight)
+            } catch {
+              ActivityReportLogger.shared.log(
+                error: error, context: "reportInFlight(fail:\(work.kind.rawValue))")
+              InternalPostFailureTracker.shared.reportFailure(.inflight, error: error)
+            }
           }
         }
         // === /activity:G ===
@@ -527,9 +534,11 @@ public final class BatteryAwareScheduler: ObservableObject {
     // that prevents autonomous drains from pinning the model in memory.
     if drainedAnyAutonomous {
       let depth = try? await PendingWorkStorage.shared.depthSummary()
-      let key = PendingWork.Kind.summarize.rawValue
-      let summarizeRemaining = (depth?.queued[key] ?? 0) + (depth?.failed[key] ?? 0)
-      if summarizeRemaining == 0 {
+      let summarizeKey = PendingWork.Kind.summarize.rawValue
+      let extractKGKey = PendingWork.Kind.extractKG.rawValue
+      let summarizeRemaining = (depth?.queued[summarizeKey] ?? 0) + (depth?.failed[summarizeKey] ?? 0)
+      let extractKGRemaining = (depth?.queued[extractKGKey] ?? 0) + (depth?.failed[extractKGKey] ?? 0)
+      if summarizeRemaining == 0 && extractKGRemaining == 0 {
         await IdleAIController.shared.releaseAfterAutonomousWorkIfAppropriate()
       }
     }
@@ -539,7 +548,7 @@ public final class BatteryAwareScheduler: ObservableObject {
   /// Currently: `.summarize`. Future autonomous-LLM kinds should be added here.
   fileprivate static func requiresAutonomousReadiness(_ kind: PendingWork.Kind) -> Bool {
     switch kind {
-    case .summarize:
+    case .summarize, .extractKG:
       return true
     case .transcribe, .ocr, .extractMemory, .extractActionItems:
       return false
@@ -552,13 +561,14 @@ public final class BatteryAwareScheduler: ObservableObject {
   /// the conversion happens here at the boundary instead of being
   /// implicit via `rawValue` (which would produce `"extractMemory"`
   /// instead of the snake_case `"extract_memory"` the daemon expects).
-  fileprivate static func toWireWorkKind(_ kind: PendingWork.Kind) -> WorkKind {
+  fileprivate static func toWireWorkKind(_ kind: PendingWork.Kind) -> WorkKind? {
     switch kind {
     case .transcribe: return .transcribe
     case .ocr: return .ocr
     case .summarize: return .summarize
     case .extractMemory: return .extractMemory
     case .extractActionItems: return .extractActionItems
+    case .extractKG: return nil  // not represented in the daemon's WorkKind wire enum
     }
   }
 

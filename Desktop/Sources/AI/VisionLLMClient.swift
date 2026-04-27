@@ -132,7 +132,7 @@ actor VisionLLMClient {
     }
 
     // Strip optional ```json fences before parsing.
-    let stripped = Self.stripJSONFences(raw)
+    let stripped = stripJSONFences(raw)
     guard let payload = stripped.data(using: .utf8) else {
       throw VisionLLMError.decodingFailed("non-utf8 reply")
     }
@@ -208,24 +208,6 @@ actor VisionLLMClient {
     }
     let b64 = png.base64EncodedString()
     return "data:image/png;base64,\(b64)"
-  }
-
-  /// Strip ```json ... ``` and ``` ... ``` fences if the model wrapped its
-  /// reply against instructions.
-  private static func stripJSONFences(_ s: String) -> String {
-    var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-    if t.hasPrefix("```") {
-      // Drop the leading fence marker (``` or ```json) up to the first newline.
-      if let nl = t.firstIndex(of: "\n") {
-        t = String(t[t.index(after: nl)...])
-      }
-      // Drop the trailing fence.
-      if t.hasSuffix("```") {
-        t = String(t.dropLast(3))
-      }
-      t = t.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    return t
   }
 
   private static func checkHTTPStatus(_ response: URLResponse, data: Data) throws {

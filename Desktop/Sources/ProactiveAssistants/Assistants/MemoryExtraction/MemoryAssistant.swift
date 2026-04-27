@@ -245,6 +245,8 @@ actor MemoryAssistant: ProactiveAssistant {
 
         do {
             let inserted = try await MemoryStorage.shared.insertLocalMemory(record)
+            // KG extraction is enqueued atomically inside `insertLocalMemory`
+            // so the memory and its `.extractKG` work item can never split.
             log("Memory: Saved to SQLite (id: \(inserted.id ?? -1))")
             return inserted
         } catch {

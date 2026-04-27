@@ -848,6 +848,7 @@ actor FocusAssistant: ProactiveAssistant {
 
         do {
             let insertedMemory = try await MemoryStorage.shared.insertLocalMemory(memoryRecord)
+            // KG extraction is enqueued atomically inside `insertLocalMemory`.
             log("Focus: Saved to memories (id: \(insertedMemory.id ?? -1)) with tags \(tags)")
             return insertedMemory.id
         } catch {

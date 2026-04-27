@@ -314,6 +314,7 @@ actor InsightAssistant: ProactiveAssistant {
 
         do {
             let inserted = try await MemoryStorage.shared.insertLocalMemory(record)
+            // KG extraction is enqueued atomically inside `insertLocalMemory`.
             log("Insight: Saved to SQLite (id: \(inserted.id ?? -1)) with tags \(tags)")
             return inserted
         } catch {

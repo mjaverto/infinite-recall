@@ -2479,6 +2479,28 @@ actor RewindDatabase {
                 """)
         }
 
+        migrator.registerMigration("createKGProvenanceAndExtractionStatus") { db in
+            try db.create(table: "local_kg_node_sources") { t in
+                t.column("memoryId", .integer).notNull()
+                t.column("nodeId", .text).notNull()
+                t.primaryKey(["memoryId", "nodeId"])
+            }
+            try db.create(index: "idx_local_kg_node_sources_nodeId",
+                          on: "local_kg_node_sources", columns: ["nodeId"])
+
+            try db.create(table: "local_kg_edge_sources") { t in
+                t.column("memoryId", .integer).notNull()
+                t.column("edgeId", .text).notNull()
+                t.primaryKey(["memoryId", "edgeId"])
+            }
+            try db.create(index: "idx_local_kg_edge_sources_edgeId",
+                          on: "local_kg_edge_sources", columns: ["edgeId"])
+
+            try db.alter(table: "memories") { t in
+                t.add(column: "kg_extraction_status", .text)
+            }
+        }
+
         try migrator.migrate(queue)
     }
 

@@ -385,6 +385,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // on battery and drains on AC.
     PowerWorkBridge.shared.start()
 
+    // One-time KG backfill: enqueues an .extractKG job for every existing
+    // memory that hasn't been processed yet. Idempotent via migration_status.
+    Task {
+      await KGBackfillService.shared.runIfNeeded()
+    }
+
     // === activity:C1 ===
     // CapturePauseGate must run for the lifetime of the app: capture
     // services consult it on every start/mid-flight, regardless of whether

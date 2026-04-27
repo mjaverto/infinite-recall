@@ -27,6 +27,7 @@ public enum WorkLabels {
         case .summarize:         return summarizeLabel(work.payload)
         case .extractMemory:     return extractMemoryLabel(work.payload)
         case .extractActionItems: return extractActionItemsLabel(work.payload)
+        case .extractKG:         return extractKGLabel(work.payload)
         }
     }
 
@@ -86,6 +87,19 @@ public enum WorkLabels {
             return "Finding action items in #\(id)"
         }
         return "Finding action items"
+    }
+
+    /// Payload shape (KGBackfillService): { memory_id: Int64 }
+    private static func extractKGLabel(_ payload: Data) -> String {
+        if let dict = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {
+            if let id = dict["memory_id"] as? Int {
+                return "Extracting brain map entities from memory #\(id)"
+            }
+            if let n = dict["memory_id"] as? NSNumber {
+                return "Extracting brain map entities from memory #\(n.intValue)"
+            }
+        }
+        return "Extracting brain map entities"
     }
 
     // MARK: - Helpers

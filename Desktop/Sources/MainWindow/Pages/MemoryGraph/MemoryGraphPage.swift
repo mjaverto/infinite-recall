@@ -32,6 +32,12 @@ struct MemoryGraphPage: View {
 
           Spacer()
 
+          if let progress = viewModel.buildProgress {
+            BuildingProgressPill(progress: progress)
+          }
+
+          Spacer()
+
           if viewModel.isRebuilding {
             ProgressView()
               .scaleEffect(0.6)
@@ -62,10 +68,68 @@ struct MemoryGraphPage: View {
         ProgressView()
           .scaleEffect(1.2)
           .tint(.white.opacity(0.4))
+      } else if viewModel.isEmpty, let progress = viewModel.buildProgress {
+        BrainMapEmptyStateView(progress: progress)
       }
     }
     .task {
       await viewModel.prepareGraph()
+    }
+  }
+}
+
+/// Centered empty-state copy that adapts to the current build state.
+struct BrainMapEmptyStateView: View {
+  let progress: KGBuildProgress
+
+  var body: some View {
+    let mode = BrainMapEmptyStateClassifier.mode(
+      state: progress.state,
+      totalMemories: progress.totalMemories,
+      processedMemories: progress.processedMemories
+    )
+
+    VStack(spacing: 14) {
+      Image(systemName: "brain")
+        .scaledFont(size: 36)
+        .foregroundColor(.white.opacity(0.25))
+
+      Text(headline(for: mode))
+        .scaledFont(size: 15, weight: .medium)
+        .foregroundColor(.white.opacity(0.7))
+        .multilineTextAlignment(.center)
+
+      Text(subline(for: mode))
+        .scaledFont(size: 12.5)
+        .foregroundColor(.white.opacity(0.45))
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: 360)
+
+      BuildingProgressPill(progress: progress)
+        .padding(.top, 4)
+    }
+    .padding(32)
+  }
+
+  private func headline(for mode: EmptyStateMode) -> String {
+    switch mode {
+    case .backfillNotStarted:
+      return "Building your brain map"
+    case .backfillRunningNoNodesYet:
+      return "Building your brain map"
+    case .backfillCompleteEmpty:
+      return "No entities yet"
+    }
+  }
+
+  private func subline(for mode: EmptyStateMode) -> String {
+    switch mode {
+    case .backfillNotStarted:
+      return "This runs while your Mac is idle. Once your first memory is processed, nodes will appear here."
+    case .backfillRunningNoNodesYet:
+      return "Processing your memories now. Nodes will appear as soon as the first one yields entities."
+    case .backfillCompleteEmpty:
+      return "Your memories didn't contain any entities the extractor could pull out yet. New memories will be picked up automatically."
     }
   }
 }
@@ -112,6 +176,18 @@ struct MemoryGraphInlineCard: View {
           ProgressView()
             .scaleEffect(1.1)
             .tint(.white.opacity(0.45))
+        } else if viewModel.isEmpty, let progress = viewModel.buildProgress {
+          VStack(spacing: 10) {
+            Image(systemName: "brain")
+              .scaledFont(size: 18)
+              .foregroundColor(OmiColors.textTertiary)
+            Text(inlineEmptyCopy(progress: progress))
+              .scaledFont(size: 12.5)
+              .foregroundColor(OmiColors.textSecondary)
+              .multilineTextAlignment(.center)
+            BuildingProgressPill(progress: progress, compact: true)
+          }
+          .padding(18)
         } else if viewModel.isEmpty {
           VStack(spacing: 8) {
             Image(systemName: "brain")
@@ -135,6 +211,22 @@ struct MemoryGraphInlineCard: View {
     )
     .task {
       await viewModel.prepareGraph()
+    }
+  }
+
+  private func inlineEmptyCopy(progress: KGBuildProgress) -> String {
+    let mode = BrainMapEmptyStateClassifier.mode(
+      state: progress.state,
+      totalMemories: progress.totalMemories,
+      processedMemories: progress.processedMemories
+    )
+    switch mode {
+    case .backfillNotStarted:
+      return "Brain map runs while your Mac is idle."
+    case .backfillRunningNoNodesYet:
+      return "Building your brain map…"
+    case .backfillCompleteEmpty:
+      return "No entities found yet. New memories will be picked up automatically."
     }
   }
 }
@@ -196,6 +288,7 @@ class MemoryGraphViewModel: ObservableObject {
   @Published var isRebuilding = false
   @Published var isEmpty = true
   @Published var selectedNodeId: String?
+  @Published var buildProgress: KGBuildProgress?
 
   let scene = SCNScene()
   let cameraNode = SCNNode()
@@ -204,10 +297,39 @@ class MemoryGraphViewModel: ObservableObject {
   private var nodeSceneNodes: [String: SCNNode] = [:]
   private var edgeSceneNodes: [String: SCNNode] = [:]
   private var isAnimating = true
+  private var progressTask: Task<Void, Never>?
 
   init() {
     setupCamera()
     setupLighting()
+    subscribeToBuildProgress()
+  }
+
+  deinit {
+    progressTask?.cancel()
+  }
+
+  private func subscribeToBuildProgress() {
+    progressTask?.cancel()
+    progressTask = Task { [weak self] in
+      let stream = await KGProgressPublisher.shared.stream
+      for await snapshot in stream {
+        guard let self = self else { return }
+        await MainActor.run {
+          self.buildProgress = snapshot
+          // Auto-refresh the rendered scene when nodes appear or grow while
+          // the page is open. Only do this if we aren't already mid-rebuild.
+          if !self.isRebuilding && !self.isLoading,
+             snapshot.totalNodes > 0,
+             self.isEmpty
+          {
+            Task { await self.loadGraph() }
+          }
+        }
+      }
+    }
+    // Kick a fresh tick so the VM gets an immediate snapshot.
+    Task { await KGProgressPublisher.shared.tick() }
   }
 
   private func setupCamera() {
