@@ -116,14 +116,24 @@ final class PowerWorkBridge {
     /// notification.
     @Sendable
     fileprivate static func handleDeadLetter(workType: String, payload: Data) async {
-        guard workType == PendingWork.Kind.summarize.rawValue else { return }
+        switch workType {
+        case PendingWork.Kind.summarize.rawValue:
+            await handleDeadLetterSummarize(payload: payload)
+        case PendingWork.Kind.extractKG.rawValue:
+            await handleDeadLetterExtractKG(payload: payload)
+        default:
+            return
+        }
+    }
 
+    @Sendable
+    fileprivate static func handleDeadLetterSummarize(payload: Data) async {
         struct Payload: Decodable { let session_id: Int64 }
         let sessionId: Int64
         do {
             sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
         } catch {
-            logError("PowerWorkBridge: dead-letter payload undecodable for \(workType)", error: error)
+            logError("PowerWorkBridge: dead-letter payload undecodable for summarize", error: error)
             return
         }
 
@@ -141,6 +151,31 @@ final class PowerWorkBridge {
                 userInfo: ["session_id": sessionId]
             )
         }
+    }
+
+    /// Cluster E1: when an `.extractKG` row exhausts its retry budget,
+    /// transition the memory's `kg_extraction_status` to `.failed` so the
+    /// progress publisher counts it correctly (otherwise it'd remain NULL
+    /// and forever inflate the "remaining memories" denominator).
+    @Sendable
+    fileprivate static func handleDeadLetterExtractKG(payload: Data) async {
+        struct Payload: Decodable { let memory_id: Int64 }
+        let memoryId: Int64
+        do {
+            memoryId = try JSONDecoder().decode(Payload.self, from: payload).memory_id
+        } catch {
+            // Payload was undecodable when we tried to extract too; nothing
+            // we can do at dead-letter time. Logged in the handler already.
+            logError("PowerWorkBridge: dead-letter — extractKG payload undecodable", error: error)
+            return
+        }
+        do {
+            try await MemoryStorage.shared.setKGExtractionStatus(id: memoryId, status: .failed)
+            log("PowerWorkBridge: dead-letter — marked memory \(memoryId) kg_extraction_status='failed'")
+        } catch {
+            logError("PowerWorkBridge: dead-letter — failed to write kg_extraction_status for memory \(memoryId)", error: error)
+        }
+        await KGProgressPublisher.shared.tick()
     }
 
     // MARK: - Transcribe handler
@@ -414,8 +449,17 @@ final class PowerWorkBridge {
         do {
             memoryId = try JSONDecoder().decode(Payload.self, from: work.payload).memory_id
         } catch {
-            logError("PowerWorkBridge: .extractKG payload undecodable, dropping", error: error)
-            return
+            // Cluster G: an undecodable payload previously logged + returned
+            // success → row ack'd → memory's `kg_extraction_status` stays
+            // NULL forever. Throw instead so the row enters retry/backoff
+            // and eventually dead-letters. We can't surface a memoryId
+            // because the payload didn't yield one; the dead-letter callback
+            // skips when the workType doesn't match a known kind.
+            logError(
+                "PowerWorkBridge: .extractKG payload undecodable; throwing to dead-letter",
+                error: error
+            )
+            throw error
         }
 
         let record: MemoryRecord?
@@ -426,10 +470,18 @@ final class PowerWorkBridge {
             throw error
         }
 
-        guard let memory = record, memory.deleted == false, let realId = memory.id else {
-            // Memory was deleted (or soft-deleted) between enqueue and drain.
-            // Treat as a benign no-op: ack the row, don't log as error.
-            log("PowerWorkBridge: .extractKG — memory \(memoryId) no longer exists or is deleted, skipping")
+        // Cluster J: distinguish "memory not found" from "memory soft-deleted"
+        // in the log so production telemetry can tell DB-vs-soft-delete apart.
+        if record == nil {
+            log("PowerWorkBridge: .extractKG — memory \(memoryId) not found, ack-and-skip")
+            return
+        }
+        if record?.deleted == true {
+            log("PowerWorkBridge: .extractKG — memory \(memoryId) soft-deleted, ack-and-skip")
+            return
+        }
+        guard let memory = record, let realId = memory.id else {
+            log("PowerWorkBridge: .extractKG — memory \(memoryId) record missing id, ack-and-skip")
             return
         }
 
@@ -444,7 +496,12 @@ final class PowerWorkBridge {
         } catch {
             // Extractor itself threw (LLM unreachable, etc.). Mark failed and
             // rethrow so PendingWork retry/backoff takes over.
-            try? await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: "failed")
+            // Cluster C3: log when status write fails so silent drops are visible.
+            do {
+                try await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: .failed)
+            } catch let statusError {
+                logError("PowerWorkBridge: .extractKG — setKGExtractionStatus(.failed) failed for memory \(realId) (will be re-extracted on retry)", error: statusError)
+            }
             await KGProgressPublisher.shared.tick()
             throw error
         }
@@ -452,34 +509,57 @@ final class PowerWorkBridge {
         switch extraction.outcome {
         case .parsed, .recovered, .truncatedRetried:
             if extraction.nodes.isEmpty && extraction.edges.isEmpty {
-                // Defensive: shouldn't happen because the extractor
-                // collapses an empty success into `.empty(...)`, but keep the
-                // status writeable just in case.
-                try? await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: "empty")
+                // Defensive: shouldn't happen because the extractor collapses
+                // an empty success into `.empty(...)`, but keep the status
+                // writeable just in case.
+                do {
+                    try await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: .empty)
+                } catch let statusError {
+                    logError("PowerWorkBridge: .extractKG — setKGExtractionStatus(.empty/defensive) failed for memory \(realId)", error: statusError)
+                }
             } else {
                 do {
+                    // Cluster B2: upsert + status now ride in the same
+                    // transaction so a crash between them is impossible.
                     _ = try await KnowledgeGraphStorage.shared.upsert(
                         memoryId: realId,
                         nodes: extraction.nodes,
-                        edges: extraction.edges
+                        edges: extraction.edges,
+                        terminalStatus: .succeeded
                     )
-                    try await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: "succeeded")
                 } catch {
                     // Upsert failure is retryable (DB transient) — mark failed
-                    // and rethrow.
-                    try? await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: "failed")
+                    // out-of-band (best-effort; if THIS write also fails the
+                    // row will simply be re-extracted on retry, which is fine).
+                    do {
+                        try await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: .failed)
+                    } catch let statusError {
+                        logError("PowerWorkBridge: .extractKG — setKGExtractionStatus(.failed) failed for memory \(realId) after upsert failure", error: statusError)
+                    }
                     await KGProgressPublisher.shared.tick()
                     throw error
                 }
             }
         case .empty:
-            try? await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: "empty")
+            do {
+                try await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: .empty)
+            } catch let statusError {
+                logError("PowerWorkBridge: .extractKG — setKGExtractionStatus(.empty) failed for memory \(realId)", error: statusError)
+            }
         case .failed(let reason):
-            try? await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: "failed")
+            do {
+                try await MemoryStorage.shared.setKGExtractionStatus(id: realId, status: .failed)
+            } catch let statusError {
+                logError("PowerWorkBridge: .extractKG — setKGExtractionStatus(.failed) failed for memory \(realId)", error: statusError)
+            }
             await KGProgressPublisher.shared.tick()
+            // Cluster F: surface the underlying LLM error detail so
+            // PendingWorkStorage.fail() captures it in `lastError` and the
+            // dead-letter log shows what actually went wrong.
+            let detail = extraction.llmErrorDetail.map { ": \($0)" } ?? ""
             throw NSError(
                 domain: "PowerWorkBridge", code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "extractKG failed: \(reason.rawValue)"]
+                userInfo: [NSLocalizedDescriptionKey: "extractKG failed: \(reason.rawValue)\(detail)"]
             )
         }
 
