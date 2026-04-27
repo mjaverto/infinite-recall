@@ -65,12 +65,14 @@ struct MemoryPayload: Codable {
   ///
   /// `id` must be a stable string for the outbox. Prefer `backendId` once
   /// the record has synced to the (now-defunct) backend; otherwise fall
-  /// back to a `"local-<rowid>"` form so retries land on the same row.
+  /// back to a `"local_<rowid>"` form so retries land on the same row.
+  /// The underscore form matches `MemoryRecord.toServerMemory()` so the
+  /// outbox `memoryId` can be joined against the canonical memory id.
   init(from record: MemoryRecord) {
     if let backendId = record.backendId, !backendId.isEmpty {
       self.id = backendId
     } else {
-      self.id = "local-\(record.id ?? 0)"
+      self.id = "local_\(record.id ?? 0)"
     }
 
     if let headline = record.headline, !headline.isEmpty {

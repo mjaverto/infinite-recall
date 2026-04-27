@@ -69,7 +69,7 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
 
     /// Build a realistic Layer-2 `MemoryRecord` fixture. The ID is
     /// nil/zero — `MemoryPayload(from: MemoryRecord)` falls back to
-    /// `"local-<rowid>"` form, which is stable enough for assertion.
+    /// `"local_<rowid>"` form, which is stable enough for assertion.
     private func makeMemory(
         backendId: String? = nil,
         headline: String? = "Test memory headline",
@@ -243,5 +243,55 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
 
         XCTAssertEqual(enabledRows.count, 1, "Enabled integration receives the row")
         XCTAssertEqual(disabledRows.count, 0, "Disabled integration receives nothing")
+    }
+
+    /// Pin the `backendId == nil` fallback branch of
+    /// `MemoryPayload(from: MemoryRecord)`. With an explicit `id: 42` and no
+    /// backendId, the outbox row's `memoryId` MUST be `"local_42"` —
+    /// underscore, matching `MemoryRecord.toServerMemory()`. A regression
+    /// that flipped this back to a hyphen (`"local-42"`) would break any
+    /// future dedup that joins outbox `memoryId` against the canonical
+    /// memory id, and silently confuse log correlation today. This test
+    /// exists so that flip can never happen quietly.
+    func test_enqueueDispatch_memory_localFallback_usesUnderscoreFormat() async throws {
+        let integration = try await createEnabledWebhook(name: "local-fallback")
+
+        // Explicit rowid, no backendId — exercises the fallback branch.
+        let memory = MemoryRecord(
+            id: 42,
+            backendId: nil,
+            backendSynced: false,
+            content: "Body for the local-fallback assertion.",
+            category: "system",
+            tagsJson: nil,
+            reviewed: false,
+            manuallyAdded: false,
+            source: "desktop",
+            headline: "Local fallback id test",
+            isRead: false,
+            isDismissed: false,
+            deleted: false,
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+
+        await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: memory)
+
+        let rows = try await outboxRows(forIntegrationId: integration.id)
+        XCTAssertEqual(rows.count, 1, "Exactly one outbox row expected")
+
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(
+            row.memoryId, "local_42",
+            "Fallback id MUST use underscore to match toServerMemory()"
+        )
+
+        // Belt-and-suspenders: the snapshotted payload's id field also has
+        // to carry the underscore form, since downstream readers decode it.
+        let data = try XCTUnwrap(row.payloadJson.data(using: .utf8))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let payload = try decoder.decode(MemoryPayload.self, from: data)
+        XCTAssertEqual(payload.id, "local_42")
     }
 }
