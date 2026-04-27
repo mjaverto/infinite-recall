@@ -89,6 +89,19 @@ public enum ThermalState: String, Codable, Hashable {
     case critical
 }
 
+public enum ProcessKind: String, Codable, Hashable {
+    case core
+    case localModel = "local_model"
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        let raw = try c.decode(String.self)
+        // Fallback to .unknown for forward-compat with newer daemons.
+        self = ProcessKind(rawValue: raw) ?? .unknown
+    }
+}
+
 /// Issue #35: the pre-#35 `GateReason` (`idle/device_active/on_battery/
 /// thermal/locked/manual_pause/none/stub`) was a stringly-typed enum that
 /// existed alongside an `allowed: Bool` permitting illegal combos like
@@ -242,19 +255,22 @@ public struct ProcessBreakdown: Codable, Hashable {
     public let pid: Int32
     public let cpuPercent: Float
     public let rssMb: UInt32
+    public let kind: ProcessKind?
 
     enum CodingKeys: String, CodingKey {
         case name
         case pid
         case cpuPercent = "cpu_percent"
         case rssMb = "rss_mb"
+        case kind
     }
 
-    public init(name: String, pid: Int32, cpuPercent: Float, rssMb: UInt32) {
+    public init(name: String, pid: Int32, cpuPercent: Float, rssMb: UInt32, kind: ProcessKind? = nil) {
         self.name = name
         self.pid = pid
         self.cpuPercent = cpuPercent
         self.rssMb = rssMb
+        self.kind = kind
     }
 }
 

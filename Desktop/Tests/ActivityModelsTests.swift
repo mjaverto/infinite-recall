@@ -589,4 +589,45 @@ final class ActivityModelsTests: XCTestCase {
     func testDefaultsKeyMatchesContract() {
         XCTAssertEqual(ActivityDefaultsKeys.lastGateStateJSON, "activity.lastGateStateJSON")
     }
+
+    // MARK: - ProcessKind decoding (forward-compat with newer daemons)
+
+    func testProcessBreakdownDecodesLocalModelKind() throws {
+        let json = """
+        { "name": "mlx-lm", "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498,
+          "kind": "local_model" }
+        """
+        let p = try Self.makeDecoder()
+            .decode(ProcessBreakdown.self, from: json.data(using: .utf8)!)
+        XCTAssertEqual(p.kind, .localModel)
+    }
+
+    func testProcessBreakdownDecodesCoreKind() throws {
+        let json = """
+        { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84,
+          "kind": "core" }
+        """
+        let p = try Self.makeDecoder()
+            .decode(ProcessBreakdown.self, from: json.data(using: .utf8)!)
+        XCTAssertEqual(p.kind, .core)
+    }
+
+    func testProcessBreakdownDecodesUnknownKindAsUnknown() throws {
+        let json = """
+        { "name": "future-proc", "pid": 9999, "cpu_percent": 1.0, "rss_mb": 10,
+          "kind": "future_unknown" }
+        """
+        let p = try Self.makeDecoder()
+            .decode(ProcessBreakdown.self, from: json.data(using: .utf8)!)
+        XCTAssertEqual(p.kind, .unknown)
+    }
+
+    func testProcessBreakdownDecodesMissingKindAsNil() throws {
+        let json = """
+        { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84 }
+        """
+        let p = try Self.makeDecoder()
+            .decode(ProcessBreakdown.self, from: json.data(using: .utf8)!)
+        XCTAssertNil(p.kind)
+    }
 }

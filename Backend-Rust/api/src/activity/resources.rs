@@ -26,18 +26,27 @@ use libproc::proc_pid;
 use libproc::task_info::TaskInfo;
 
 use super::traits::ResourceSampler;
-use super::types::{ProcessBreakdown, ResourceSample, ThermalState};
+use super::types::{ProcessBreakdown, ProcessKind, ResourceSample, ThermalState};
 
 /// `pgrep -f` patterns. The Swift app is launched as a regular `.app` (never
-/// under launchd) so its PID has to come from the bundle path; the mlx-lm
-/// helper is a `uv tool run mlx_lm.server` invocation that uniquely matches
-/// the executable name.
+/// under launchd) so its PID has to come from the bundle path; the mlx-lm /
+/// mlx-vlm helpers are `uv tool run mlx_{lm,vlm}.server` invocations that
+/// uniquely match the executable name.
+///
+/// The mlx patterns are anchored with a leading space so an argv that
+/// happens to mention both names (e.g. a wrapper script) doesn't
+/// double-match the same PID under both labels.
 const SWIFT_PGREP_PATTERN: &str = "Infinite Recall.app/Contents/MacOS";
-const MLX_PGREP_PATTERN: &str = "mlx_lm.server";
+const MLX_PGREP_PATTERN: &str = " mlx_lm.server";
+const MLX_VLM_PGREP_PATTERN: &str = " mlx_vlm.server";
 
-/// Launchd label for `mlx_lm.server`. The Swift app is NOT under launchd, so
-/// no swift-side label is probed.
+/// Launchd labels for the local-model helpers. The Swift app is NOT under
+/// launchd, so no swift-side label is probed.
 const MLX_LAUNCHD_LABEL: &str = "com.infiniterecall.mlx";
+const MLX_VLM_LAUNCHD_LABEL: &str = "com.infiniterecall.vlm";
+
+/// Pidfile basenames under the InfiniteRecall app-support dir.
+const MLX_VLM_PIDFILE: &str = "mlxvlm.pid";
 
 /// How long to hold a sample in cache before re-sampling.
 ///
@@ -63,7 +72,7 @@ struct Inner {
     support_dir_override: Option<PathBuf>,
     /// If `Some`, take this list of pids verbatim instead of discovering.
     /// Tests use this so they do not have to spin up real processes.
-    pid_override: Option<Vec<(String, i32)>>,
+    pid_override: Option<Vec<(String, i32, Option<ProcessKind>)>>,
 }
 
 impl SystemResourceSampler {
@@ -94,7 +103,7 @@ impl SystemResourceSampler {
 
     /// Test constructor: skip PID discovery entirely and sample these pids.
     #[cfg(test)]
-    fn with_pids(pids: Vec<(String, i32)>) -> Self {
+    fn with_pids(pids: Vec<(String, i32, Option<ProcessKind>)>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 cache: None,
@@ -132,7 +141,7 @@ impl ResourceSampler for SystemResourceSampler {
             )
         };
 
-        let pids: Vec<(String, i32)> = match pid_override {
+        let pids: Vec<(String, i32, Option<ProcessKind>)> = match pid_override {
             Some(v) => v,
             None => discover_pids(support_dir_override.as_deref()),
         };
@@ -173,11 +182,13 @@ impl ResourceSampler for SystemResourceSampler {
 /// Singleton-fixer S7: each discovery path emits a structured tracing
 /// breadcrumb so the next contributor can tell whether a missing pid is
 /// "no pidfile yet" vs "launchctl label renamed" vs "stale pidfile".
-fn discover_pids(support_dir_override: Option<&std::path::Path>) -> Vec<(String, i32)> {
-    let mut out: Vec<(String, i32)> = Vec::with_capacity(3);
+fn discover_pids(
+    support_dir_override: Option<&std::path::Path>,
+) -> Vec<(String, i32, Option<ProcessKind>)> {
+    let mut out: Vec<(String, i32, Option<ProcessKind>)> = Vec::with_capacity(4);
 
     let self_pid = std::process::id() as i32;
-    out.push(("api".to_string(), self_pid));
+    out.push(("api".to_string(), self_pid, Some(ProcessKind::Core)));
 
     let support_dir = support_dir_override
         .map(|p| p.to_path_buf())
@@ -189,7 +200,7 @@ fn discover_pids(support_dir_override: Option<&std::path::Path>) -> Vec<(String,
         SWIFT_PGREP_PATTERN,
         None,
     ) {
-        out.push(("swift".to_string(), pid));
+        out.push(("swift".to_string(), pid, Some(ProcessKind::Core)));
     }
 
     if let Some(pid) = discover_one(
@@ -198,8 +209,39 @@ fn discover_pids(support_dir_override: Option<&std::path::Path>) -> Vec<(String,
         MLX_PGREP_PATTERN,
         Some(MLX_LAUNCHD_LABEL),
     ) {
-        out.push(("mlx-lm".to_string(), pid));
+        out.push(("mlx-lm".to_string(), pid, Some(ProcessKind::LocalModel)));
     }
+
+    if let Some(pid) = discover_one(
+        "mlx-vlm",
+        &support_dir.join(MLX_VLM_PIDFILE),
+        MLX_VLM_PGREP_PATTERN,
+        Some(MLX_VLM_LAUNCHD_LABEL),
+    ) {
+        out.push(("mlx-vlm".to_string(), pid, Some(ProcessKind::LocalModel)));
+    }
+
+    // Dedupe by pid: anchored pgrep patterns + distinct launchd labels make
+    // collisions unlikely, but a wrapper script whose argv contains both
+    // names would otherwise yield two identical rows. Drop later duplicates
+    // so the first-discovered label wins.
+    let mut seen: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+    out.retain(|(name, pid, _)| match seen.get(pid) {
+        None => {
+            seen.insert(*pid, name.clone());
+            true
+        }
+        Some(kept) => {
+            tracing::warn!(
+                component = "activity.discover",
+                kept_label = %kept,
+                duplicate_label = %name,
+                pid,
+                "dropping duplicate pid from discovery (already discovered under another label)"
+            );
+            false
+        }
+    });
 
     out
 }
@@ -444,7 +486,7 @@ fn pid_alive(pid: i32) -> bool {
 /// (elapsed_ns * num_cores) * 100`. RSS is taken from the second sample.
 ///
 /// Pids that disappear between calls are silently dropped.
-fn sample_processes(pids: &[(String, i32)]) -> Vec<ProcessBreakdown> {
+fn sample_processes(pids: &[(String, i32, Option<ProcessKind>)]) -> Vec<ProcessBreakdown> {
     if pids.is_empty() {
         return Vec::new();
     }
@@ -452,16 +494,16 @@ fn sample_processes(pids: &[(String, i32)]) -> Vec<ProcessBreakdown> {
     let cores = num_logical_cores().max(1) as f64;
 
     let t0 = Instant::now();
-    let first: Vec<(String, i32, Option<TaskInfo>)> = pids
+    let first: Vec<(String, i32, Option<ProcessKind>, Option<TaskInfo>)> = pids
         .iter()
-        .map(|(n, p)| (n.clone(), *p, proc_pid::pidinfo::<TaskInfo>(*p, 0).ok()))
+        .map(|(n, p, k)| (n.clone(), *p, *k, proc_pid::pidinfo::<TaskInfo>(*p, 0).ok()))
         .collect();
 
     thread::sleep(CPU_SAMPLE_WINDOW);
 
     let elapsed_ns = t0.elapsed().as_nanos() as f64;
     let mut out = Vec::with_capacity(first.len());
-    for (name, pid, before) in first {
+    for (name, pid, kind, before) in first {
         let Some(before) = before else { continue };
         let Ok(after) = proc_pid::pidinfo::<TaskInfo>(pid, 0) else {
             continue;
@@ -482,18 +524,25 @@ fn sample_processes(pids: &[(String, i32)]) -> Vec<ProcessBreakdown> {
         // with Activity Monitor "Memory" column reporting).
         let rss_mb = (after.pti_resident_size / (1024 * 1024)) as u32;
 
-        // Best-effort: prefer the OS-reported short name, fall back to the
-        // discovery label.
-        let display_name = proc_pid::name(pid)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(name);
+        // For known kinds the discovery label wins: `proc_pid::name` would
+        // collapse mlx-lm and mlx-vlm to `python3.11`/`uv`, making the rows
+        // indistinguishable in the UI. For untyped pids (None), keep the
+        // existing OS-name-preferred behaviour.
+        let display_name = if kind.is_some() {
+            name
+        } else {
+            proc_pid::name(pid)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(name)
+        };
 
         out.push(ProcessBreakdown {
             name: display_name,
             pid,
             cpu_percent,
             rss_mb,
+            kind,
         });
     }
     out
@@ -775,23 +824,49 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// PID-from-pidfile happy path: writing our own pid into the support dir
-    /// is enough to be picked up by discover_pids.
+    /// Exercises pidfile precedence in isolation from host pgrep/launchctl
+    /// state by probing `discover_one` once per known label.
     #[test]
     fn pidfile_happy_path() {
         let tmp = tempdir();
         let me = std::process::id() as i32;
+        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+            ("swift", "swift.pid", SWIFT_PGREP_PATTERN, None),
+            ("mlx", "mlxlm.pid", MLX_PGREP_PATTERN, Some(MLX_LAUNCHD_LABEL)),
+            (
+                "mlx-vlm",
+                MLX_VLM_PIDFILE,
+                MLX_VLM_PGREP_PATTERN,
+                Some(MLX_VLM_LAUNCHD_LABEL),
+            ),
+        ];
+        for (target, pidfile_name, pgrep, launchd) in cases {
+            let pidfile = tmp.join(pidfile_name);
+            fs::write(&pidfile, me.to_string()).unwrap();
+            let pid = discover_one(target, &pidfile, pgrep, *launchd);
+            assert_eq!(pid, Some(me), "discover_one({target}) should pick pidfile");
+            fs::remove_file(&pidfile).unwrap();
+        }
+    }
+
+    /// Dedupe path: when mlx-lm and mlx-vlm both resolve to the same pid
+    /// (e.g. an argv that mentions both names so an unanchored pgrep
+    /// double-matches), only one row is emitted.
+    #[test]
+    fn discover_dedupes_colliding_pids() {
+        let tmp = tempdir();
+        let me = std::process::id() as i32;
+        // All four labels (api, swift, mlx-lm, mlx-vlm) resolve to `me`
+        // via pidfile or the implicit api self-pid. Dedupe must collapse
+        // them to a single row, and the surviving row's pid must be unique.
         fs::write(tmp.join("swift.pid"), me.to_string()).unwrap();
         fs::write(tmp.join("mlxlm.pid"), me.to_string()).unwrap();
+        fs::write(tmp.join(MLX_VLM_PIDFILE), me.to_string()).unwrap();
 
         let pids = discover_pids(Some(&tmp));
-        // self + swift + mlx-lm = 3, all pointing at our own pid in this test.
-        assert_eq!(pids.len(), 3, "expected 3 pids, got {pids:?}");
-        assert!(pids.iter().all(|(_, p)| *p == me));
-        let names: Vec<&str> = pids.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"api"));
-        assert!(names.contains(&"swift"));
-        assert!(names.contains(&"mlx-lm"));
+        let unique: std::collections::HashSet<i32> = pids.iter().map(|(_, p, _)| *p).collect();
+        assert_eq!(unique.len(), pids.len(), "no duplicate pids allowed");
+        assert_eq!(pids.len(), 1, "expected dedupe to collapse to 1 row");
     }
 
     /// PID-not-found: empty support dir + no launchctl labels matching means
@@ -805,7 +880,7 @@ mod tests {
         // unlikely candidate labels — almost certainly nothing matches.
         let pids = discover_pids(Some(&tmp));
         // `self` is always there.
-        assert!(pids.iter().any(|(n, _)| n == "api"));
+        assert!(pids.iter().any(|(n, _, _)| n == "api"));
 
         // sample() with the same support dir override must succeed even when
         // only the self pid is present.
@@ -820,7 +895,11 @@ mod tests {
     #[test]
     fn cache_prevents_back_to_back_resample() {
         let me = std::process::id() as i32;
-        let s = SystemResourceSampler::with_pids(vec![("api".to_string(), me)]);
+        let s = SystemResourceSampler::with_pids(vec![(
+            "api".to_string(),
+            me,
+            Some(ProcessKind::Core),
+        )]);
 
         let a = s.sample();
         let t = Instant::now();

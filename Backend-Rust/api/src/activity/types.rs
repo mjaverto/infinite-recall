@@ -188,6 +188,22 @@ pub struct CaptureRow {
     pub paused_until: Option<DateTime<Utc>>,
 }
 
+/// Classifier for `ProcessBreakdown` rows so the UI can group them.
+/// Wire shape: snake_case string. Field is optional on `ProcessBreakdown` —
+/// older daemons emit no `kind`, and clients must tolerate unknown future
+/// variants gracefully. `Unknown` is the catch-all for future variants:
+/// `#[serde(other)]` makes deserialization match Swift's forward-compat
+/// fallback so an older daemon that adds a new wire value doesn't fail
+/// the whole snapshot decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessKind {
+    Core,
+    LocalModel,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Per-process sample line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessBreakdown {
@@ -195,6 +211,8 @@ pub struct ProcessBreakdown {
     pub pid: i32,
     pub cpu_percent: f32,
     pub rss_mb: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProcessKind>,
 }
 
 /// One sample tick of system resources.
@@ -358,7 +376,10 @@ mod tests {
         // not be present (the whole point of the sum is that they're not
         // meaningful in this variant).
         assert!(v.get("reason").is_none(), "Allowed must not carry reason");
-        assert!(v.get("waiting_for").is_none(), "Allowed must not carry waiting_for");
+        assert!(
+            v.get("waiting_for").is_none(),
+            "Allowed must not carry waiting_for"
+        );
 
         // Round-trip back through the wire and we get the same variant.
         let back: GateState = serde_json::from_value(v).unwrap();
@@ -386,7 +407,11 @@ mod tests {
         assert!(!back.is_allowed());
         assert_eq!(back.since(), since);
         match back {
-            GateState::Blocked { reason, waiting_for, .. } => {
+            GateState::Blocked {
+                reason,
+                waiting_for,
+                ..
+            } => {
                 assert_eq!(reason, BlockReason::DeviceActive);
                 assert!(matches!(
                     waiting_for,
@@ -422,7 +447,10 @@ mod tests {
                 },
                 serde_json::json!({"type":"idle_for","duration_secs":120}),
             ),
-            (WaitCondition::AcPower, serde_json::json!({"type":"ac_power"})),
+            (
+                WaitCondition::AcPower,
+                serde_json::json!({"type":"ac_power"}),
+            ),
             (
                 WaitCondition::ThermalCooldown,
                 serde_json::json!({"type":"thermal_cooldown"}),
@@ -459,6 +487,16 @@ mod tests {
     }
 
     #[test]
+    fn process_kind_unknown_variant_decodes_future_wire_values() {
+        let json = r#"{"name":"future-proc","pid":9999,"cpu_percent":1.0,"rss_mb":10,"kind":"future_unknown"}"#;
+        let p: ProcessBreakdown = serde_json::from_str(json).unwrap();
+        assert_eq!(p.kind, Some(ProcessKind::Unknown));
+
+        let direct: ProcessKind = serde_json::from_str("\"future_unknown\"").unwrap();
+        assert_eq!(direct, ProcessKind::Unknown);
+    }
+
+    #[test]
     fn gate_state_allowed_rejects_extraneous_reason() {
         // Allowed's untyped extras still parse (serde ignores unknown
         // fields by default), but constructing and round-tripping a clean
@@ -467,7 +505,13 @@ mod tests {
             since: "2026-04-26T14:25:00Z".parse().unwrap(),
         };
         let s = serde_json::to_string(&g).unwrap();
-        assert!(!s.contains("reason"), "Allowed serialization must not contain reason: {s}");
-        assert!(!s.contains("waiting_for"), "Allowed must not contain waiting_for: {s}");
+        assert!(
+            !s.contains("reason"),
+            "Allowed serialization must not contain reason: {s}"
+        );
+        assert!(
+            !s.contains("waiting_for"),
+            "Allowed must not contain waiting_for: {s}"
+        );
     }
 }
