@@ -57,6 +57,16 @@ const MLX_VLM_PIDFILE: &str = "mlxvlm.pid";
 /// (CPU/RSS/GPU are coarse readouts, not real-time meters).
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// Maximum BFS depth when walking descendants of a `LocalModel` root via
+/// `pgrep -P`. Defensive cap so a runaway tree (e.g. a wrapper that re-execs)
+/// can't expand the snapshot indefinitely.
+const DESCENDANT_MAX_DEPTH: usize = 4;
+
+/// Maximum number of descendants collected per `LocalModel` root.
+/// Paired with `DESCENDANT_MAX_DEPTH` to bound `discover_pids` overhead
+/// regardless of process tree shape.
+const DESCENDANT_MAX_COUNT: usize = 16;
+
 /// Window over which we measure CPU% deltas.
 const CPU_SAMPLE_WINDOW: Duration = Duration::from_millis(250);
 
@@ -219,6 +229,45 @@ fn discover_pids(
         Some(MLX_VLM_LAUNCHD_LABEL),
     ) {
         out.push(("mlx-vlm".to_string(), pid, Some(ProcessKind::LocalModel)));
+    }
+
+    // Walk descendants of every `LocalModel` root and append them as their own
+    // rows. The launchd-managed parent (e.g. `uv tool run mlx_lm.server`) holds
+    // ~5 MB; the forked Python child it execs holds the multi-GB model weights.
+    // Without this walk the Activity tab silently undercounts by ~10+ GB. We
+    // only walk LocalModel roots — Core (api/swift) descendants are short-lived
+    // shells (Bash/pgrep/launchctl) that aren't memory-relevant.
+    //
+    // Snapshot the roots first so we're not iterating `out` while pushing to
+    // it. Existing dedupe (below) handles any collisions with the parent.
+    let local_model_roots: Vec<(String, i32)> = out
+        .iter()
+        .filter_map(|(name, pid, kind)| {
+            if matches!(kind, Some(ProcessKind::LocalModel)) {
+                Some((name.clone(), *pid))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (name, ppid) in local_model_roots {
+        for (child_pid, depth) in
+            descendants_of(ppid, DESCENDANT_MAX_DEPTH, DESCENDANT_MAX_COUNT)
+        {
+            tracing::debug!(
+                component = "activity.discover.descendants",
+                root = %name,
+                ppid,
+                child_pid,
+                depth,
+                "discovered model worker descendant"
+            );
+            out.push((
+                format!("{name} child"),
+                child_pid,
+                Some(ProcessKind::LocalModel),
+            ));
+        }
     }
 
     // Dedupe by pid: anchored pgrep patterns + distinct launchd labels make
@@ -416,6 +465,94 @@ fn parse_pgrep_pid(stdout: &str, self_pid: i32, target: &str) -> Option<i32> {
         }
     }
     picked
+}
+
+/// Parse newline-separated `pgrep` output, returning ALL live, non-self pids.
+///
+/// Sibling of `parse_pgrep_pid` — kept separate (rather than generalising the
+/// existing one with a `multi: bool` flag) so each parser stays single-purpose
+/// and easy to reason about. Used by the descendant tree walk.
+fn parse_pgrep_pids_all(stdout: &str, self_pid: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let Ok(pid) = line.trim().parse::<i32>() else {
+            continue;
+        };
+        if pid > 0 && pid != self_pid && pid_alive(pid) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Run `pgrep -P <ppid>` and return the live, non-self direct children of
+/// `ppid`. Mirrors `pid_from_pgrep` but returns every match.
+fn pgrep_children(ppid: i32) -> Vec<i32> {
+    let out = match Command::new("pgrep")
+        .args(["-P", &ppid.to_string()])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            // Mirrors the `pid_from_pgrep` convention: emit a debug breadcrumb
+            // when the `pgrep` binary itself is unspawnable so ops can tell
+            // the difference between "no children" and "the feature is
+            // structurally broken on this host". Not noisy: only fires when
+            // the spawn itself fails, not on the (normal) no-match exit code.
+            tracing::debug!(
+                component = "activity.discover.descendants",
+                ppid,
+                error = %e,
+                "pgrep -P spawn failed"
+            );
+            return Vec::new();
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // pgrep exits non-zero (1) when there are no matches; that's not an error.
+    // Anything OTHER than 0 (success) or 1 (no matches) with empty stdout is
+    // surprising — log at debug so a future regression isn't silent.
+    if !out.status.success() && out.stdout.is_empty() && out.status.code() != Some(1) {
+        tracing::debug!(
+            component = "activity.discover.descendants",
+            ppid,
+            status = ?out.status,
+            "pgrep -P returned unexpected non-(0|1) exit with empty stdout"
+        );
+    }
+    parse_pgrep_pids_all(&stdout, std::process::id() as i32)
+}
+
+/// BFS the process tree rooted at `root_ppid`, returning `(pid, depth)` pairs
+/// for every descendant up to `max_depth` levels deep, capped at `max_count`.
+///
+/// Depth 1 == direct children of `root_ppid`. The root itself is not
+/// included. The `depth` is propagated to the tracing breadcrumb so log
+/// readers can answer "which generation of the tree is this?" without
+/// re-walking by hand.
+fn descendants_of(root_ppid: i32, max_depth: usize, max_count: usize) -> Vec<(i32, usize)> {
+    let mut out: Vec<(i32, usize)> = Vec::new();
+    if max_depth == 0 || max_count == 0 {
+        return out;
+    }
+    // (pid_to_walk, depth_of_its_children)
+    let mut frontier: Vec<(i32, usize)> = vec![(root_ppid, 1)];
+    while let Some((parent, depth)) = frontier.first().copied() {
+        frontier.remove(0);
+        if depth > max_depth {
+            continue;
+        }
+        for child in pgrep_children(parent) {
+            if out.len() >= max_count {
+                return out;
+            }
+            out.push((child, depth));
+            if depth < max_depth {
+                frontier.push((child, depth + 1));
+            }
+        }
+    }
+    out
 }
 
 /// Parses `launchctl list <label>` for a `"PID" = <int>;` (legacy) or
@@ -852,13 +989,19 @@ mod tests {
     /// Dedupe path: when mlx-lm and mlx-vlm both resolve to the same pid
     /// (e.g. an argv that mentions both names so an unanchored pgrep
     /// double-matches), only one row is emitted.
+    ///
+    /// Note: descendant expansion (added for the model-worker undercount fix)
+    /// may legitimately add additional rows for children of `me`. We only
+    /// assert that pids never duplicate, and that the api-self row collapses
+    /// to a single entry (no row for `me` appears more than once even though
+    /// 4 labels initially pointed at it).
     #[test]
     fn discover_dedupes_colliding_pids() {
         let tmp = tempdir();
         let me = std::process::id() as i32;
         // All four labels (api, swift, mlx-lm, mlx-vlm) resolve to `me`
         // via pidfile or the implicit api self-pid. Dedupe must collapse
-        // them to a single row, and the surviving row's pid must be unique.
+        // them to a single row for `me`, and every row's pid must be unique.
         fs::write(tmp.join("swift.pid"), me.to_string()).unwrap();
         fs::write(tmp.join("mlxlm.pid"), me.to_string()).unwrap();
         fs::write(tmp.join(MLX_VLM_PIDFILE), me.to_string()).unwrap();
@@ -866,7 +1009,8 @@ mod tests {
         let pids = discover_pids(Some(&tmp));
         let unique: std::collections::HashSet<i32> = pids.iter().map(|(_, p, _)| *p).collect();
         assert_eq!(unique.len(), pids.len(), "no duplicate pids allowed");
-        assert_eq!(pids.len(), 1, "expected dedupe to collapse to 1 row");
+        let me_count = pids.iter().filter(|(_, p, _)| *p == me).count();
+        assert_eq!(me_count, 1, "the colliding self-pid row must dedupe to 1");
     }
 
     /// PID-not-found: empty support dir + no launchctl labels matching means
@@ -1134,6 +1278,264 @@ Currently in use:
         let s = SystemResourceSampler::new();
         let sample = s.sample();
         println!("{}", serde_json::to_string_pretty(&sample).unwrap());
+    }
+
+    /// `parse_pgrep_pids_all` must drop self, non-positive pids, and garbage
+    /// while keeping live foreign pids. We can't use `1` (launchd) as the
+    /// always-alive fixture because `proc_pid::pidinfo` requires permission
+    /// the test runner doesn't have for it; spawn our own short-lived child
+    /// instead. Killed before assertions so a panic can't leak it.
+    #[test]
+    fn parse_pgrep_pids_all_filters_self_and_dead() {
+        let me = std::process::id() as i32;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let live_other = child.id() as i32;
+        // Give the child a moment to register so pid_alive sees it.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let buf = format!("{me}\n0\nnot-a-pid\n{live_other}\n");
+        let pids = parse_pgrep_pids_all(&buf, me);
+
+        // Tear down BEFORE assertions so panic-on-fail can't leak the child.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!pids.contains(&me), "must filter self pid");
+        assert!(!pids.contains(&0), "must filter non-positive pid");
+        assert!(
+            pids.contains(&live_other),
+            "must keep live non-self pid {live_other}"
+        );
+    }
+
+    /// Spawn a 2-deep `sh` tree of `sleep` processes and assert
+    /// `descendants_of` returns at least one descendant with depth in 1..=4.
+    /// Children are killed BEFORE the assertions so a failed assert doesn't
+    /// leak sleeping processes onto the host.
+    #[test]
+    fn descendants_of_walks_real_tree() {
+        // sh -c 'sleep 30 & sleep 30 & wait' — parent sh forks two sleeps,
+        // giving us a 2-level tree (sh -> sleep, sh -> sleep).
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30 & wait"])
+            .spawn()
+            .expect("spawn sh tree");
+        let parent_pid = child.id() as i32;
+
+        // Poll up to ~2s for pgrep -P to see the children. On a loaded CI
+        // machine the old fixed 200ms warmup was occasionally too short.
+        let descendants = poll_descendants(parent_pid, 4, 16, Duration::from_secs(2));
+
+        // Tear down BEFORE asserting so a panic can't leave 30s sleeps around.
+        // child.kill() only SIGKILLs the `sh`; the `sleep 30` grandchildren
+        // would reparent to launchd and linger. `pkill -P <sh-pid>` first so
+        // the whole tree dies together (portable across macOS/Linux test
+        // hosts; no `nix` dep needed).
+        let _ = std::process::Command::new("pkill")
+            .args(["-P", &parent_pid.to_string()])
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            !descendants.is_empty(),
+            "expected at least one descendant of the spawned sh tree within 2s"
+        );
+        for (pid, depth) in &descendants {
+            assert!(*pid > 0, "descendant pid must be positive: {pid}");
+            assert!(
+                (1..=4).contains(depth),
+                "descendant depth out of bounds: {depth}"
+            );
+        }
+    }
+
+    /// Poll `descendants_of` up to `timeout`, sleeping 50ms between calls,
+    /// returning the first non-empty result (or the final empty result on
+    /// timeout). Used by tests that race against `pgrep -P` propagation
+    /// after spawning a fresh tree.
+    fn poll_descendants(
+        root_ppid: i32,
+        max_depth: usize,
+        max_count: usize,
+        timeout: Duration,
+    ) -> Vec<(i32, usize)> {
+        let start = Instant::now();
+        loop {
+            let d = descendants_of(root_ppid, max_depth, max_count);
+            if !d.is_empty() {
+                return d;
+            }
+            if start.elapsed() >= timeout {
+                return d;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// `descendants_of` must respect `max_count`. Calling against the test
+    /// process itself (which may have arbitrary children) with a tight cap
+    /// must not exceed it.
+    #[test]
+    fn descendants_caps_respected() {
+        let me = std::process::id() as i32;
+        let descendants = descendants_of(me, 4, 3);
+        assert!(
+            descendants.len() <= 3,
+            "max_count=3 violated: got {} entries",
+            descendants.len()
+        );
+    }
+
+    /// `max_depth` cap must actually clip the BFS frontier. Spawn a 5-level
+    /// nested `sh` tree and assert `descendants_of(.., max_depth=3, ..)`
+    /// returns no entry with depth > 3.
+    ///
+    /// The 2-level test above (`descendants_of_walks_real_tree`) is too
+    /// shallow to prove this — caps of 4, 40, or unbounded would all pass it.
+    #[test]
+    fn descendants_of_respects_max_depth() {
+        // 5 nested shells, each running `sleep 30 & wait` so the parent at
+        // every level has a child the next level can fork from. The deepest
+        // grandchild sleeps; `wait` propagates up so killing the outermost
+        // sh tears the whole tree down (and we pkill -P as belt-and-braces).
+        //
+        // sh -c 'sh -c "sh -c \"sh -c \\\"sh -c \\\\\\\"sleep 30 & wait\\\\\\\" & wait\\\" & wait\" & wait' & wait'
+        // — that's painful to escape; we use a simpler pattern with explicit
+        // backgrounding at each level via repeated nested invocations.
+        let script = "sh -c 'sh -c \"sh -c \\\"sh -c \\\\\\\"sleep 30\\\\\\\" & wait\\\" & wait\" & wait' & wait";
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("spawn deeply nested sh tree");
+        let parent_pid = child.id() as i32;
+
+        // Poll up to 3s for the deeper levels to come up — each nested `sh`
+        // has to fork before the next layer is visible.
+        let start = Instant::now();
+        let timeout = Duration::from_secs(3);
+        let max_depth = 3;
+        // Loop until we observe at least one depth==max_depth entry, OR time
+        // out. Either way, the assertion below ("no depth > max_depth") is
+        // what proves the cap; the wait just makes the test more meaningful
+        // (we want to see the cap actually clip, not vacuously pass).
+        let descendants = loop {
+            let d = descendants_of(parent_pid, max_depth, 64);
+            if d.iter().any(|(_, depth)| *depth == max_depth) {
+                break d;
+            }
+            if start.elapsed() >= timeout {
+                break d;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // Tear down the WHOLE tree before asserting. pkill -P only catches
+        // direct children, but child.kill() + the chained `wait`s (and
+        // SIGTERM-on-pgrp the OS does for orphans of a killed shell) handle
+        // the deeper layers. Repeat pkill once more after killing the root
+        // to mop up reparented sleeps.
+        let _ = std::process::Command::new("pkill")
+            .args(["-P", &parent_pid.to_string()])
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        // Best-effort sweep: any `sleep 30` orphaned to launchd from this
+        // test will self-exit in 30s, but pkill against the literal command
+        // is too aggressive (would kill unrelated host sleeps), so we accept
+        // the eventual self-cleanup.
+
+        for (pid, depth) in &descendants {
+            assert!(
+                *depth <= max_depth,
+                "depth cap violated: pid={pid} depth={depth} max={max_depth}"
+            );
+        }
+        // Sanity: we should at least see SOMETHING from this tree in 3s,
+        // otherwise the test is degenerate (proves nothing). If this is
+        // flaky on CI, the test is providing zero value — fail loudly.
+        assert!(
+            !descendants.is_empty(),
+            "expected at least one descendant from a 5-level sh tree within 3s"
+        );
+    }
+
+    /// End-to-end: a real `LocalModel` root pidfile + descendants_of splice
+    /// in `discover_pids` must produce a row for the root AND at least one
+    /// "<root> child" row whose pid is the spawned descendant. Without this
+    /// the helpers can each be correct in isolation but the splice could
+    /// regress (wrong filter, wrong label, etc.) silently.
+    #[test]
+    fn discover_pids_walks_local_model_descendants() {
+        let tmp = tempdir();
+
+        // Spawn `sh -c 'sleep 30 & wait'` — a 2-level tree where the sh is
+        // the LocalModel "root" and the sleep is its descendant.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .expect("spawn sh root");
+        let root_pid = child.id() as i32;
+
+        // Stamp the spawned root pid into the mlxlm.pid file so discover_one
+        // resolves "mlx-lm" via the pidfile path (skipping pgrep/launchctl).
+        fs::write(tmp.join("mlxlm.pid"), root_pid.to_string()).unwrap();
+
+        // Poll up to ~2s for pgrep -P to register the child sleep. We call
+        // discover_pids each iteration because that's the actual behaviour
+        // we're verifying, not just descendants_of.
+        let start = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let pids = loop {
+            let pids = discover_pids(Some(&tmp));
+            let saw_child = pids
+                .iter()
+                .any(|(name, _, _)| name == "mlx-lm child");
+            if saw_child || start.elapsed() >= timeout {
+                break pids;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // Tear down BEFORE assertions. pkill -P first so the sleep doesn't
+        // reparent to launchd; then SIGKILL the sh.
+        let _ = std::process::Command::new("pkill")
+            .args(["-P", &root_pid.to_string()])
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // (a) the root row, labelled "mlx-lm", kind LocalModel.
+        let root_row = pids
+            .iter()
+            .find(|(name, p, _)| name == "mlx-lm" && *p == root_pid);
+        assert!(
+            root_row.is_some(),
+            "expected a 'mlx-lm' row at pid {root_pid}; got {pids:?}"
+        );
+        assert_eq!(
+            root_row.unwrap().2,
+            Some(ProcessKind::LocalModel),
+            "root row must be tagged LocalModel"
+        );
+
+        // (b) at least one descendant row, labelled "mlx-lm child", kind
+        // LocalModel, whose pid is NOT the root.
+        let child_rows: Vec<_> = pids
+            .iter()
+            .filter(|(name, p, kind)| {
+                name == "mlx-lm child"
+                    && *p != root_pid
+                    && *kind == Some(ProcessKind::LocalModel)
+            })
+            .collect();
+        assert!(
+            !child_rows.is_empty(),
+            "expected at least one 'mlx-lm child' row in {pids:?}"
+        );
     }
 
     /// Helper: unique tempdir under env::temp_dir.
