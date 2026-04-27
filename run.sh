@@ -128,6 +128,32 @@ is_truthy() {
     esac
 }
 
+migrate_stale_backend_env() {
+    # Heal Backend-Rust/.env files written from the pre-#73 template, where the
+    # default port was 10201 (Omi-fork era). Those values get auto-exported by
+    # the surrounding `set -a; source ...; set +a` and then propagate into the
+    # bundled app's .env (see ~line 879), reproducing the dead-port symptom
+    # ("snapshot failed: Could not connect to the server").
+    local env_file="$1"
+    [ -f "$env_file" ] || return 0
+    local migrated=0
+    # IR_API_URL=http://host:10201 (with optional trailing path/whitespace).
+    # Use BSD-sed-friendly patterns: anchor on the literal value boundaries
+    # rather than alternation groups.
+    if grep -qE '^IR_API_URL=.*:10201([^0-9]|$)' "$env_file"; then
+        sed -i '' -E 's|^(IR_API_URL=.*):10201$|\1:7331|' "$env_file"
+        sed -i '' -E 's|^(IR_API_URL=.*):10201([^0-9])|\1:7331\2|' "$env_file"
+        migrated=1
+    fi
+    if grep -qE '^PORT=10201[[:space:]]*$' "$env_file"; then
+        sed -i '' -E 's|^PORT=10201[[:space:]]*$|PORT=7331|' "$env_file"
+        migrated=1
+    fi
+    if [ "$migrated" = "1" ]; then
+        substep "Migrated stale port 10201 -> 7331 in $env_file (Omi-fork era default)"
+    fi
+}
+
 warn_if_daemon_stale() {
     local installed="$HOME/Library/Application Support/InfiniteRecall/bin/infinite-recall-api"
     local src_dir
@@ -663,6 +689,7 @@ fi
 
 # Read environment from .env (skip if missing — yolo mode doesn't need it)
 if [ -f "$BACKEND_DIR/.env" ]; then
+    migrate_stale_backend_env "$BACKEND_DIR/.env"
     set -a; source "$BACKEND_DIR/.env"; set +a
 fi
 
@@ -747,6 +774,7 @@ if [ "${IR_SKIP_AUTH:-0}" != "1" ]; then
         (
             cd "$AUTH_DIR"
             if [ -f "$BACKEND_DIR/.env" ]; then
+                migrate_stale_backend_env "$BACKEND_DIR/.env"
                 set -a; source "$BACKEND_DIR/.env"; set +a
             fi
             export GOOGLE_APPLICATION_CREDENTIALS="$CREDS_PATH"
