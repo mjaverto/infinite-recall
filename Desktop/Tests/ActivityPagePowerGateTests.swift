@@ -73,11 +73,11 @@ final class ActivityPagePowerGateTests: XCTestCase {
         let res = resources(onBattery: false, lowPower: true)
         let corrected = GateState.blocked(reason: .onBattery, since: now, waitingFor: .acPower)
 
-        for reason in [BlockReason.thermal, .locked, .deviceActive, .manualPause] {
+        for reason in [BlockReason.thermal, .locked, .manualPause] {
             let snapshotGate = GateState.blocked(
                 reason: reason,
                 since: now,
-                waitingFor: reason == .deviceActive ? .idleFor(seconds: 60) : .manual
+                waitingFor: .manual
             )
             XCTAssertFalse(activityShouldShowRunNowButton(
                 snapshotGate: snapshotGate,
@@ -88,5 +88,23 @@ final class ActivityPagePowerGateTests: XCTestCase {
                 isRunOnceActive: false
             ), "Run now should stay hidden for \(reason)")
         }
+    }
+
+    func test_runNowButtonShownForDeviceActiveWithQueuedWork() {
+        let res = resources(onBattery: false, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .deviceActive,
+            since: now,
+            waitingFor: .idleFor(seconds: 60)
+        )
+
+        XCTAssertTrue(activityShouldShowRunNowButton(
+            snapshotGate: snapshotGate,
+            correctedGate: snapshotGate,
+            resources: res,
+            queued: 2,
+            isThermalBlocked: false,
+            isRunOnceActive: false
+        ), "Run now should be visible when device is active so the user can override the idle gate.")
     }
 }
