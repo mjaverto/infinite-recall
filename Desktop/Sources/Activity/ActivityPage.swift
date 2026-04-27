@@ -17,6 +17,30 @@
 
 import SwiftUI
 
+extension BlockReason {
+    /// True when this reason should not be replaced by `.onBattery` in the
+    /// activity banner. Used by `activityCorrectedGate` so power blocks don't
+    /// mask more-specific reasons.
+    var dominatesPowerBlock: Bool {
+        switch self {
+        case .thermal, .locked, .deviceActive, .manualPause: return true
+        case .onBattery, .initializing: return false
+        }
+    }
+
+    /// True when the "Run now" button should be disabled for this reason.
+    /// `.deviceActive` is excluded — `runOnceIgnoringPower` bypasses idle at
+    /// the engine layer (`ProcessingGateReporter.swift:130`).
+    /// `.thermal` IS included — engine refuses one-shot under thermal
+    /// pressure (`ProcessingGateReporter.swift:120`).
+    var disablesRunNowOverride: Bool {
+        switch self {
+        case .thermal, .locked, .manualPause: return true
+        case .deviceActive, .onBattery, .initializing: return false
+        }
+    }
+}
+
 // MARK: - Power gate helpers
 
 /// Local Activity-page power blocker. The wire model currently exposes the
@@ -34,16 +58,6 @@ func activityPowerBlock(resources: ResourceSample, queued: UInt32) -> ActivityPo
     return nil
 }
 
-func activitySuppressesRunNow(_ gate: GateState?) -> Bool {
-    guard case .blocked(let reason, _, _) = gate else { return false }
-    switch reason {
-    case .thermal, .locked, .deviceActive, .manualPause:
-        return true
-    case .onBattery, .initializing:
-        return false
-    }
-}
-
 func activityCorrectedGate(
     snapshotGate: GateState,
     resources: ResourceSample,
@@ -59,7 +73,7 @@ func activityCorrectedGate(
     if isRunOnceActive {
         return .allowed(since: runOnceStartedAt ?? now)
     }
-    if activitySuppressesRunNow(snapshotGate) {
+    if snapshotGate.blockReason?.dominatesPowerBlock == true {
         return snapshotGate
     }
     if activityPowerBlock(resources: resources, queued: queued) != nil {
@@ -76,7 +90,7 @@ func activityShouldShowRunNowButton(
     isThermalBlocked: Bool,
     isRunOnceActive: Bool
 ) -> Bool {
-    if isThermalBlocked || activitySuppressesRunNow(snapshotGate) { return false }
+    if isThermalBlocked || snapshotGate?.blockReason?.disablesRunNowOverride == true { return false }
     if isRunOnceActive { return true }
     guard let resources, activityPowerBlock(resources: resources, queued: queued) != nil else { return false }
     return correctedGate?.blockReason == .onBattery
@@ -269,6 +283,7 @@ struct ActivityPage: View {
                 .fill(OmiColors.backgroundPrimary.opacity(0.8))
         )
         .disabled(running || totalQueued == 0)
+        .accessibilityLabel("Run now — process \(totalQueued) queued item\(totalQueued == 1 ? "" : "s")")
         .accessibilityIdentifier("activity_run_now_button")
     }
 
@@ -323,7 +338,7 @@ struct ActivityPage: View {
             return BannerInfo(
                 icon: "keyboard.fill",
                 title: "Waiting for idle — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: "Resumes after \(detail).",
+                detail: "Resumes after \(detail) — or run now.",
                 color: OmiColors.warning
             )
         case .onBattery:
