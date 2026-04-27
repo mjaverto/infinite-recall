@@ -6,6 +6,22 @@ struct KGExtraction: Sendable {
   let nodes: [ExtractedKGNode]
   let edges: [ExtractedKGEdge]
   let outcome: ParseOutcome
+  /// Diagnostic detail for `.failed(.llmError)` outcomes. nil otherwise.
+  /// Surfaced through `PendingWorkStorage.fail()`'s error-message column so
+  /// dead-letter logs include the underlying LLM error.
+  let llmErrorDetail: String?
+
+  init(
+    nodes: [ExtractedKGNode],
+    edges: [ExtractedKGEdge],
+    outcome: ParseOutcome,
+    llmErrorDetail: String? = nil
+  ) {
+    self.nodes = nodes
+    self.edges = edges
+    self.outcome = outcome
+    self.llmErrorDetail = llmErrorDetail
+  }
 }
 
 enum ParseOutcome: Sendable, Equatable {
@@ -134,12 +150,18 @@ actor KGExtractor: KGExtracting {
     var unionNodes: [ExtractedKGNode] = []
     var unionEdges: [ExtractedKGEdge] = []
     var chunkOutcomes: [ParseOutcome] = []
+    // Preserve the first non-nil llmErrorDetail across chunks so the dead-letter
+    // path can surface the underlying transport error.
+    var firstLLMErrorDetail: String?
 
     for chunk in chunks {
       let chunkResult = try await runOnce(content: chunk, sourceApp: sourceApp)
       chunkOutcomes.append(chunkResult.outcome)
       unionNodes.append(contentsOf: chunkResult.nodes)
       unionEdges.append(contentsOf: chunkResult.edges)
+      if firstLLMErrorDetail == nil, let detail = chunkResult.llmErrorDetail {
+        firstLLMErrorDetail = detail
+      }
     }
 
     let aggregatedOutcome = aggregateOutcomes(chunkOutcomes)
@@ -151,13 +173,21 @@ actor KGExtractor: KGExtracting {
     if dedupedNodes.isEmpty && dedupedEdges.isEmpty {
       switch aggregatedOutcome {
       case .empty, .failed:
-        return KGExtraction(nodes: [], edges: [], outcome: aggregatedOutcome)
+        return KGExtraction(
+          nodes: [], edges: [],
+          outcome: aggregatedOutcome,
+          llmErrorDetail: firstLLMErrorDetail
+        )
       default:
         return KGExtraction(nodes: [], edges: [], outcome: .empty(reason: .modelReturnedNone))
       }
     }
 
-    return KGExtraction(nodes: dedupedNodes, edges: dedupedEdges, outcome: aggregatedOutcome)
+    return KGExtraction(
+      nodes: dedupedNodes, edges: dedupedEdges,
+      outcome: aggregatedOutcome,
+      llmErrorDetail: firstLLMErrorDetail
+    )
   }
 
   // MARK: Per-chunk pipeline
@@ -172,7 +202,16 @@ actor KGExtractor: KGExtracting {
     do {
       firstRaw = try await callLLM(system: system, user: user, maxTokens: Self.defaultMaxTokens)
     } catch {
-      return KGExtraction(nodes: [], edges: [], outcome: .failed(reason: .llmError))
+      // Preserve the original error in the structured logger (so deferred
+      // diagnostics aren't lost) AND surface it as `llmErrorDetail` so the
+      // PowerWorkBridge handler can route it into the pending_work
+      // `lastError` column for dead-letter visibility.
+      logError("KGExtractor: LLM call failed (first pass)", error: error)
+      return KGExtraction(
+        nodes: [], edges: [],
+        outcome: .failed(reason: .llmError),
+        llmErrorDetail: error.localizedDescription
+      )
     }
 
     let firstParse = parseAndValidate(raw: firstRaw, baseOutcome: .parsed)
@@ -182,7 +221,12 @@ actor KGExtractor: KGExtracting {
       do {
         retriedRaw = try await callLLM(system: system, user: user, maxTokens: Self.defaultMaxTokens * 2)
       } catch {
-        return KGExtraction(nodes: [], edges: [], outcome: .failed(reason: .llmError))
+        logError("KGExtractor: LLM call failed (truncation retry)", error: error)
+        return KGExtraction(
+          nodes: [], edges: [],
+          outcome: .failed(reason: .llmError),
+          llmErrorDetail: error.localizedDescription
+        )
       }
       let retriedParse = parseAndValidate(raw: retriedRaw, baseOutcome: .truncatedRetried)
       switch retriedParse {
