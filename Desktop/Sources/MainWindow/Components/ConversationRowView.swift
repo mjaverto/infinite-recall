@@ -38,14 +38,12 @@ struct ConversationRowView: View {
     Date().timeIntervalSince(conversation.createdAt) < 60
   }
 
-  /// True when the recording finished but the LLM has not yet produced a
-  /// title/overview. Delegates to the shared
-  /// `ServerConversation.isSummaryPending(cachedPreview:)` extension so the
-  /// list and detail views never diverge (PR #30 review).
-  var isSummaryPending: Bool {
-    conversation.isSummaryPending(
-      cachedPreview: appState.conversationPreviews[conversation.id]
-    )
+  private var summaryState: SummaryDisplayState {
+    conversation.summaryDisplayState
+  }
+
+  private var isSummaryPending: Bool {
+    summaryState == .pending
   }
 
   private static let timeFormatter: DateFormatter = {
@@ -167,16 +165,14 @@ struct ConversationRowView: View {
     }
   }
 
-  /// Title to display in the row. Replaces the "Untitled Conversation"
-  /// fallback with "Summary Pending" when `isSummaryPending` so the user
-  /// understands the LLM hasn't run yet rather than seeing a generic
-  /// untitled placeholder.
   private var displayTitle: String {
     let raw = conversation.title
-    if isSummaryPending && raw == "Untitled Conversation" {
-      return "Summary Pending"
+    let isEmpty = raw.isEmpty || raw == "Untitled Conversation"
+    guard isEmpty else { return raw }
+    switch summaryState {
+    case .pending: return "Summary Pending"
+    case .unavailable, .done: return "Untitled recording"
     }
-    return raw
   }
 
   /// Label for the conversation source
@@ -408,9 +404,7 @@ struct ConversationRowView: View {
             NewBadge()
           }
 
-          if isSummaryPending {
-            SummaryPendingBadge()
-          }
+          SummaryStateBadge(state: summaryState)
 
           // Inline action buttons (show on hover)
           if isHovering && !isMultiSelectMode {
@@ -504,9 +498,7 @@ struct ConversationRowView: View {
             NewBadge()
           }
 
-          if isSummaryPending {
-            SummaryPendingBadge()
-          }
+          SummaryStateBadge(state: summaryState)
 
           // Inline action buttons (show on hover)
           if isHovering && !isMultiSelectMode {
@@ -697,21 +689,34 @@ struct ConversationRowView: View {
   .background(OmiColors.backgroundPrimary)
 }
 
-// MARK: - Summary Pending Badge
+// MARK: - Summary State Badge
 
-/// Small inline badge displayed next to a conversation title when the
-/// recording is finished but the autonomous summarizer hasn't produced a
-/// title/overview yet. Styled to mirror `NewBadge` (TasksPage.swift:4896)
-/// so the row keeps a consistent visual rhythm.
-struct SummaryPendingBadge: View {
+struct SummaryStateBadge: View {
+  let state: SummaryDisplayState
+
   var body: some View {
-    Text("Summary Pending")
-      .scaledFont(size: 10, weight: .semibold)
-      .foregroundColor(OmiColors.purplePrimary)
-      .padding(.horizontal, 6)
-      .padding(.vertical, 2)
-      .background(OmiColors.purplePrimary.opacity(0.15))
-      .cornerRadius(4)
-      .help("Will summarize when your Mac is plugged in and idle or locked.")
+    switch state {
+    case .done:
+      EmptyView()
+    case .pending:
+      Text("Summary Pending")
+        .scaledFont(size: 10, weight: .semibold)
+        .foregroundColor(OmiColors.purplePrimary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(OmiColors.purplePrimary.opacity(0.15))
+        .cornerRadius(4)
+        .help("Will summarize when your Mac is plugged in and idle or locked.")
+        .accessibilityLabel("Summary pending")
+    case .unavailable:
+      Text("No transcript available")
+        .scaledFont(size: 10, weight: .semibold)
+        .foregroundColor(OmiColors.textTertiary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(OmiColors.textTertiary.opacity(0.15))
+        .cornerRadius(4)
+        .accessibilityLabel("No transcript available")
+    }
   }
 }

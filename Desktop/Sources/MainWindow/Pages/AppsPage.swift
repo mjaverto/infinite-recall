@@ -126,13 +126,26 @@ struct AppsPage: View {
                 .background(OmiColors.backgroundTertiary)
 
             // Content
-            if appProvider.isLoading {
-                loadingShimmerView
-            } else if appProvider.apps.isEmpty && appProvider.popularApps.isEmpty {
-                emptyView
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 24) {
+            //
+            // MyAppsSection (local integrations) renders unconditionally inside
+            // the ScrollView so it remains reachable even when the remote
+            // catalog is empty — which is always the case in local-first IR.
+            // The catalog branches (loading shimmer, page-level empty state,
+            // populated grids) render below it.
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    if searchText.isEmpty && !hasActiveFilters {
+                        MyAppsSection()
+                    }
+
+                    if appProvider.isLoading {
+                        loadingShimmerView
+                    } else if appProvider.apps.isEmpty && appProvider.popularApps.isEmpty {
+                        // Remote catalog empty — MyAppsSection above already
+                        // shows its own empty-state copy, so nothing to render
+                        // here in local-first.
+                        EmptyView()
+                    } else {
                         if !searchText.isEmpty || hasActiveFilters {
                             // Show filtered/search results in a flat grid
                             if appProvider.isSearching {
@@ -222,11 +235,6 @@ struct AppsPage: View {
                                 )
                             }
 
-                            // My Apps — local integrations (webhook + filesystem)
-                            // managed via LocalIntegrationStorage. Empty state
-                            // lives inside the section, so no outer guard.
-                            MyAppsSection()
-
                             // Integrations section (external_integration capability)
                             if !appProvider.integrationApps.isEmpty {
                                 AppGridSection(
@@ -252,8 +260,8 @@ struct AppsPage: View {
                             }
                         }
                     }
-                    .padding()
                 }
+                .padding()
             }
         }
         .background(OmiColors.backgroundPrimary)
@@ -405,19 +413,6 @@ struct AppsPage: View {
             .fixedSize()
 
             Spacer()
-
-            // Create buttons (compact)
-            HStack(spacing: 8) {
-                SmallHeaderButton(
-                    icon: "app.badge.fill",
-                    label: "Create App",
-                    color: OmiColors.textSecondary
-                ) {
-                    if let url = URL(string: "https://docs.omi.me/docs/developer/apps/Introduction") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-            }
         }
     }
 
@@ -473,55 +468,31 @@ struct AppsPage: View {
     }
 
 
+    // The page-level ScrollView (`body`) owns vertical scrolling and outer
+    // `.padding()` (applied to LazyVStack). Nesting another vertical
+    // ScrollView here collapses to zero intrinsic height inside the outer
+    // LazyVStack on macOS — keep this a plain VStack.
     private var loadingShimmerView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                // Shimmer sections
-                ForEach(0..<3, id: \.self) { _ in
-                    VStack(alignment: .leading, spacing: 12) {
-                        ShimmerView()
-                            .frame(width: 120, height: 24)
-                            .cornerRadius(6)
+        VStack(alignment: .leading, spacing: 24) {
+            // Shimmer sections
+            ForEach(0..<3, id: \.self) { _ in
+                VStack(alignment: .leading, spacing: 12) {
+                    ShimmerView()
+                        .frame(width: 120, height: 24)
+                        .cornerRadius(6)
 
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
-                                ForEach(0..<4, id: \.self) { _ in
-                                    ShimmerAppCard()
-                                }
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 16) {
+                            ForEach(0..<4, id: \.self) { _ in
+                                ShimmerAppCard()
                             }
                         }
                     }
                 }
             }
-            .padding()
         }
     }
 
-    private var emptyView: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "square.grid.2x2")
-                .scaledFont(size: 48)
-                .foregroundColor(OmiColors.textTertiary)
-
-            Text("No apps found")
-                .scaledFont(size: 20, weight: .semibold)
-                .foregroundColor(OmiColors.textPrimary)
-
-            if !searchText.isEmpty {
-                Text("Try a different search term")
-                    .foregroundColor(OmiColors.textTertiary)
-
-                Button("Clear Search") {
-                    searchText = ""
-                }
-                .buttonStyle(.bordered)
-            } else {
-                Text("Apps will appear here once available")
-                    .foregroundColor(OmiColors.textTertiary)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
 }
 
 // MARK: - Imports Section

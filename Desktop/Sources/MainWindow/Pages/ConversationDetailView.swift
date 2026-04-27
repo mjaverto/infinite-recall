@@ -564,32 +564,47 @@ struct ConversationDetailView: View {
         }
     }
 
-    // MARK: - Summary Pending
+    // MARK: - Summary State
 
-    /// True when the recording finished but the LLM has not yet produced an
-    /// overview. Delegates to the shared
-    /// `ServerConversation.isSummaryPending(cachedPreview:)` extension so
-    /// the list and detail views never diverge (PR #30 review). Detail view
-    /// passes `nil` for cachedPreview — it doesn't have AppState in scope.
-    private var isSummaryPending: Bool {
-        displayConversation.isSummaryPending(cachedPreview: nil)
+    private var summaryState: SummaryDisplayState {
+        displayConversation.summaryDisplayState
     }
 
-    /// Banner shown above the (empty) overview section when the recording
-    /// has finished but the autonomous summarizer hasn't run yet.
-    private var summaryPendingPanel: some View {
+    @ViewBuilder
+    private var summaryStatePanel: some View {
+        switch summaryState {
+        case .done:
+            EmptyView()
+        case .pending:
+            statePanel(
+                icon: "hourglass",
+                tint: OmiColors.purplePrimary,
+                title: "Summary pending",
+                body: "Infinite Recall will summarize this transcript when your Mac is plugged in and idle or locked."
+            )
+        case .unavailable:
+            statePanel(
+                icon: "exclamationmark.triangle",
+                tint: OmiColors.textTertiary,
+                title: "No transcript available",
+                body: "No transcript was captured for this recording."
+            )
+        }
+    }
+
+    private func statePanel(icon: String, tint: Color, title: String, body: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: "hourglass")
+                Image(systemName: icon)
                     .scaledFont(size: 13)
-                    .foregroundColor(OmiColors.purplePrimary)
+                    .foregroundColor(tint)
 
-                Text("Summary pending")
+                Text(title)
                     .scaledFont(size: 14, weight: .semibold)
                     .foregroundColor(OmiColors.textPrimary)
             }
 
-            Text("Infinite Recall will summarize this transcript when your Mac is plugged in and idle or locked.")
+            Text(body)
                 .scaledFont(size: 12)
                 .foregroundColor(OmiColors.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -598,11 +613,11 @@ struct ConversationDetailView: View {
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(OmiColors.purplePrimary.opacity(0.10))
+                .fill(tint.opacity(0.10))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(OmiColors.purplePrimary.opacity(0.25), lineWidth: 1)
+                .stroke(tint.opacity(0.25), lineWidth: 1)
         )
     }
 
@@ -610,10 +625,8 @@ struct ConversationDetailView: View {
 
     @ViewBuilder
     private var summaryContent: some View {
-        // Pending panel — rendered above the overview section when the
-        // recording is finished but the LLM hasn't summarized yet.
-        if isSummaryPending {
-            summaryPendingPanel
+        if summaryState != .done {
+            summaryStatePanel
         }
 
         // Overview section
