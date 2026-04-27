@@ -15,7 +15,7 @@ import GRDB
 /// `AppDelegate.applicationDidFinishLaunching`. It:
 /// 1. Starts `BatteryAwareScheduler.shared` (which itself starts
 ///    `PowerStateMonitor.shared`).
-/// 2. Registers handlers for `.transcribe` and `.ocr` work kinds.
+/// 2. Registers per-kind handlers (`.transcribe`, `.ocr`, `.summarize`, `.extractKG`).
 ///
 /// Handlers are stored as `@Sendable` closures on the scheduler. They MUST NOT
 /// strong-capture this bridge (or `TranscriptionService` / `RewindIndexer`
@@ -41,9 +41,9 @@ final class PowerWorkBridge {
         BatteryAwareScheduler.shared.start()
 
         // .transcribe — pull audio_chunks rows that overlap the queued window
-        // and run a one-shot WhisperKit batchTranscribe per chunk. Emit
-        // synthetic segments via the foreground TranscriptionService (if one
-        // is alive) so the UI updates the same as a live pass.
+        // and run a one-shot WhisperKit batchTranscribe per chunk. Posts
+        // `.powerWorkBridgeDeferredTranscript` for the foreground UI to
+        // consume; no direct call back into TranscriptionService.
         BatteryAwareScheduler.shared.registerHandler(for: .transcribe) { work in
             try await PowerWorkBridge.handleTranscribe(work)
         }
@@ -102,9 +102,11 @@ final class PowerWorkBridge {
             }
             await ConversationSummaryBackfillService.shared
                 .enqueueHistoricalSummariesIfNeeded(reason: "launch")
+            await ConversationTranscribeBackfillService.shared
+                .enqueueHistoricalTranscribesIfNeeded(reason: "launch")
         }
 
-        log("PowerWorkBridge: Started — registered .transcribe, .ocr, and .summarize handlers")
+        log("PowerWorkBridge: Started — registered .transcribe, .ocr, .summarize, and .extractKG handlers")
     }
 
     // MARK: - Dead-letter handler
@@ -180,29 +182,55 @@ final class PowerWorkBridge {
 
     // MARK: - Transcribe handler
 
-    /// Decode a .transcribe payload and run WhisperKit on every audio_chunks
-    /// row whose `startedAt` falls within the queued window. Errors are logged
-    /// but never thrown out — throwing would leave the work item in the queue
-    /// and stall the drain. Per-row failures are tolerable; we move on.
+    /// Decode a .transcribe payload and run WhisperKit on the matching
+    /// audio_chunks rows. Two payload shapes are accepted on the same workType:
+    ///
+    /// 1. Window-shaped (`{started_at, ended_at, language?, ...}`) — produced
+    ///    by `TranscriptionService` when live Whisper is gated by
+    ///    battery/thermal. Drains by wall-clock window and emits transcripts
+    ///    via `.powerWorkBridgeDeferredTranscript`.
+    /// 2. Session-shaped (`{session_id}`) — produced by
+    ///    `ConversationTranscribeBackfillService` for finished sessions whose
+    ///    audio_chunks were never transcribed (e.g. status='failed' mid-
+    ///    lifecycle). Drains by session and persists to `transcription_segments`.
+    ///
+    /// Per-row failures are tolerable and we move on so one bad chunk doesn't
+    /// stall the drain. Malformed JSON throws so the row stays queued for
+    /// retry/inspection rather than being silently ack'd as `done`.
     fileprivate static func handleTranscribe(_ work: PendingWork) async throws {
-        struct Payload: Decodable {
-            let started_at: String
-            let ended_at: String
-            let duration_sec: Double?
-            let language: String?
-            let mode: String?
+        let json = try JSONSerialization.jsonObject(with: work.payload, options: [])
+        guard let dict = json as? [String: Any] else {
+            throw NSError(
+                domain: "PowerWorkBridge", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "transcribe payload not a JSON object"]
+            )
+        }
+
+        // If `session_id` is present at all, commit to the session branch.
+        // A type mismatch throws so the row stays for retry rather than
+        // silently falling through to the window decoder and getting ack-dropped.
+        if let rawSessionId = dict["session_id"] {
+            let sessionId: Int64
+            if let v = rawSessionId as? Int64 {
+                sessionId = v
+            } else if let v = rawSessionId as? Int {
+                sessionId = Int64(v)
+            } else {
+                throw NSError(
+                    domain: "PowerWorkBridge", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "transcribe session_id has unsupported type \(type(of: rawSessionId))"]
+                )
+            }
+            try await handleTranscribeSession(sessionId: sessionId)
+            return
         }
 
         guard
-            let json = try? JSONSerialization.jsonObject(with: work.payload, options: []),
-            let dict = json as? [String: Any],
             let startedStr = dict["started_at"] as? String,
             let endedStr = dict["ended_at"] as? String,
             let started = ISO8601DateFormatter().date(from: startedStr),
             let ended = ISO8601DateFormatter().date(from: endedStr)
         else {
-            // Corrupt payload is non-recoverable; logError so we get telemetry
-            // visibility without leaving the row stuck. We still ack/return.
             logError(
                 "PowerWorkBridge: .transcribe payload undecodable, dropping",
                 error: NSError(domain: "PowerWorkBridge", code: 2,
@@ -215,7 +243,6 @@ final class PowerWorkBridge {
         // Fetch matching audio_chunks rows from GRDB.
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             log("PowerWorkBridge: .transcribe — DB not initialized, leaving in queue")
-            // Throwing leaves work item in place per scheduler contract.
             throw NSError(domain: "PowerWorkBridge", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Database not initialized for transcribe drain"
             ])
@@ -297,6 +324,174 @@ final class PowerWorkBridge {
         }
 
         log("PowerWorkBridge: .transcribe — drained \(transcribedCount)/\(rows.count) chunks for window \(started)…\(ended)")
+    }
+
+    /// Session-shaped `.transcribe` drain: load every audio_chunk linked to
+    /// the session via `transcriptionSessionId`, run WhisperKit per chunk,
+    /// and persist the result as a `transcription_segments` row. Used by
+    /// `ConversationTranscribeBackfillService` to recover finished sessions
+    /// that never produced live segments.
+    fileprivate static func handleTranscribeSession(sessionId: Int64) async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            log("PowerWorkBridge: .transcribe(session) — DB not initialized, leaving in queue")
+            throw NSError(domain: "PowerWorkBridge", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Database not initialized for transcribe drain"
+            ])
+        }
+
+        struct SessionInfo {
+            let startedAt: Date
+            let language: String
+        }
+
+        let sessionInfo: SessionInfo?
+        do {
+            sessionInfo = try await dbQueue.read { db -> SessionInfo? in
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: "SELECT startedAt, language FROM transcription_sessions WHERE id = ? AND deleted = 0",
+                    arguments: [sessionId]
+                ) else { return nil }
+                let started: Date = row["startedAt"] ?? Date()
+                let language: String = row["language"] ?? "en"
+                return SessionInfo(startedAt: started, language: language)
+            }
+        } catch {
+            logError("PowerWorkBridge: .transcribe(session) — DB read failed for session \(sessionId)", error: error)
+            throw error
+        }
+
+        guard let info = sessionInfo else {
+            log("PowerWorkBridge: .transcribe(session) — session \(sessionId) missing or deleted, ack-and-skip")
+            return
+        }
+
+        // Bail if non-empty segments already exist. `transcription_segments`
+        // has no uniqueness constraint, so re-running per-chunk Whisper would
+        // double the rows for any happy-path session that slipped past the
+        // enqueue-side guard (race between concurrent finishConversation calls,
+        // out-of-order drains, etc.). Predicate MUST match the
+        // `text IS NOT NULL AND TRIM(text) <> ''` filter used by
+        // `ConversationTranscribeBackfillService.sessionHasSegments` and
+        // `fetchEligibleSessionIds` — a session with only empty-text rows
+        // must remain eligible to drain, not be silently ack-skipped.
+        let existingSegmentCount: Int
+        do {
+            existingSegmentCount = try await dbQueue.read { db -> Int in
+                try Int.fetchOne(
+                    db,
+                    sql: """
+                        SELECT COUNT(*) FROM transcription_segments
+                         WHERE sessionId = ?
+                           AND text IS NOT NULL
+                           AND TRIM(text) <> ''
+                        """,
+                    arguments: [sessionId]
+                ) ?? 0
+            }
+        } catch {
+            logError("PowerWorkBridge: .transcribe(session) — segment-count check failed for session \(sessionId)", error: error)
+            throw error
+        }
+        if existingSegmentCount > 0 {
+            log("PowerWorkBridge: .transcribe(session) — session \(sessionId) already has \(existingSegmentCount) non-empty segment(s), ack-and-skip")
+            return
+        }
+
+        let rows: [(id: Int64, startedAt: Date, durationSeconds: Double, pcm: Data)]
+        do {
+            rows = try await dbQueue.read { db -> [(id: Int64, startedAt: Date, durationSeconds: Double, pcm: Data)] in
+                let cursor = try Row.fetchCursor(
+                    db,
+                    sql: """
+                        SELECT id, startedAt, durationSeconds, pcm FROM audio_chunks
+                        WHERE transcriptionSessionId = ?
+                        ORDER BY startedAt ASC
+                        """,
+                    arguments: [sessionId]
+                )
+                var out: [(id: Int64, startedAt: Date, durationSeconds: Double, pcm: Data)] = []
+                while let row = try cursor.next() {
+                    let id: Int64 = row["id"] ?? 0
+                    let s: Date = row["startedAt"] ?? Date()
+                    let dur: Double = row["durationSeconds"] ?? 0
+                    let pcm: Data = row["pcm"] ?? Data()
+                    out.append((id, s, dur, pcm))
+                }
+                return out
+            }
+        } catch {
+            logError("PowerWorkBridge: .transcribe(session) — audio_chunks read failed for session \(sessionId)", error: error)
+            throw error
+        }
+
+        if rows.isEmpty {
+            log("PowerWorkBridge: .transcribe(session) — no audio_chunks for session \(sessionId); marking done")
+            return
+        }
+
+        var transcribedCount = 0
+        // FIXME: speaker hardcoded to 0 — diarization gap for the backfill case.
+        for row in rows {
+            do {
+                let text = try await TranscriptionService.batchTranscribe(
+                    audioData: row.pcm,
+                    language: info.language,
+                    apiKey: nil
+                )
+                guard let text = text, !text.isEmpty else {
+                    // Surface this so we can audit how often Whisper drains to
+                    // empty on real audio (vs. ambient/silence).
+                    logError(
+                        "PowerWorkBridge: .transcribe(session) — chunk \(row.id) produced empty transcript for session \(sessionId)",
+                        error: NSError(domain: "PowerWorkBridge", code: 5,
+                                       userInfo: [NSLocalizedDescriptionKey: "empty Whisper output"])
+                    )
+                    continue
+                }
+
+                let startTime = row.startedAt.timeIntervalSince(info.startedAt)
+                let endTime = startTime + row.durationSeconds
+                _ = try await TranscriptionStorage.shared.appendSegment(
+                    sessionId: sessionId,
+                    speaker: 0,
+                    text: text,
+                    startTime: startTime,
+                    endTime: endTime
+                )
+                transcribedCount += 1
+            } catch {
+                logError(
+                    "PowerWorkBridge: .transcribe(session) — chunk \(row.id) failed",
+                    error: error
+                )
+            }
+        }
+
+        if transcribedCount == 0 {
+            // Audit signal: a session-shaped drain that processed chunks but
+            // wrote zero segments. The eligibility query already guards against
+            // re-enqueuing this session (it excludes `done` rows for the same
+            // dedup key), but the cohort itself is worth tracking.
+            logError(
+                "PowerWorkBridge: .transcribe(session) — session \(sessionId) drained \(rows.count) chunk(s) to zero segments",
+                error: NSError(domain: "PowerWorkBridge", code: 6,
+                               userInfo: [NSLocalizedDescriptionKey: "zero segments after Whisper pass"])
+            )
+        } else {
+            log("PowerWorkBridge: .transcribe(session) — drained \(transcribedCount)/\(rows.count) chunks for session \(sessionId)")
+        }
+
+        // After segments land, the summary backfill (queries on
+        // summary_state='pending' + finishedAt + segments-exist) picks this
+        // session up automatically.
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .conversationsListNeedsRefresh,
+                object: nil,
+                userInfo: ["session_id": sessionId]
+            )
+        }
     }
 
     // MARK: - OCR handler

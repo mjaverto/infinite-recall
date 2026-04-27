@@ -1726,6 +1726,10 @@ class AppState: ObservableObject {
             await ConversationSummaryBackfillService.shared.summarizeSessionIfNeeded(
               sessionId, reason: "finishConversation")
           }
+          Task(priority: .background) {
+            await ConversationTranscribeBackfillService.shared.enqueueTranscribeIfNeeded(
+              sessionId: sessionId, reason: "finishConversation")
+          }
         }
       } catch {
         logError("Transcription: Failed to finalize DB session \(sessionId)", error: error)
@@ -1910,6 +1914,10 @@ class AppState: ObservableObject {
             Task(priority: .background) {
               await ConversationSummaryBackfillService.shared.summarizeSessionIfNeeded(
                 sessionId, reason: "stopTranscription")
+            }
+            Task(priority: .background) {
+              await ConversationTranscribeBackfillService.shared.enqueueTranscribeIfNeeded(
+                sessionId: sessionId, reason: "stopTranscription")
             }
           }
         } catch {
