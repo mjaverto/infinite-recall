@@ -58,6 +58,52 @@ struct MemoryPayload: Codable {
       : [conversation.structured.category]
   }
 
+  /// Maps a Layer-2 atomic `MemoryRecord` (extracted by FocusAssistant /
+  /// MemoryAssistant / InsightAssistant) into the same export shape used
+  /// for Layer-1 conversations. There is no transcript at this layer, so
+  /// `transcriptSegments` and `actionItems` are empty.
+  ///
+  /// `id` must be a stable string for the outbox. Prefer `backendId` once
+  /// the record has synced to the (now-defunct) backend; otherwise fall
+  /// back to a `"local-<rowid>"` form so retries land on the same row.
+  init(from record: MemoryRecord) {
+    if let backendId = record.backendId, !backendId.isEmpty {
+      self.id = backendId
+    } else {
+      self.id = "local-\(record.id ?? 0)"
+    }
+
+    if let headline = record.headline, !headline.isEmpty {
+      self.title = headline
+    } else if let firstLine = record.content
+      .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+      .first,
+      !firstLine.isEmpty
+    {
+      self.title = String(firstLine)
+    } else {
+      self.title = "Memory"
+    }
+
+    self.overview = record.content
+    self.category = record.category
+    self.createdAt = record.createdAt
+    self.transcriptSegments = []
+    self.actionItems = []
+
+    // Decode tagsJson if present and well-formed; otherwise fall back to
+    // the single-element category array (matching the conversation path's
+    // tag convention), filtered for empty strings.
+    if let json = record.tagsJson,
+      let data = json.data(using: .utf8),
+      let decoded = try? JSONDecoder().decode([String].self, from: data)
+    {
+      self.tags = decoded
+    } else {
+      self.tags = record.category.isEmpty ? [] : [record.category]
+    }
+  }
+
   /// Serializes the payload as the canonical JSON body used by all
   /// integration senders. Pretty-printed with sorted keys so byte output
   /// is stable for snapshotting in the outbox.
