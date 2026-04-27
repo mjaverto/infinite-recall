@@ -441,28 +441,38 @@ struct ActivityPage: View {
     }
 
     private func processBreakdownView(_ procs: [ProcessBreakdown]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let sortedProcs = procs.sorted { $0.cpuPercent > $1.cpuPercent }
+        let localModels = sortedProcs.filter { $0.kind == .localModel }
+        let others = sortedProcs.filter { $0.kind != .localModel }
+        return VStack(alignment: .leading, spacing: 6) {
             Text("Process breakdown")
                 .scaledFont(size: 12, weight: .semibold)
                 .foregroundColor(OmiColors.textTertiary)
-            VStack(spacing: 4) {
-                ForEach(procs, id: \.pid) { p in
-                    HStack {
-                        Text(p.name)
-                            .scaledFont(size: 12)
-                            .foregroundColor(OmiColors.textSecondary)
-                        Text("(pid \(p.pid))")
-                            .scaledFont(size: 11)
-                            .foregroundColor(OmiColors.textQuaternary)
-                        Spacer()
-                        Text(String(format: "%.0f%%", p.cpuPercent))
-                            .scaledFont(size: 12, weight: .medium)
-                            .foregroundColor(OmiColors.textPrimary)
-                            .frame(width: 50, alignment: .trailing)
-                        Text(rssString(p.rssMb))
-                            .scaledFont(size: 12)
+            VStack(alignment: .leading, spacing: 8) {
+                if localModels.isEmpty {
+                    VStack(spacing: 4) {
+                        ForEach(others, id: \.pid) { p in
+                            processRow(p)
+                        }
+                    }
+                } else {
+                    Text("Local Models")
+                        .scaledFont(size: 11, weight: .semibold)
+                        .foregroundColor(OmiColors.textTertiary)
+                    VStack(spacing: 4) {
+                        ForEach(localModels, id: \.pid) { p in
+                            processRow(p)
+                        }
+                    }
+                    if !others.isEmpty {
+                        Text("Processes")
+                            .scaledFont(size: 11, weight: .semibold)
                             .foregroundColor(OmiColors.textTertiary)
-                            .frame(width: 70, alignment: .trailing)
+                        VStack(spacing: 4) {
+                            ForEach(others, id: \.pid) { p in
+                                processRow(p)
+                            }
+                        }
                     }
                 }
             }
@@ -471,6 +481,26 @@ struct ActivityPage: View {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(OmiColors.backgroundSecondary)
             )
+        }
+    }
+
+    private func processRow(_ p: ProcessBreakdown) -> some View {
+        HStack {
+            Text(p.name)
+                .scaledFont(size: 12)
+                .foregroundColor(OmiColors.textSecondary)
+            Text("(pid \(p.pid))")
+                .scaledFont(size: 11)
+                .foregroundColor(OmiColors.textQuaternary)
+            Spacer()
+            Text(String(format: "%.0f%%", p.cpuPercent))
+                .scaledFont(size: 12, weight: .medium)
+                .foregroundColor(OmiColors.textPrimary)
+                .frame(width: 50, alignment: .trailing)
+            Text(rssString(p.rssMb))
+                .scaledFont(size: 12)
+                .foregroundColor(OmiColors.textTertiary)
+                .frame(width: 70, alignment: .trailing)
         }
     }
 

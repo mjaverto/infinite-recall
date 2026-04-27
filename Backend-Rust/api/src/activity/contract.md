@@ -69,9 +69,10 @@ Field names are snake_case on the wire. Swift mirrors live in
     "on_battery": false,
     "low_power": false,
     "process_breakdown": [
-      { "name": "infinite-recall-api", "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84 },
-      { "name": "Infinite Recall",     "pid": 1235, "cpu_percent": 51.2, "rss_mb": 760 },
-      { "name": "mlx-lm.server",       "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498 }
+      { "name": "api",     "pid": 1234, "cpu_percent": 12.4, "rss_mb": 84,   "kind": "core" },
+      { "name": "swift",   "pid": 1235, "cpu_percent": 51.2, "rss_mb": 760,  "kind": "core" },
+      { "name": "mlx-lm",  "pid": 1236, "cpu_percent": 78.4, "rss_mb": 1498, "kind": "local_model" },
+      { "name": "mlx-vlm", "pid": 1237, "cpu_percent": 14.0, "rss_mb": 1102, "kind": "local_model" }
     ]
   },
   "processing_gate": {
@@ -83,6 +84,28 @@ Field names are snake_case on the wire. Swift mirrors live in
   "generated_at": "2026-04-26T14:25:30.512Z"
 }
 ```
+
+### `ProcessBreakdown.kind` — optional classifier
+
+Each row in `resources.process_breakdown` may carry an optional `kind`
+discriminator the UI uses to group rows (e.g. a "Local Models" subhead).
+
+| Variant | Wire value | Meaning |
+|---|---|---|
+| `Core` | `"core"` | IR-spawned core process (`api`, `swift`). |
+| `LocalModel` | `"local_model"` | IR-spawned local-model server (`mlx-lm`, `mlx-vlm`). |
+
+The field is **optional in both directions**:
+
+- An older daemon (pre-this-PR) emits no `kind` at all — newer clients must
+  treat that as "unknown" and render the row in the default partition.
+- An older client decoding a payload that contains `kind` must tolerate
+  unknown future variants without throwing; the Swift mirror in
+  `ActivityModels.swift` decodes anything outside the known set as
+  `.unknown`.
+
+Wire-level: serialised with `serde(default, skip_serializing_if = "Option::is_none")`,
+so the field is silently absent when the daemon doesn't know the kind.
 
 ### `GateState` — sum type (issue #35)
 
@@ -123,6 +146,7 @@ and a stringly-typed `waiting_for`.
 | `CaptureRow.kind` / `CaptureKind` | `audio`, `screen` |
 | `PauseRequest.target` / `ResumeRequest.target` / `PauseTargetId` | `kind`, `capture` (with typed `id` payload — see below) |
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
+| `ProcessBreakdown.kind` / `ProcessKind` (optional) | `core`, `local_model`, `unknown` (field omitted when daemon doesn't classify; both Rust and Swift decoders fold any future wire value into `unknown` for forward-compat) |
 | `GateState` (variant tag on `state`) | `allowed`, `blocked` |
 | `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `initializing` |
 

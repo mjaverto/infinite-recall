@@ -189,6 +189,7 @@ impl ResourceSampler for FakeSampler {
                 pid: 4242,
                 cpu_percent: 12.5,
                 rss_mb: 256,
+                kind: None,
             }],
         }
     }
