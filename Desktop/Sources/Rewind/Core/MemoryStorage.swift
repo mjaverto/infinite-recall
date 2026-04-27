@@ -451,6 +451,20 @@ actor MemoryStorage {
         }
 
         log("MemoryStorage: Inserted local memory (id: \(inserted.id ?? -1)) with KG work enqueued atomically")
+
+        // Fan out to enabled local integrations (filesystem, webhooks, etc.)
+        // for Layer-2 atomic memories. Same skip rule as the inline KG enqueue
+        // above: the onboarding sentinel row is a synthetic placeholder, never
+        // user content, so it must not be exported. Detached + fire-and-forget
+        // because the dispatcher must not block the insert path or surface its
+        // failures back to the caller.
+        if let memoryId = inserted.id, memoryId != ONBOARDING_SENTINEL {
+            let toDispatch = inserted
+            Task.detached(priority: .utility) {
+                await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: toDispatch)
+            }
+        }
+
         return inserted
     }
 
