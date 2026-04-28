@@ -672,13 +672,10 @@ actor TranscriptionStorage {
 
         try await db.write { database in
             try database.execute(
-                sql: "DELETE FROM transcription_segments WHERE sessionId = ?",
-                arguments: [id]
-            )
-            try database.execute(
                 sql: "DELETE FROM audio_chunks WHERE transcriptionSessionId = ?",
                 arguments: [id]
             )
+            // transcription_segments rows cascade via FK on transcription_sessions delete.
             try database.execute(
                 sql: "DELETE FROM transcription_sessions WHERE id = ?",
                 arguments: [id]
