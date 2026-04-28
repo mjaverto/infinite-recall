@@ -325,6 +325,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
           log("Conversations: Purged \(purged) empty session(s) on launch")
         }
 
+        await ConversationSummaryBackfillService.shared.backfillDiscardEmptyShortRecordingsOnce()
+
         let recovered = try await TranscriptionStorage.shared.recoverStaleRecordingSessions()
         if recovered > 0 {
           log("Conversations: Recovered \(recovered) stale recording session(s) on launch")
