@@ -868,13 +868,20 @@ final class PowerWorkBridge {
             ? String(transcript.prefix(ConversationTranscriptLoader.maxTranscriptLength)) + "..."
             : transcript
 
+        // LLMBridge.generateJSON appends a stock instruction telling the model
+        // to "respond ONLY with a single valid JSON object". Asking for a bare
+        // array on top of that contradicts the augment and noticeably trips
+        // the local 4-bit Qwen. So we wrap the array in an envelope object
+        // (`{"items": [...]}`) and decode that. Every other LLMBridge caller
+        // already returns an object — keeping the bridge contract uniform.
         let systemPrompt = """
             You are an action-item extractor. Read a conversation transcript and \
-            output a JSON array of concrete tasks the speakers committed to. Output \
-            ONLY a single valid JSON array — no code fences, no prose, no commentary. \
-            If the transcript contains no actionable tasks, output exactly [].
+            output a JSON object containing concrete tasks the speakers committed \
+            to. Output ONLY a single valid JSON object of the form \
+            `{"items": [...]}` — no code fences, no prose, no commentary. If the \
+            transcript contains no actionable tasks, output exactly {"items": []}.
 
-            Each array element is an object with these fields:
+            Each element of the "items" array is an object with these fields:
             - "description": string, required, a concise one-sentence task description \
               (imperative voice, e.g. "Send the design review notes to Mike")
             - "priority": string, optional, one of: "high", "medium", "low"
@@ -909,7 +916,7 @@ final class PowerWorkBridge {
 
         let decoded: [LLMActionItem]
         do {
-            decoded = try JSONDecoder.iso8601().decode([LLMActionItem].self, from: data)
+            decoded = try JSONDecoder.iso8601().decode(LLMActionItemEnvelope.self, from: data).items
         } catch {
             let snippet = String(raw.prefix(500))
             logError("PowerWorkBridge: .extractActionItems — JSON parse failed for session \(sessionId); raw (first 500): \(snippet)", error: error)
@@ -960,6 +967,16 @@ final class PowerWorkBridge {
 
         try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
         log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) item(s)")
+    }
+
+    /// Envelope wrapping the array of extracted action items. Required
+    /// because `LLMBridge.generateJSON` appends a "respond ONLY with a single
+    /// valid JSON object" instruction to the prompt — asking for a bare
+    /// array would contradict that. Adapter pattern: only this caller needs
+    /// the envelope, so we keep the bridge contract uniform across callers
+    /// and unwrap inside the decode here.
+    private struct LLMActionItemEnvelope: Decodable {
+        let items: [LLMActionItem]
     }
 
     /// Codable mirror for the LLM's per-item response.
