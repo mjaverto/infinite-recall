@@ -131,7 +131,7 @@ actor ConversationSummaryBackfillService {
         let mode = autonomous ? "autonomous" : "live"
         let outcome = try await process(row: row, mode: mode, autonomous: autonomous)
         switch outcome {
-        case .summarized, .placeholder:
+        case .summarized, .placeholder, .discarded:
             // Done: ack happens at the caller (Agent B's drain loop) or the
             // immediate-path entry point.
             return
@@ -301,7 +301,7 @@ actor ConversationSummaryBackfillService {
                 totalProcessed += 1
                 // Throttle: give the LLM server a brief breather.
                 try await Task.sleep(nanoseconds: Self.throttleNanoseconds)
-            case .placeholder:
+            case .placeholder, .discarded:
                 continue
             case .deferred:
                 // Do not spin forever on the same row if the local LLM is
@@ -328,6 +328,7 @@ actor ConversationSummaryBackfillService {
     private enum ProcessOutcome {
         case summarized
         case placeholder
+        case discarded
         case deferred
     }
 
@@ -342,7 +343,7 @@ actor ConversationSummaryBackfillService {
             log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), discarding empty session (\(mode))")
             try await TranscriptionStorage.shared.discardEmptySession(id: sessionId, reason: "short_transcript")
             await notifyConversationListNeedsRefresh()
-            return .placeholder
+            return .discarded
         }
 
         // Ambient/non-speech fallback: long enough to look real but mostly
