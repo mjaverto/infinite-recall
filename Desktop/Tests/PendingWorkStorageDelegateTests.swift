@@ -63,16 +63,25 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
     /// in the developer's production DB and the `BatteryAwareScheduler` drain
     /// loop later trips on their non-JSON payloads.
     private func purgeTestRows() async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            XCTFail("purgeTestRows: no database queue available — test isolation cannot be guaranteed")
+            return
+        }
         try await dbQueue.write { db in
             try db.execute(
-                sql: "DELETE FROM pending_work WHERE payload LIKE 'delegate-test-%'"
+                sql: "DELETE FROM pending_work WHERE dedupKey LIKE 'delegate-%'"
             )
         }
     }
 
     override func setUp() async throws {
         try await super.setUp()
+        // Force the storage actor (and through it, RewindDatabase) to lazily
+        // initialize before `purgeTestRows` reaches into the raw db queue.
+        // Otherwise `getDatabaseQueue()` returns nil on the first setUp of
+        // the process and the purge XCTFails — the queue isn't broken, it
+        // just hasn't been opened yet.
+        _ = await PendingWorkStorage.shared.pendingCount()
         try await purgeTestRows()
     }
 
