@@ -230,12 +230,22 @@ actor ConversationSummaryBackfillService {
 
         log("ConversationSummaryBackfillService: discard-empty backfill starting — \(ids.count) candidate row(s)")
 
+        var failures = 0
         for id in ids {
-            try? await TranscriptionStorage.shared.discardEmptySession(id: id, reason: "backfill_short_recording")
+            do {
+                try await TranscriptionStorage.shared.discardEmptySession(id: id, reason: "backfill_short_recording")
+            } catch {
+                failures += 1
+                logError("ConversationSummaryBackfillService: discard-empty backfill failed for session \(id)", error: error)
+            }
         }
 
-        UserDefaults.standard.set(true, forKey: flagKey)
-        log("ConversationSummaryBackfillService: discard-empty backfill complete — processed \(ids.count) row(s)")
+        if failures == 0 {
+            UserDefaults.standard.set(true, forKey: flagKey)
+            log("ConversationSummaryBackfillService: discard-empty backfill complete — processed \(ids.count) row(s)")
+        } else {
+            log("ConversationSummaryBackfillService: discard-empty backfill partial — \(ids.count - failures) ok, \(failures) failed; will retry next launch")
+        }
     }
 
     /// Summarize one just-finished session immediately when conditions are
