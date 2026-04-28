@@ -1,91 +1,40 @@
 import Foundation
 
-/// Result of a filesystem dispatch. Carries the standard `DispatchOutcome`
-/// plus an optional refreshed bookmark — non-nil only when the resolved
-/// bookmark was `isStale` and we successfully re-created one. The caller
-/// persists the new bookmark blob to the integrations table.
+/// Writes a memory payload to a user-picked folder. Path scheme:
+/// `<root>/YYYY/MM-DD/HHMMSS-<slug>.<ext>` in the user's local timezone
+/// (matches what they see in the IR UI).
 ///
-/// INVARIANT (not enforced by the type): `refreshedBookmark` is nil whenever
-/// `outcome` is `.permanentFailure`. The producer (`FilesystemWriter.write`)
-/// upholds this; safe-to-persist on any outcome via `if let refreshed`.
-/// Revisit as a `WriteOutcome` enum (bookmark on success/retry only) post-v1.
-struct WriteResult {
-  let outcome: DispatchOutcome
-  let refreshedBookmark: Data?
-}
-
-/// Writes a memory payload to a user-picked folder via security-scoped
-/// bookmark. Path scheme: `<root>/YYYY/MM-DD/HHMMSS-<slug>.<ext>` in the
-/// user's local timezone (matches what they see in the IR UI).
+/// The app is non-sandboxed, so a plain path string is the I/O source of
+/// truth — no security-scoped bookmarks. (Bookmarks were the cause of
+/// intermittent Cocoa 259 "bookmark unresolvable" errors when Google
+/// Drive's File Provider remounted and changed the volume UUID.)
 enum FilesystemWriter {
-  /// Resolves the bookmark, builds the dated path, writes atomically.
+  /// Builds the dated path and writes atomically.
   ///
-  /// - Stale bookmark that we refresh successfully: returns the new
-  ///   bookmark in `refreshedBookmark` AND continues with the write.
-  /// - Bookmark resolve throws: `.permanentFailure` (user likely deleted
-  ///   or unmounted the folder).
+  /// - Empty `folderPath`: `.permanentFailure` (caller should never pass
+  ///   one, but defend so a bad row can't loop forever).
   /// - File I/O errors: treated as `.retry` (assume transient — better
   ///   to retry than lose data; iCloud-not-downloaded is the common case).
   static func write(
     payload: MemoryPayload,
     payloadJSON: Data,
     format: LocalIntegrationFormat,
-    bookmark: Data
-  ) async -> WriteResult {
-    // 1. Resolve the security-scoped bookmark.
-    var isStale = false
-    let rootURL: URL
-    do {
-      rootURL = try URL(
-        resolvingBookmarkData: bookmark,
-        options: [.withSecurityScope],
-        relativeTo: nil,
-        bookmarkDataIsStale: &isStale
-      )
-    } catch {
-      return WriteResult(
-        outcome: .permanentFailure(reason: "bookmark unresolvable: \(error.localizedDescription)"),
-        refreshedBookmark: nil
-      )
+    folderPath: String
+  ) async -> DispatchOutcome {
+    guard !folderPath.isEmpty else {
+      return .permanentFailure(reason: "no folder path")
     }
+    let rootURL = URL(fileURLWithPath: folderPath)
 
-    // 2. If stale, try to refresh — but don't fail the write if refresh
-    //    itself throws; the resolved URL still works for this attempt.
-    var refreshedBookmark: Data? = nil
-    if isStale {
-      do {
-        refreshedBookmark = try rootURL.bookmarkData(
-          options: [.withSecurityScope],
-          includingResourceValuesForKeys: nil,
-          relativeTo: nil
-        )
-      } catch {
-        // Stale and we can't re-bookmark — log so the failure isn't silent,
-        // then keep going. The resolved URL still works for THIS write, but
-        // on next launch the stale bookmark will resolve again (or fail).
-        // Caller sees refreshedBookmark == nil.
-        logError("FilesystemWriter: stale bookmark refresh failed; proceeding with this write but next launch may degrade", error: error)
-      }
-    }
-
-    // 3. Acquire scope. ALWAYS pair with stop in defer.
-    let didStart = rootURL.startAccessingSecurityScopedResource()
-    defer {
-      if didStart { rootURL.stopAccessingSecurityScopedResource() }
-    }
-
-    // 4. Compute dated subfolder + filename in the user's local timezone.
-    //    Calendar.current uses the user's default TZ — do not pass an
-    //    explicit TimeZone, per spec.
+    // Compute dated subfolder + filename in the user's local timezone.
+    // Calendar.current uses the user's default TZ — do not pass an
+    // explicit TimeZone, per spec.
     let cal = Calendar.current
     let comps = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: payload.createdAt)
     guard let year = comps.year, let month = comps.month, let day = comps.day,
           let hour = comps.hour, let minute = comps.minute, let second = comps.second
     else {
-      return WriteResult(
-        outcome: .permanentFailure(reason: "could not extract date components from createdAt"),
-        refreshedBookmark: refreshedBookmark
-      )
+      return .permanentFailure(reason: "could not extract date components from createdAt")
     }
 
     let yearStr = String(format: "%04d", year)
@@ -105,10 +54,7 @@ enum FilesystemWriter {
       // .data(using: .utf8) on a Swift String is non-throwing-non-nil for
       // valid Strings; force-unwrap is safe here but we guard for paranoia.
       guard let utf8 = rendered.data(using: .utf8) else {
-        return WriteResult(
-          outcome: .permanentFailure(reason: "could not utf8-encode markdown"),
-          refreshedBookmark: refreshedBookmark
-        )
+        return .permanentFailure(reason: "could not utf8-encode markdown")
       }
       body = utf8
     }
@@ -118,14 +64,14 @@ enum FilesystemWriter {
       .appendingPathComponent(monthDayStr, isDirectory: true)
     let fileURL = dailyFolder.appendingPathComponent("\(timeStr)-\(slug).\(ext)")
 
-    // 5. Create directory + write atomically.
+    // Create directory + write atomically.
     do {
       try FileManager.default.createDirectory(
         at: dailyFolder,
         withIntermediateDirectories: true
       )
       try body.write(to: fileURL, options: .atomic)
-      return WriteResult(outcome: .success, refreshedBookmark: refreshedBookmark)
+      return .success
     } catch let nsError as NSError {
       // Map known transient cases to retry. Anything we don't recognize
       // also retries — losing a memory snapshot is worse than a redundant
@@ -139,11 +85,20 @@ enum FilesystemWriter {
       // forever and eventually escalate to permanent failure.
       if domain == NSCocoaErrorDomain && code == NSFileWriteFileExistsError {
         log("FilesystemWriter: file already exists at \(fileURL.path) — treating as idempotent success")
-        return WriteResult(outcome: .success, refreshedBookmark: refreshedBookmark)
+        return .success
+      }
+      // TCC denial / read-only filesystem / explicit "no permission" — retrying
+      // is futile until the user grants access in System Settings → Privacy &
+      // Security → Files and Folders. Mark permanent so the row parks (30 days)
+      // and the lastError surfaces in the integrations table; user can re-pick
+      // or "Retry now" once they've fixed the permission.
+      if (domain == NSCocoaErrorDomain && code == NSFileWriteNoPermissionError)
+          || (domain == NSPOSIXErrorDomain && code == Int(EACCES)) {
+        return .permanentFailure(reason: reason)
       }
       // Everything else: retry. Losing a memory snapshot is worse than a
       // redundant retry tick.
-      return WriteResult(outcome: .retry(reason: reason), refreshedBookmark: refreshedBookmark)
+      return .retry(reason: reason)
     }
   }
 

@@ -48,7 +48,7 @@ enum LocalIntegrationFormat: String, Codable {
 ///
 /// INVARIANT (enforced at `create`/`update` callsites in `AddLocalAppSheet`,
 /// not in the type): `kind == "webhook"` ⇒ `webhookURL != nil`;
-/// `kind == "filesystem"` ⇒ `folderBookmark != nil && format != nil`.
+/// `kind == "filesystem"` ⇒ `folderDisplayPath != nil && format != nil`.
 /// The drainer defends against violations by mapping malformed rows to
 /// `.permanentFailure` rather than crashing. Revisit as a sum-type
 /// `LocalIntegrationConfig` once a third kind lands.
@@ -71,11 +71,17 @@ struct LocalIntegrationRecord: Codable, FetchableRecord, PersistableRecord, Iden
     /// Only populated when `kind == "webhook"`.
     var webhookURL: String?
 
-    /// Only populated when `kind == "filesystem"`. Security-scoped bookmark
-    /// blob — survives relaunch and folder moves.
+    /// Legacy security-scoped bookmark blob. Unused by the writer (the app
+    /// is non-sandboxed; `folderDisplayPath` is the I/O source of truth).
+    /// Kept for back-compat with old rows; new rows write nil. The GRDB
+    /// column stays so we don't need a schema migration.
+    /// Drop the column in the next migration that touches this table; until
+    /// then, leave it alone.
     var folderBookmark: Data?
 
-    /// Last-resolved path string. UI display only — never trust for I/O.
+    /// Path string for filesystem integrations. I/O source of truth — the
+    /// drainer reads this and hands it to `FilesystemWriter`. Only populated
+    /// when `kind == "filesystem"`.
     var folderDisplayPath: String?
 
     /// Raw value of `LocalIntegrationFormat` — "json" or "markdown".

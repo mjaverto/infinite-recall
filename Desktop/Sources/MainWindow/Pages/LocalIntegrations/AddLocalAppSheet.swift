@@ -6,7 +6,7 @@ import SwiftUI
 /// The same sheet is reused for both flows — pass `editing: nil` for "Add",
 /// pass a populated record for "Edit". When editing, the kind picker is
 /// disabled (changing kind would invalidate the existing webhook/filesystem
-/// fields and there's no clean migration path); the existing folder bookmark
+/// fields and there's no clean migration path); the existing folder path
 /// is preserved unless the user explicitly re-picks a folder.
 struct AddLocalAppSheet: View {
   // MARK: - Inputs
@@ -23,9 +23,8 @@ struct AddLocalAppSheet: View {
   @State private var webhookURL: String = ""
   @State private var format: LocalIntegrationFormat = .json
 
-  /// Security-scoped bookmark for the chosen folder. Initialized from the
-  /// editing record so simply pressing Save preserves the existing bookmark.
-  @State private var folderBookmark: Data? = nil
+  /// Path string for the chosen folder. Initialized from the editing record
+  /// so simply pressing Save preserves the existing path.
   @State private var folderDisplayPath: String? = nil
 
   @State private var saveError: String? = nil
@@ -205,7 +204,7 @@ struct AddLocalAppSheet: View {
     case .webhook:
       return webhookURLValid
     case .filesystem:
-      return folderBookmark != nil
+      return !(folderDisplayPath ?? "").isEmpty
     }
   }
 
@@ -216,34 +215,21 @@ struct AddLocalAppSheet: View {
     name = editing.name
     if let k = editing.kindEnum { kind = k }
     webhookURL = editing.webhookURL ?? ""
-    folderBookmark = editing.folderBookmark
     folderDisplayPath = editing.folderDisplayPath
     if let f = editing.formatEnum { format = f }
   }
 
-  /// Open `NSOpenPanel` to choose a folder, then create a security-scoped
-  /// bookmark for the resulting URL. Persisting the bookmark (rather than the
-  /// raw path) lets the drainer re-resolve the folder across relaunches and
-  /// folder moves.
+  /// Open `NSOpenPanel` to choose a folder and store its path. The app is
+  /// non-sandboxed, so the path string is the I/O source of truth — TCC
+  /// handles permission, no security-scoped bookmark needed.
   private func chooseFolder() {
     let panel = NSOpenPanel()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
     panel.allowsMultipleSelection = false
     panel.prompt = "Choose"
-    let response = panel.runModal()
-    guard response == .OK, let url = panel.url else { return }
-    do {
-      let bookmark = try url.bookmarkData(
-        options: .withSecurityScope,
-        includingResourceValuesForKeys: nil,
-        relativeTo: nil
-      )
-      folderBookmark = bookmark
-      folderDisplayPath = url.path
-    } catch {
-      saveError = "Couldn't create bookmark for folder: \(error.localizedDescription)"
-    }
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    folderDisplayPath = url.path
   }
 
   private func save() async {
@@ -275,7 +261,7 @@ struct AddLocalAppSheet: View {
         kind: LocalIntegrationKind.filesystem.rawValue,
         enabled: editing?.enabled ?? true,
         webhookURL: nil,
-        folderBookmark: folderBookmark,
+        folderBookmark: nil,
         folderDisplayPath: folderDisplayPath,
         format: format.rawValue,
         createdAt: editing?.createdAt ?? now,

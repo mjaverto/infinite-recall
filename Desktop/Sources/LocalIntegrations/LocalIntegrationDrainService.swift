@@ -283,9 +283,8 @@ final class LocalIntegrationDrainService: LocalIntegrationOutboxDelegate {
       // Rebuild MemoryPayload from the snapshot (NOT from APIClient — the
       // outbox row is authoritative).
       let bodyData = row.payloadJson.data(using: .utf8) ?? Data()
-      let bookmark = integration.folderBookmark ?? Data()
-      if bookmark.isEmpty {
-        outcome = .permanentFailure(reason: "no folder bookmark")
+      guard let folderPath = integration.folderDisplayPath, !folderPath.isEmpty else {
+        outcome = .permanentFailure(reason: "no folder path")
         break
       }
       let payload: MemoryPayload
@@ -298,24 +297,12 @@ final class LocalIntegrationDrainService: LocalIntegrationOutboxDelegate {
         outcome = .permanentFailure(reason: "payload decode failed: \(error.localizedDescription)")
         break
       }
-      let result = await FilesystemWriter.write(
+      outcome = await FilesystemWriter.write(
         payload: payload,
         payloadJSON: bodyData,
         format: integration.formatEnum ?? .json,
-        bookmark: bookmark
+        folderPath: folderPath
       )
-      // Persist the refreshed bookmark before processing the outcome so a
-      // crash here doesn't lose the new bookmark.
-      if let refreshed = result.refreshedBookmark {
-        var updated = integration
-        updated.folderBookmark = refreshed
-        do {
-          try await LocalIntegrationStorage.shared.update(updated)
-        } catch {
-          logError("LocalIntegrationDrainService: persist refreshed bookmark failed integration=\(integration.id)", error: error)
-        }
-      }
-      outcome = result.outcome
 
     case .none:
       // Unknown kind raw value — treat as permanent so the row doesn't
