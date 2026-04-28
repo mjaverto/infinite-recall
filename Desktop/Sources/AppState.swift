@@ -3164,6 +3164,10 @@ extension Notification.Name {
   /// Posted when conversation rows are mutated under the UI (e.g. backfill
   /// service rewrites title/overview). Listeners should refetch.
   static let conversationsListNeedsRefresh = Notification.Name("conversationsListNeedsRefresh")
+  /// Posted when action_items rows are mutated under the UI (e.g. the
+  /// `.extractActionItems` handler inserts conversation-derived tasks).
+  /// Listeners should refetch (e.g. `TasksStore.loadTasks()`).
+  static let actionItemsListNeedsRefresh = Notification.Name("actionItemsListNeedsRefresh")
   /// Posted when Tasks page finishes loading initial data
   static let tasksPageDidLoad = Notification.Name("tasksPageDidLoad")
   /// Posted when Focus page finishes loading initial data

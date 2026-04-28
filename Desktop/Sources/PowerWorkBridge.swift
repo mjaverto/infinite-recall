@@ -72,6 +72,15 @@ final class PowerWorkBridge {
             try await PowerWorkBridge.handleExtractKG(work)
         }
 
+        // .extractActionItems — pull task-shaped items from a finished
+        // conversation's transcript. Decodes `{"session_id": Int64}` and
+        // routes through `LLMBridge.generateJSON` (NOT `chatAutonomous`):
+        // this kind only requires `allowHeavyWork`, so the user may still be
+        // active and Memory Saver must be allowed to keep the model warm.
+        BatteryAwareScheduler.shared.registerHandler(for: .extractActionItems) { work in
+            try await PowerWorkBridge.handleExtractActionItems(work)
+        }
+
         // Start the periodic sweeper that reclaims expired leases and GCs old rows.
         PendingWorkSweeper.shared.start()
 
@@ -104,9 +113,11 @@ final class PowerWorkBridge {
                 .enqueueHistoricalSummariesIfNeeded(reason: "launch")
             await ConversationTranscribeBackfillService.shared
                 .enqueueHistoricalTranscribesIfNeeded(reason: "launch")
+            await ConversationActionItemsBackfillService.shared
+                .enqueueHistoricalActionItemsIfNeeded(reason: "launch")
         }
 
-        log("PowerWorkBridge: Started — registered .transcribe, .ocr, .summarize, and .extractKG handlers")
+        log("PowerWorkBridge: Started — registered .transcribe, .ocr, .summarize, .extractKG, and .extractActionItems handlers")
     }
 
     // MARK: - Dead-letter handler
@@ -123,6 +134,8 @@ final class PowerWorkBridge {
             await handleDeadLetterSummarize(payload: payload)
         case PendingWork.Kind.extractKG.rawValue:
             await handleDeadLetterExtractKG(payload: payload)
+        case PendingWork.Kind.extractActionItems.rawValue:
+            await handleDeadLetterExtractActionItems(payload: payload)
         default:
             return
         }
@@ -763,6 +776,249 @@ final class PowerWorkBridge {
         await KGProgressPublisher.shared.tick()
 
         log("PowerWorkBridge: .extractKG — memory \(realId) outcome=\(extraction.outcome) in \(String(format: "%.2f", drainDuration))s")
+    }
+
+    // MARK: - Extract Action Items handler
+
+    /// Maximum transcript length (chars) sent to the LLM for action-item
+    /// extraction. Mirrors `ConversationSummaryBackfillService.maxTranscriptLength`.
+    fileprivate static let extractActionItemsMaxTranscriptLength = 6000
+
+    /// Minimum transcript length (chars) before bothering with extraction.
+    fileprivate static let extractActionItemsMinTranscriptLength = 30
+
+    /// Decode an `.extractActionItems` payload (`{"session_id": Int64}`),
+    /// load the transcript, run the LLM, and persist any extracted items via
+    /// `ActionItemStorage.shared.insertLocalActionItem(...)`.
+    ///
+    /// LLM path uses `LLMBridge.generateJSON` (NOT `chatAutonomous`): this
+    /// kind only requires `allowHeavyWork`, so the user may still be active
+    /// and Memory Saver must be allowed to track the call.
+    ///
+    /// Outcome routing:
+    /// - Undecodable payload → log + ack (return). Mirrors `.summarize`.
+    /// - Empty/short transcript → mark extracted + ack (no insert).
+    /// - LLM returned nil OR JSON parse failure → throw (lets PendingWork retry).
+    /// - Successful empty array `[]` → mark extracted + ack.
+    /// - Successful items → insert each + mark extracted + post refresh.
+    fileprivate static func handleExtractActionItems(_ work: PendingWork) async throws {
+        try await _handleExtractActionItemsPayload(
+            work.payload,
+            processor: { sessionId in
+                try await processExtractActionItems(sessionId: sessionId)
+            },
+            notify: { sessionId in
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: .actionItemsListNeedsRefresh,
+                        object: nil,
+                        userInfo: ["session_id": sessionId]
+                    )
+                }
+            }
+        )
+    }
+
+    /// Testable seam for `handleExtractActionItems`. Same contract as
+    /// `_handleSummarizePayload`: undecodable payload → no throw, no notify,
+    /// no processor call; processor throw → re-thrown, no notify; success →
+    /// notify called.
+    static func _handleExtractActionItemsPayload(
+        _ payload: Data,
+        processor: (Int64) async throws -> Void,
+        notify: (Int64) async -> Void
+    ) async throws {
+        struct Payload: Decodable {
+            let session_id: Int64
+        }
+
+        let sessionId: Int64
+        do {
+            sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
+        } catch {
+            logError("PowerWorkBridge: .extractActionItems payload undecodable, dropping", error: error)
+            return
+        }
+
+        do {
+            try await processor(sessionId)
+        } catch {
+            logError("PowerWorkBridge: .extractActionItems — session \(sessionId) failed (will retry)", error: error)
+            throw error
+        }
+
+        await notify(sessionId)
+        log("PowerWorkBridge: .extractActionItems — session \(sessionId) done")
+    }
+
+    /// Production processor: load transcript, call LLM, insert items, mark
+    /// session extracted. Throws on retryable failure (LLM unreachable, JSON
+    /// parse failure) so PendingWork retry/backoff takes over.
+    fileprivate static func processExtractActionItems(sessionId: Int64) async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw NSError(domain: "PowerWorkBridge", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Database not initialized for extractActionItems"
+            ])
+        }
+
+        // Assemble the transcript from segments — same WhisperKit-token
+        // stripping pattern used by ConversationSummaryBackfillService.
+        let segmentSQL = """
+            SELECT text FROM transcription_segments
+             WHERE sessionId = ?
+             ORDER BY segmentOrder ASC
+            """
+        let rawTexts: [String] = try await dbQueue.read { db in
+            try String.fetchAll(db, sql: segmentSQL, arguments: [sessionId])
+        }
+        let transcript = rawTexts
+            .map { $0.replacingOccurrences(of: #"<\|[^|>]+\|>"#, with: "", options: .regularExpression)
+                      .trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        if transcript.count < extractActionItemsMinTranscriptLength {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) transcript too short (\(transcript.count) chars), marking extracted")
+            try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
+            return
+        }
+
+        let truncated = transcript.count > extractActionItemsMaxTranscriptLength
+            ? String(transcript.prefix(extractActionItemsMaxTranscriptLength)) + "..."
+            : transcript
+
+        let systemPrompt = """
+            You are an action-item extractor. Read a conversation transcript and \
+            output a JSON array of concrete tasks the speakers committed to. Output \
+            ONLY a single valid JSON array — no code fences, no prose, no commentary. \
+            If the transcript contains no actionable tasks, output exactly [].
+
+            Each array element is an object with these fields:
+            - "description": string, required, a concise one-sentence task description \
+              (imperative voice, e.g. "Send the design review notes to Mike")
+            - "priority": string, optional, one of: "high", "medium", "low"
+            - "dueAt": string, optional, an ISO 8601 date-time (UTC, e.g. \
+              "2026-05-01T17:00:00Z") if the speakers named a specific deadline
+            - "category": string, optional, a short category label (e.g. "work", \
+              "personal", "follow-up")
+            - "tags": array of strings, optional, free-form labels
+
+            Be conservative: only emit items the speakers actually committed to doing. \
+            Skip aspirations, rhetorical questions, and hypotheticals.
+            """
+
+        let userPrompt = "Transcript:\n\n\(truncated)"
+        let label = "ConversationActionItemsBackfill[\(sessionId)]"
+
+        guard let raw = await LLMBridge.generateJSON(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt,
+            label: label
+        ) else {
+            throw NSError(domain: "PowerWorkBridge", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "extractActionItems: LLM returned nil for session \(sessionId)"
+            ])
+        }
+
+        guard let data = raw.data(using: .utf8) else {
+            throw NSError(domain: "PowerWorkBridge", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "extractActionItems: response not UTF-8 for session \(sessionId)"
+            ])
+        }
+
+        let decoded: [LLMActionItem]
+        do {
+            decoded = try JSONDecoder.iso8601().decode([LLMActionItem].self, from: data)
+        } catch {
+            let snippet = String(raw.prefix(500))
+            logError("PowerWorkBridge: .extractActionItems — JSON parse failed for session \(sessionId); raw (first 500): \(snippet)", error: error)
+            throw error
+        }
+
+        if decoded.isEmpty {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) yielded zero items, marking extracted")
+            try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
+            return
+        }
+
+        let validPriorities: Set<String> = ["high", "medium", "low"]
+        var inserted = 0
+        for item in decoded {
+            let description = item.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !description.isEmpty else { continue }
+
+            let priority: String? = {
+                guard let p = item.priority?.lowercased() else { return nil }
+                return validPriorities.contains(p) ? p : nil
+            }()
+
+            let tagsJson: String? = {
+                guard let tags = item.tags, !tags.isEmpty else { return nil }
+                guard let data = try? JSONEncoder().encode(tags),
+                      let json = String(data: data, encoding: .utf8) else { return nil }
+                return json
+            }()
+
+            let record = ActionItemRecord(
+                description: description,
+                source: "conversation",
+                conversationId: String(sessionId),
+                priority: priority,
+                category: item.category,
+                tagsJson: tagsJson,
+                dueAt: item.dueAt,
+                fromStaged: false
+            )
+            do {
+                _ = try await ActionItemStorage.shared.insertLocalActionItem(record)
+                inserted += 1
+            } catch {
+                logError("PowerWorkBridge: .extractActionItems — insert failed for session \(sessionId)", error: error)
+            }
+        }
+
+        try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
+        log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) item(s)")
+    }
+
+    /// Codable mirror for the LLM's per-item response.
+    private struct LLMActionItem: Decodable {
+        let description: String
+        let priority: String?
+        let dueAt: Date?
+        let category: String?
+        let tags: [String]?
+    }
+
+    /// Dead-letter for `.extractActionItems`: mark the session extracted so
+    /// it stops re-qualifying on launch. No user-visible placeholder needed —
+    /// "no tasks for this conversation" is indistinguishable from a real
+    /// empty result. Surfaces in logs only.
+    @Sendable
+    fileprivate static func handleDeadLetterExtractActionItems(payload: Data) async {
+        struct Payload: Decodable { let session_id: Int64 }
+        let sessionId: Int64
+        do {
+            sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
+        } catch {
+            logError("PowerWorkBridge: dead-letter — extractActionItems payload undecodable", error: error)
+            return
+        }
+
+        do {
+            try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
+            log("PowerWorkBridge: dead-letter — marked session \(sessionId) action_items_extracted_at to break re-enqueue loop")
+        } catch {
+            logError("PowerWorkBridge: dead-letter — failed to mark session \(sessionId) extracted", error: error)
+        }
+    }
+}
+
+private extension JSONDecoder {
+    static func iso8601() -> JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
     }
 }
 

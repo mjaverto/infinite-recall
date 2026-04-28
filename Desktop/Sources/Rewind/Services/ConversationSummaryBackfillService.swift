@@ -311,6 +311,13 @@ actor ConversationSummaryBackfillService {
         log("ConversationSummaryBackfillService: session \(sessionId) → \"\(structured.title)\" (\(mode))")
         await notifyConversationListNeedsRefresh()
 
+        // Now that the session has a usable summary (i.e. transcript + LLM
+        // both succeeded), enqueue the action-items extraction. Producing on
+        // summary-success — not transcript-finish — avoids double-extracting
+        // and racing transcript materialization.
+        await ConversationActionItemsBackfillService.shared
+            .enqueueActionItemsIfNeeded(sessionId: sessionId, reason: "post-summary:\(mode)")
+
         // Fire-and-forget: now that the conversation has its final title +
         // overview, hand it off to the local-integration outbox. This is the
         // unambiguous "conversation finished" moment in the local-first fork
