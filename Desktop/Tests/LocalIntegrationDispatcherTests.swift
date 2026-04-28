@@ -13,6 +13,14 @@ import GRDB
 /// isolate per-test by creating uniquely-named integrations and cleaning
 /// them (plus their outbox rows) up in `tearDown`.
 ///
+/// Invariant: this suite temporarily disables user-owned integrations
+/// during `setUp` and restores them in `tearDown` to prevent test memories
+/// from being delivered to real filesystem/webhook destinations. Without
+/// this guard, a real enabled filesystem integration (e.g. one writing to
+/// the user's Obsidian/Google-Drive folder) would receive an outbox row
+/// for every fan-out test memory and the drain service would render it
+/// to disk before tearDown could intervene.
+///
 /// Scope: `enqueueDispatch(memory:)` only.
 ///
 /// We deliberately skip `enqueueDispatch(conversationId:)` because that
@@ -28,7 +36,32 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
     /// (and their outbox rows) in tearDown — no matter which assertion fired.
     private var createdIntegrationIds: [String] = []
 
+    /// Snapshot of user-owned integrations that were enabled at setUp time.
+    /// We disable them for the duration of the suite so the dispatcher's
+    /// fan-out doesn't hit real filesystem/webhook destinations, and
+    /// re-enable them in tearDown.
+    private var disabledUserIntegrationIds: [String] = []
+
     // MARK: - Lifecycle
+
+    override func setUp() async throws {
+        try await super.setUp()
+        // Real `try` — if `listEnabled()` fails we MUST NOT proceed: the
+        // dispatcher fan-out below would otherwise write test memories to
+        // whatever real integrations the user has enabled. Letting setUp
+        // throw is correct here — XCTest marks the test failed without
+        // running the body.
+        let enabled = try await LocalIntegrationStorage.shared.listEnabled()
+        disabledUserIntegrationIds = enabled.map { $0.id }
+        for id in disabledUserIntegrationIds {
+            // Breadcrumb: if the test process crashes between here and
+            // tearDown's restore loop, the user has a record of which ids
+            // to flip back on manually (SELECT id, enabled FROM
+            // local_integrations;).
+            log("LocalIntegrationDispatcherTests: setUp disabled user integration id=\(id)")
+            try await LocalIntegrationStorage.shared.setEnabled(id: id, false)
+        }
+    }
 
     override func tearDown() async throws {
         // Defensive sweep: drop every outbox row that belongs to one of our
@@ -40,7 +73,55 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
             try? await LocalIntegrationStorage.shared.delete(id: id)
         }
         createdIntegrationIds.removeAll()
+
+        // Restore user-owned integrations. We attempt every id even if some
+        // fail, then XCTFail loudly with the collected errors so the user
+        // notices and fixes the sqlite state instead of silently losing
+        // exports. Each call is in do/catch (not `try?`) so we capture the
+        // actual error.
+        var restoreFailures: [(id: String, error: Error)] = []
+        for id in disabledUserIntegrationIds {
+            do {
+                try await LocalIntegrationStorage.shared.setEnabled(id: id, true)
+            } catch {
+                restoreFailures.append((id: id, error: error))
+            }
+        }
+        disabledUserIntegrationIds.removeAll()
+
+        if !restoreFailures.isEmpty {
+            XCTFail(
+                "Failed to re-enable user integrations: \(restoreFailures). " +
+                "Manually verify with: SELECT id, enabled FROM local_integrations;"
+            )
+        }
+
         try await super.tearDown()
+    }
+
+    /// Belt-and-suspenders sweep called inside each fan-out test method
+    /// after `enqueueDispatch` returns but before assertions: count any
+    /// outbox rows that snuck in for the snapshotted user integrations
+    /// during the async window between setUp's disable and the dispatcher
+    /// reading `listEnabled()`, ASSERT the count is zero (the disable
+    /// must have propagated), then still clear so we don't leave rows for
+    /// the next test.
+    ///
+    /// `LocalIntegrationOutboxStorage.clearAll(forIntegrationId:)` returns
+    /// `Void`, so we cannot get a cleared-row count from it. Per the
+    /// no-production-signature-changes constraint we read the count via
+    /// the existing `outboxRows(forIntegrationId:)` helper before clearing.
+    private func sweepUserIntegrationOutbox() async throws {
+        for id in disabledUserIntegrationIds {
+            let preCount = try await outboxRows(forIntegrationId: id).count
+            XCTAssertEqual(
+                preCount, 0,
+                "Sweep would clear \(preCount) rows for id=\(id) — disable did not propagate before dispatcher read listEnabled()"
+            )
+            // Cleanup so we don't leak rows into later tests even if the
+            // assertion above fired.
+            try await LocalIntegrationOutboxStorage.shared.clearAll(forIntegrationId: id)
+        }
     }
 
     // MARK: - Helpers
@@ -132,6 +213,7 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
 
         let memory = makeMemory(headline: "no-subscribers")
         await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: memory)
+        try await sweepUserIntegrationOutbox()
 
         // The disabled integration must have NO outbox rows. (The dispatcher
         // shouldn't have looked at it, but we assert on the row state to be
@@ -157,6 +239,7 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
         )
 
         await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: memory)
+        try await sweepUserIntegrationOutbox()
 
         let rows = try await outboxRows(forIntegrationId: integration.id)
         XCTAssertEqual(rows.count, 1, "Exactly one outbox row expected")
@@ -192,6 +275,7 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
         )
 
         await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: memory)
+        try await sweepUserIntegrationOutbox()
 
         let rowsA = try await outboxRows(forIntegrationId: a.id)
         let rowsB = try await outboxRows(forIntegrationId: b.id)
@@ -237,6 +321,7 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
             headline: "mixed test"
         )
         await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: memory)
+        try await sweepUserIntegrationOutbox()
 
         let enabledRows = try await outboxRows(forIntegrationId: enabled.id)
         let disabledRows = try await outboxRows(forIntegrationId: insertedDisabled.id)
@@ -276,6 +361,7 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
         )
 
         await LocalIntegrationDispatcher.shared.enqueueDispatch(memory: memory)
+        try await sweepUserIntegrationOutbox()
 
         let rows = try await outboxRows(forIntegrationId: integration.id)
         XCTAssertEqual(rows.count, 1, "Exactly one outbox row expected")
