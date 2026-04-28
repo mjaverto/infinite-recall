@@ -124,6 +124,48 @@ final class OnboardingFlowTests: XCTestCase {
     XCTAssertEqual(migratedTasks, 18)
   }
 
+  func testMigrationInsertingBYOKStepShiftsLaterStepsForward() {
+    // Legacy Tasks (index 17 before BYOK insertion) should land on the new
+    // Tasks index (18) once BringYourOwnKeys is inserted between Goal and Tasks.
+    let migratedLegacyTasks = OnboardingFlow.migratedStep(
+      currentStep: 17,
+      hasMigratedVideoStep: true,
+      hasInsertedVoiceShortcutStep: true,
+      hasMergedVoiceInputStep: true,
+      hasRemovedNotificationStep: true,
+      hasInsertedFloatingBarShortcutStep: true,
+      hasMigratedPagedIntro: true,
+      hasReorderedTrustStep: true,
+      hasInsertedHowDidYouHearStep: true,
+      hasInsertedDataSourcesStep: true,
+      hasInsertedExportsStep: true,
+      hasInsertedSecondBrainStep: false,
+      hasRemovedResearchStep: true,
+      hasInsertedBYOKStep: false
+    )
+
+    // Steps before the BYOK insertion point (e.g. Goal at index 16) must not shift.
+    let migratedGoal = OnboardingFlow.migratedStep(
+      currentStep: 16,
+      hasMigratedVideoStep: true,
+      hasInsertedVoiceShortcutStep: true,
+      hasMergedVoiceInputStep: true,
+      hasRemovedNotificationStep: true,
+      hasInsertedFloatingBarShortcutStep: true,
+      hasMigratedPagedIntro: true,
+      hasReorderedTrustStep: true,
+      hasInsertedHowDidYouHearStep: true,
+      hasInsertedDataSourcesStep: true,
+      hasInsertedExportsStep: true,
+      hasInsertedSecondBrainStep: false,
+      hasRemovedResearchStep: true,
+      hasInsertedBYOKStep: false
+    )
+
+    XCTAssertEqual(migratedLegacyTasks, 18)
+    XCTAssertEqual(migratedGoal, 16)
+  }
+
   func testVoiceShortcutContinueUnlocksOnlyAfterReleaseFollowingObservedPress() {
     XCTAssertFalse(
       OnboardingFlow.shouldUnlockVoiceShortcutContinue(
