@@ -651,6 +651,40 @@ actor TranscriptionStorage {
         }
     }
 
+    /// Hard-delete a single empty Short Recording conversation (and its
+    /// segments + audio chunks) atomically. Used by the auto-delete path for
+    /// `summary_state='unavailable'` rows that are local-only and never sync.
+    ///
+    /// All mutations run inside a single GRDB transaction so we never end up
+    /// with orphaned segments or chunks if the process dies mid-delete.
+    ///
+    /// Note: `audio_chunks` stores raw PCM directly as a blob (`pcm` column);
+    /// there is no separate on-disk audio file path to unlink. Deleting the
+    /// row is sufficient to remove the audio bytes.
+    ///
+    /// - Parameters:
+    ///   - id: session id to discard
+    ///   - reason: short tag included in the log line for traceability
+    func discardEmptySession(id: Int64, reason: String) async throws {
+        let db = try await ensureInitialized()
+
+        log("TranscriptionStorage: Discarding empty session \(id) — reason=\(reason)")
+
+        try await db.write { database in
+            try database.execute(
+                sql: "DELETE FROM audio_chunks WHERE transcriptionSessionId = ?",
+                arguments: [id]
+            )
+            // transcription_segments rows cascade via FK on transcription_sessions delete.
+            try database.execute(
+                sql: "DELETE FROM transcription_sessions WHERE id = ?",
+                arguments: [id]
+            )
+        }
+
+        log("Auto-deleted empty conversation \(id) — reason=\(reason)")
+    }
+
     /// Fetch the first segment's text per session in a single SQL pass.
     /// Used by the Conversations list to render a 1-2 line inline preview
     /// without paying for the full segment fetch on every row.

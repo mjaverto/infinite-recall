@@ -134,7 +134,7 @@ actor ConversationSummaryBackfillService {
         let mode = autonomous ? "autonomous" : "live"
         let outcome = try await process(row: row, mode: mode, autonomous: autonomous)
         switch outcome {
-        case .summarized, .placeholder:
+        case .summarized, .placeholder, .discarded:
             // Done: ack happens at the caller (Agent B's drain loop) or the
             // immediate-path entry point.
             return
@@ -198,6 +198,59 @@ actor ConversationSummaryBackfillService {
         log("ConversationSummaryBackfillService: marked backfill needed (\(reason))")
     }
 
+    /// One-time sweep: convert pre-existing "Short Recording" placeholder
+    /// sessions into discarded/empty rows so the conversations list stops
+    /// showing legacy noise from the old short-transcript path. Idempotent
+    /// via the `irEmptyShortRecordingBackfillCompletedV1` UserDefaults flag —
+    /// safe to call on every launch.
+    func backfillDiscardEmptyShortRecordingsOnce() async {
+        let flagKey = "irEmptyShortRecordingBackfillCompletedV1"
+        guard !UserDefaults.standard.bool(forKey: flagKey) else {
+            return
+        }
+
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            log("ConversationSummaryBackfillService: discard-empty backfill skipped — database not initialized")
+            return
+        }
+
+        let sql = """
+            SELECT id FROM transcription_sessions
+             WHERE deleted = 0
+               AND summary_state = 'unavailable'
+               AND title = 'Short Recording'
+            """
+
+        let ids: [Int64]
+        do {
+            ids = try await dbQueue.read { db in
+                try Int64.fetchAll(db, sql: sql)
+            }
+        } catch {
+            logError("ConversationSummaryBackfillService: discard-empty backfill query failed", error: error)
+            return
+        }
+
+        log("ConversationSummaryBackfillService: discard-empty backfill starting — \(ids.count) candidate row(s)")
+
+        var failures = 0
+        for id in ids {
+            do {
+                try await TranscriptionStorage.shared.discardEmptySession(id: id, reason: "backfill_short_recording")
+            } catch {
+                failures += 1
+                logError("ConversationSummaryBackfillService: discard-empty backfill failed for session \(id)", error: error)
+            }
+        }
+
+        if failures == 0 {
+            UserDefaults.standard.set(true, forKey: flagKey)
+            log("ConversationSummaryBackfillService: discard-empty backfill complete — processed \(ids.count) row(s)")
+        } else {
+            log("ConversationSummaryBackfillService: discard-empty backfill partial — \(ids.count - failures) ok, \(failures) failed; will retry next launch")
+        }
+    }
+
     /// Summarize one just-finished session immediately when conditions are
     /// safe; otherwise durably enqueue for the autonomous drain. Always
     /// enqueues a durable record first so nothing is lost.
@@ -251,7 +304,7 @@ actor ConversationSummaryBackfillService {
                 totalProcessed += 1
                 // Throttle: give the LLM server a brief breather.
                 try await Task.sleep(nanoseconds: Self.throttleNanoseconds)
-            case .placeholder:
+            case .placeholder, .discarded:
                 continue
             case .deferred:
                 // Do not spin forever on the same row if the local LLM is
@@ -278,6 +331,7 @@ actor ConversationSummaryBackfillService {
     private enum ProcessOutcome {
         case summarized
         case placeholder
+        case discarded
         case deferred
     }
 
@@ -285,12 +339,14 @@ actor ConversationSummaryBackfillService {
         let sessionId = row.id
         let transcript = row.transcript
 
-        // Short transcript → write a placeholder so we don't keep re-queueing.
+        // Short transcript → discard the empty session entirely instead of
+        // writing a "Short Recording" placeholder. Empty short recordings
+        // are noise in the conversations list; surface them as deleted.
         guard transcript.count >= Self.minTranscriptLength else {
-            log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), writing short-recording placeholder (\(mode))")
-            try await writeShortRecordingPlaceholder(sessionId: sessionId)
+            log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), discarding empty session (\(mode))")
+            try await TranscriptionStorage.shared.discardEmptySession(id: sessionId, reason: "short_transcript")
             await notifyConversationListNeedsRefresh()
-            return .placeholder
+            return .discarded
         }
 
         // Ambient/non-speech fallback: long enough to look real but mostly
@@ -473,18 +529,6 @@ actor ConversationSummaryBackfillService {
             .loadAssembled(sessionId: sessionId, dbQueue: dbQueue) ?? ""
 
         return PendingSession(id: sessionId, transcript: transcript)
-    }
-
-    /// Write a non-empty sentinel back for a session whose transcript is too
-    /// short to summarize, so it won't be re-queried.
-    private func writeShortRecordingPlaceholder(sessionId: Int64) async throws {
-        try await writePlaceholder(
-            sessionId: sessionId,
-            title: "Short Recording",
-            overview: "",
-            emoji: "🎙",
-            category: "other"
-        )
     }
 
     /// Write the structured Ambient Audio placeholder defined in the contract:
