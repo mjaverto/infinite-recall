@@ -110,7 +110,7 @@ public enum WorkLabels {
         guard let dict = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
             return nil
         }
-        for key in ["id", "conversation_id", "transcript_id", "source_id"] {
+        for key in ["id", "session_id", "conversation_id", "transcript_id", "source_id"] {
             if let v = dict[key] as? Int { return String(v) }
             if let v = dict[key] as? NSNumber { return v.stringValue }
             if let v = dict[key] as? String, !v.isEmpty { return v }

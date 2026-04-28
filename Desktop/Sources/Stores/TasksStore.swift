@@ -186,6 +186,17 @@ class TasksStore: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // PowerWorkBridge inserts conversation-derived tasks via
+        // ActionItemStorage.shared.insertLocalActionItem when an
+        // .extractActionItems job completes — those rows bypass the API path
+        // so refreshTasksIfNeeded's API->cache reload doesn't surface them.
+        // Reload directly from the local cache instead.
+        NotificationCenter.default.publisher(for: .actionItemsListNeedsRefresh)
+            .sink { [weak self] _ in
+                Task { await self?.reloadFromLocalCache() }
+            }
+            .store(in: &cancellables)
+
     }
 
     /// Refresh tasks if already loaded (for auto-refresh)
