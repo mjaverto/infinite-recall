@@ -780,12 +780,11 @@ final class PowerWorkBridge {
 
     // MARK: - Extract Action Items handler
 
-    /// Maximum transcript length (chars) sent to the LLM for action-item
-    /// extraction. Mirrors `ConversationSummaryBackfillService.maxTranscriptLength`.
-    fileprivate static let extractActionItemsMaxTranscriptLength = 6000
-
-    /// Minimum transcript length (chars) before bothering with extraction.
-    fileprivate static let extractActionItemsMinTranscriptLength = 30
+    // Note: transcript length thresholds live on `ConversationTranscriptLoader`
+    // (single source of truth shared with `ConversationSummaryBackfillService`).
+    // Use `ConversationTranscriptLoader.minTranscriptLength` /
+    // `.maxTranscriptLength` directly here so a future tuning change to those
+    // constants applies to both summary + action-item paths in lock-step.
 
     /// Decode an `.extractActionItems` payload (`{"session_id": Int64}`),
     /// load the transcript, run the LLM, and persist any extracted items via
@@ -855,36 +854,18 @@ final class PowerWorkBridge {
     /// session extracted. Throws on retryable failure (LLM unreachable, JSON
     /// parse failure) so PendingWork retry/backoff takes over.
     fileprivate static func processExtractActionItems(sessionId: Int64) async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            throw NSError(domain: "PowerWorkBridge", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Database not initialized for extractActionItems"
-            ])
-        }
+        // Use the shared loader so the segment SQL + WhisperKit token-strip
+        // stays in lock-step with `ConversationSummaryBackfillService`.
+        let transcript = (try await ConversationTranscriptLoader.loadAssembled(sessionId: sessionId)) ?? ""
 
-        // Assemble the transcript from segments — same WhisperKit-token
-        // stripping pattern used by ConversationSummaryBackfillService.
-        let segmentSQL = """
-            SELECT text FROM transcription_segments
-             WHERE sessionId = ?
-             ORDER BY segmentOrder ASC
-            """
-        let rawTexts: [String] = try await dbQueue.read { db in
-            try String.fetchAll(db, sql: segmentSQL, arguments: [sessionId])
-        }
-        let transcript = rawTexts
-            .map { $0.replacingOccurrences(of: #"<\|[^|>]+\|>"#, with: "", options: .regularExpression)
-                      .trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-
-        if transcript.count < extractActionItemsMinTranscriptLength {
+        if transcript.count < ConversationTranscriptLoader.minTranscriptLength {
             log("PowerWorkBridge: .extractActionItems — session \(sessionId) transcript too short (\(transcript.count) chars), marking extracted")
             try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
             return
         }
 
-        let truncated = transcript.count > extractActionItemsMaxTranscriptLength
-            ? String(transcript.prefix(extractActionItemsMaxTranscriptLength)) + "..."
+        let truncated = transcript.count > ConversationTranscriptLoader.maxTranscriptLength
+            ? String(transcript.prefix(ConversationTranscriptLoader.maxTranscriptLength)) + "..."
             : transcript
 
         let systemPrompt = """
