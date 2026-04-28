@@ -852,15 +852,57 @@ final class PowerWorkBridge {
 
     /// Production processor: load transcript, call LLM, insert items, mark
     /// session extracted. Throws on retryable failure (LLM unreachable, JSON
-    /// parse failure) so PendingWork retry/backoff takes over.
+    /// parse failure, partial-insert failure) so PendingWork retry/backoff
+    /// takes over.
     fileprivate static func processExtractActionItems(sessionId: Int64) async throws {
-        // Use the shared loader so the segment SQL + WhisperKit token-strip
-        // stays in lock-step with `ConversationSummaryBackfillService`.
-        let transcript = (try await ConversationTranscriptLoader.loadAssembled(sessionId: sessionId)) ?? ""
+        try await _processExtractActionItems(
+            sessionId: sessionId,
+            loadTranscript: { id in
+                try await ConversationTranscriptLoader.loadAssembled(sessionId: id)
+            },
+            extractItems: { transcript, id in
+                try await callExtractActionItemsLLM(truncated: transcript, sessionId: id)
+            },
+            insert: { record in
+                _ = try await ActionItemStorage.shared.insertLocalActionItem(record)
+            },
+            markExtracted: { id in
+                try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: id)
+            }
+        )
+    }
+
+    /// Testable seam: same body as `processExtractActionItems` but with all
+    /// side-effecting collaborators (transcript load, LLM call, insert, mark)
+    /// injected so tests can drive each branch (all-success, mid-loop
+    /// failure, all-fail, short-transcript, empty-result) without touching
+    /// the real DB or LLM.
+    ///
+    /// `loadTranscript` returns the assembled transcript (may be nil/empty —
+    /// short-transcript branch handles both as "too short").
+    /// `extractItems` runs the LLM on a (truncated) transcript and returns
+    /// the decoded array; throws on parse / I/O failure so the whole job
+    /// retries. Returns an empty array on a successful "no items" response.
+    static func _processExtractActionItems(
+        sessionId: Int64,
+        loadTranscript: (Int64) async throws -> String?,
+        extractItems: (String, Int64) async throws -> [LLMActionItem],
+        insert: (ActionItemRecord) async throws -> Void,
+        markExtracted: (Int64) async throws -> Void
+    ) async throws {
+        let transcript = (try await loadTranscript(sessionId)) ?? ""
 
         if transcript.count < ConversationTranscriptLoader.minTranscriptLength {
             log("PowerWorkBridge: .extractActionItems — session \(sessionId) transcript too short (\(transcript.count) chars), marking extracted")
-            try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
+            // FIX 7: don't propagate mark-failure here. The LLM didn't run, so
+            // re-throwing only buys us another drain re-checking the same
+            // too-short transcript. Eligibility query naturally re-picks the
+            // row next launch if it's still unmarked.
+            do {
+                try await markExtracted(sessionId)
+            } catch {
+                logError("PowerWorkBridge: .extractActionItems — markSessionExtracted failed for short-transcript session \(sessionId); ack-ing anyway", error: error)
+            }
             return
         }
 
@@ -868,6 +910,95 @@ final class PowerWorkBridge {
             ? String(transcript.prefix(ConversationTranscriptLoader.maxTranscriptLength)) + "..."
             : transcript
 
+        let decoded: [LLMActionItem] = try await extractItems(truncated, sessionId)
+
+        if decoded.isEmpty {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) yielded zero items, marking extracted")
+            // FIX 7: same rationale as the short-transcript branch — the LLM
+            // already ran and returned an empty result. If markSessionExtracted
+            // fails, the eligibility query will pick the session back up next
+            // launch; re-throwing here only burns another LLM call right now.
+            do {
+                try await markExtracted(sessionId)
+            } catch {
+                logError("PowerWorkBridge: .extractActionItems — markSessionExtracted failed for empty-result session \(sessionId); ack-ing anyway", error: error)
+            }
+            return
+        }
+
+        // Insert-then-mark is NOT atomic. Track per-item failures and bail
+        // BEFORE marking the session done if any insert threw — otherwise
+        // a partial-failure would silently lose those items forever (the
+        // eligibility query excludes "extracted" sessions, no recovery).
+        //
+        // TODO: insert is not idempotent on retry — there's no unique
+        // constraint on (conversationId, description). A retry after
+        // mid-loop failure can re-insert items that already landed
+        // successfully. Acceptable trade-off vs. permanent silent loss; a
+        // follow-up should add a `(conversationId, hash(description))`
+        // upsert.
+        let validPriorities: Set<String> = ["high", "medium", "low"]
+        var inserted = 0
+        var anyInsertFailed = false
+        var firstFailure: Error?
+        for item in decoded {
+            let description = item.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !description.isEmpty else { continue }
+
+            let priority: String? = {
+                guard let p = item.priority?.lowercased() else { return nil }
+                return validPriorities.contains(p) ? p : nil
+            }()
+
+            let tagsJson: String? = {
+                guard let tags = item.tags, !tags.isEmpty else { return nil }
+                guard let data = try? JSONEncoder().encode(tags),
+                      let json = String(data: data, encoding: .utf8) else { return nil }
+                return json
+            }()
+
+            let record = ActionItemRecord(
+                description: description,
+                source: "conversation",
+                conversationId: String(sessionId),
+                priority: priority,
+                category: item.category,
+                tagsJson: tagsJson,
+                dueAt: item.dueAt,
+                fromStaged: false
+            )
+            do {
+                try await insert(record)
+                inserted += 1
+            } catch {
+                anyInsertFailed = true
+                if firstFailure == nil { firstFailure = error }
+                logError("PowerWorkBridge: .extractActionItems — insert failed for session \(sessionId) (will retry whole job)", error: error)
+            }
+        }
+
+        if anyInsertFailed {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) before failure; re-throwing so PendingWork can retry (NOT marking extracted)")
+            throw firstFailure ?? NSError(domain: "PowerWorkBridge", code: 8, userInfo: [
+                NSLocalizedDescriptionKey: "extractActionItems: at least one insert failed for session \(sessionId)"
+            ])
+        }
+
+        try await markExtracted(sessionId)
+        log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) item(s)")
+    }
+
+    /// Runs the action-item extraction LLM call against `LLMBridge` and
+    /// decodes the envelope. Throws on nil result, non-UTF-8 bytes, or JSON
+    /// parse failure so the calling job retries via PendingWork backoff.
+    ///
+    /// Extracted from `_processExtractActionItems` so the seam can stub the
+    /// LLM out in tests while the production path still routes through this
+    /// single function.
+    fileprivate static func callExtractActionItemsLLM(
+        truncated: String,
+        sessionId: Int64
+    ) async throws -> [LLMActionItem] {
         // LLMBridge.generateJSON appends a stock instruction telling the model
         // to "respond ONLY with a single valid JSON object". Asking for a bare
         // array on top of that contradicts the augment and noticeably trips
@@ -914,59 +1045,13 @@ final class PowerWorkBridge {
             ])
         }
 
-        let decoded: [LLMActionItem]
         do {
-            decoded = try JSONDecoder.iso8601().decode(LLMActionItemEnvelope.self, from: data).items
+            return try JSONDecoder.iso8601().decode(LLMActionItemEnvelope.self, from: data).items
         } catch {
             let snippet = String(raw.prefix(500))
             logError("PowerWorkBridge: .extractActionItems — JSON parse failed for session \(sessionId); raw (first 500): \(snippet)", error: error)
             throw error
         }
-
-        if decoded.isEmpty {
-            log("PowerWorkBridge: .extractActionItems — session \(sessionId) yielded zero items, marking extracted")
-            try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
-            return
-        }
-
-        let validPriorities: Set<String> = ["high", "medium", "low"]
-        var inserted = 0
-        for item in decoded {
-            let description = item.description.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !description.isEmpty else { continue }
-
-            let priority: String? = {
-                guard let p = item.priority?.lowercased() else { return nil }
-                return validPriorities.contains(p) ? p : nil
-            }()
-
-            let tagsJson: String? = {
-                guard let tags = item.tags, !tags.isEmpty else { return nil }
-                guard let data = try? JSONEncoder().encode(tags),
-                      let json = String(data: data, encoding: .utf8) else { return nil }
-                return json
-            }()
-
-            let record = ActionItemRecord(
-                description: description,
-                source: "conversation",
-                conversationId: String(sessionId),
-                priority: priority,
-                category: item.category,
-                tagsJson: tagsJson,
-                dueAt: item.dueAt,
-                fromStaged: false
-            )
-            do {
-                _ = try await ActionItemStorage.shared.insertLocalActionItem(record)
-                inserted += 1
-            } catch {
-                logError("PowerWorkBridge: .extractActionItems — insert failed for session \(sessionId)", error: error)
-            }
-        }
-
-        try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
-        log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) item(s)")
     }
 
     /// Envelope wrapping the array of extracted action items. Required
@@ -975,17 +1060,33 @@ final class PowerWorkBridge {
     /// array would contradict that. Adapter pattern: only this caller needs
     /// the envelope, so we keep the bridge contract uniform across callers
     /// and unwrap inside the decode here.
-    private struct LLMActionItemEnvelope: Decodable {
+    struct LLMActionItemEnvelope: Decodable {
         let items: [LLMActionItem]
     }
 
-    /// Codable mirror for the LLM's per-item response.
-    private struct LLMActionItem: Decodable {
+    /// Codable mirror for the LLM's per-item response. Internal (not
+    /// `private`) so the testable seam `_processExtractActionItems` can
+    /// surface this type to test stubs.
+    struct LLMActionItem: Decodable {
         let description: String
         let priority: String?
         let dueAt: Date?
         let category: String?
         let tags: [String]?
+
+        init(
+            description: String,
+            priority: String? = nil,
+            dueAt: Date? = nil,
+            category: String? = nil,
+            tags: [String]? = nil
+        ) {
+            self.description = description
+            self.priority = priority
+            self.dueAt = dueAt
+            self.category = category
+            self.tags = tags
+        }
     }
 
     /// Dead-letter for `.extractActionItems`: mark the session extracted so

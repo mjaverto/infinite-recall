@@ -161,25 +161,188 @@ final class PowerWorkBridgeTests: XCTestCase {
         XCTAssertEqual(notifyCallCount, 0, "notify must not fire when processor throws")
     }
 
-    /// Empty-result happy path: the processor returns normally (its real
-    /// implementation marks the session extracted and inserts nothing). The
-    /// seam still calls notify so SwiftUI observers can dismiss any pending
-    /// badge for the session.
-    func test_handleExtractActionItemsPayload_processorEmptyResult_callsNotify() async throws {
-        let payload = try JSONEncoder().encode(
-            ConversationActionItemsBackfillService.PendingPayload(session_id: 88)
+    // FIX 3: removed `test_handleExtractActionItemsPayload_processorEmptyResult_callsNotify` —
+    // it was functionally identical to the success test (the seam can't
+    // observe "empty result" vs "success-with-items"; that branching lives
+    // inside the real processor). Empty-vs-populated branches are covered
+    // against `_processExtractActionItems` below where the seams actually
+    // exist.
+
+    // MARK: - _processExtractActionItems (atomicity + per-item failures)
+
+    /// Cases under test:
+    ///   (a) all inserts succeed → markExtracted called once, no throw
+    ///   (b) mid-loop insert throws → loop completes attempts, markExtracted
+    ///       NOT called, error re-thrown so PendingWork retries the job
+    ///   (c) single-item failure → same as (b)
+    ///   (d) empty LLM result → markExtracted called, no inserts, no throw
+    ///   (e) short transcript → no LLM call, markExtracted called, no throw
+    ///   (f) markExtracted failure on short branch → swallowed (FIX 7)
+    ///   (g) markExtracted failure on empty-result branch → swallowed (FIX 7)
+
+    private static func makeItem(_ desc: String) -> PowerWorkBridge.LLMActionItem {
+        return PowerWorkBridge.LLMActionItem(description: desc)
+    }
+
+    func test_processExtractActionItems_allInsertsSucceed_marksExtractedOnce() async throws {
+        var inserted: [String] = []
+        var markCallCount = 0
+
+        try await PowerWorkBridge._processExtractActionItems(
+            sessionId: 1,
+            loadTranscript: { _ in String(repeating: "x", count: 200) },
+            extractItems: { _, _ in [Self.makeItem("a"), Self.makeItem("b")] },
+            insert: { record in inserted.append(record.description) },
+            markExtracted: { _ in markCallCount += 1 }
         )
 
-        var processorCallCount = 0
-        var notifySeen: Int64?
+        XCTAssertEqual(inserted, ["a", "b"])
+        XCTAssertEqual(markCallCount, 1, "All inserts succeeded → markExtracted exactly once")
+    }
 
-        try await PowerWorkBridge._handleExtractActionItemsPayload(
-            payload,
-            processor: { _ in processorCallCount += 1 },
-            notify: { sid in notifySeen = sid }
+    func test_processExtractActionItems_midLoopInsertFailure_reThrowsAndDoesNotMark() async throws {
+        struct InsertFailure: Error {}
+        var insertAttempts = 0
+        var markCallCount = 0
+
+        do {
+            try await PowerWorkBridge._processExtractActionItems(
+                sessionId: 2,
+                loadTranscript: { _ in String(repeating: "y", count: 200) },
+                extractItems: { _, _ in [Self.makeItem("a"), Self.makeItem("b"), Self.makeItem("c")] },
+                insert: { _ in
+                    insertAttempts += 1
+                    if insertAttempts == 2 { throw InsertFailure() }
+                },
+                markExtracted: { _ in markCallCount += 1 }
+            )
+            XCTFail("Expected re-throw on mid-loop insert failure")
+        } catch is InsertFailure {
+            // expected
+        }
+
+        XCTAssertEqual(insertAttempts, 3, "Loop must keep going after mid-failure to attempt every item")
+        XCTAssertEqual(markCallCount, 0, "markExtracted MUST NOT fire when any insert failed")
+    }
+
+    func test_processExtractActionItems_singleItemFailure_reThrowsAndDoesNotMark() async throws {
+        struct InsertFailure: Error {}
+        var markCallCount = 0
+
+        do {
+            try await PowerWorkBridge._processExtractActionItems(
+                sessionId: 3,
+                loadTranscript: { _ in String(repeating: "z", count: 200) },
+                extractItems: { _, _ in [Self.makeItem("only")] },
+                insert: { _ in throw InsertFailure() },
+                markExtracted: { _ in markCallCount += 1 }
+            )
+            XCTFail("Expected re-throw on lone insert failure")
+        } catch is InsertFailure {
+            // expected
+        }
+
+        XCTAssertEqual(markCallCount, 0)
+    }
+
+    func test_processExtractActionItems_emptyLLMResult_marksExtractedNoInserts() async throws {
+        var insertCount = 0
+        var markCallCount = 0
+
+        try await PowerWorkBridge._processExtractActionItems(
+            sessionId: 4,
+            loadTranscript: { _ in String(repeating: "k", count: 200) },
+            extractItems: { _, _ in [] },
+            insert: { _ in insertCount += 1 },
+            markExtracted: { _ in markCallCount += 1 }
         )
 
-        XCTAssertEqual(processorCallCount, 1, "processor must be called even when it would insert zero items")
-        XCTAssertEqual(notifySeen, 88, "notify must fire on the empty-result success path")
+        XCTAssertEqual(insertCount, 0)
+        XCTAssertEqual(markCallCount, 1)
+    }
+
+    func test_processExtractActionItems_shortTranscript_skipsLLMAndMarksExtracted() async throws {
+        var llmCallCount = 0
+        var insertCount = 0
+        var markCallCount = 0
+
+        try await PowerWorkBridge._processExtractActionItems(
+            sessionId: 5,
+            loadTranscript: { _ in "tiny" },  // < minTranscriptLength
+            extractItems: { _, _ in
+                llmCallCount += 1
+                return []
+            },
+            insert: { _ in insertCount += 1 },
+            markExtracted: { _ in markCallCount += 1 }
+        )
+
+        XCTAssertEqual(llmCallCount, 0, "LLM must not be called on short transcript")
+        XCTAssertEqual(insertCount, 0)
+        XCTAssertEqual(markCallCount, 1, "Short branch still marks the session so it stops re-qualifying")
+    }
+
+    /// FIX 7: short-branch markExtracted failure must NOT propagate. The LLM
+    /// didn't run, so re-throwing only burns the next drain re-checking the
+    /// same too-short transcript. Eligibility query naturally re-picks the
+    /// row next launch if it stays unmarked.
+    func test_processExtractActionItems_shortTranscript_swallowsMarkFailure() async throws {
+        struct MarkFailure: Error {}
+
+        do {
+            try await PowerWorkBridge._processExtractActionItems(
+                sessionId: 6,
+                loadTranscript: { _ in "tiny" },
+                extractItems: { _, _ in [] },
+                insert: { _ in },
+                markExtracted: { _ in throw MarkFailure() }
+            )
+        } catch {
+            XCTFail("Short-transcript branch must swallow markExtracted failure, got \(error)")
+        }
+    }
+
+    /// FIX 7: empty-result branch markExtracted failure must NOT propagate.
+    /// The LLM already ran and returned an empty result. Re-throwing burns
+    /// another LLM call; the eligibility query handles recovery.
+    func test_processExtractActionItems_emptyResult_swallowsMarkFailure() async throws {
+        struct MarkFailure: Error {}
+
+        do {
+            try await PowerWorkBridge._processExtractActionItems(
+                sessionId: 7,
+                loadTranscript: { _ in String(repeating: "p", count: 200) },
+                extractItems: { _, _ in [] },
+                insert: { _ in },
+                markExtracted: { _ in throw MarkFailure() }
+            )
+        } catch {
+            XCTFail("Empty-result branch must swallow markExtracted failure, got \(error)")
+        }
+    }
+
+    /// Populated branch: a markExtracted failure DOES propagate (opposite
+    /// policy from short/empty branches). Inserts have user-visible
+    /// consequences — losing the mark means the eligibility query picks the
+    /// session up next launch and re-runs the LLM, but at least the items
+    /// already in the local DB are preserved.
+    func test_processExtractActionItems_populated_propagatesMarkFailure() async throws {
+        struct MarkFailure: Error {}
+        var insertCount = 0
+
+        do {
+            try await PowerWorkBridge._processExtractActionItems(
+                sessionId: 8,
+                loadTranscript: { _ in String(repeating: "q", count: 200) },
+                extractItems: { _, _ in [Self.makeItem("only")] },
+                insert: { _ in insertCount += 1 },
+                markExtracted: { _ in throw MarkFailure() }
+            )
+            XCTFail("Populated branch must re-throw markExtracted failure")
+        } catch is MarkFailure {
+            // expected
+        }
+
+        XCTAssertEqual(insertCount, 1, "Insert ran before mark failed")
     }
 }
