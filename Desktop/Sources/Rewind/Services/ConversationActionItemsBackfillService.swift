@@ -19,6 +19,12 @@ actor ConversationActionItemsBackfillService {
     /// dedup prefix and the workType in lock-step automatically.
     private static let dedupPrefix: String = "\(PendingWork.Kind.extractActionItems.rawValue):"
 
+    /// Ensures the cold-launch retry only fires once per process. A
+    /// transient DB-not-yet-initialized failure during launch should buy us
+    /// exactly one retry; continued failures should surface in logs, not
+    /// loop forever.
+    private var pendingLaunchRetry = false
+
     private init() {}
 
     struct PendingPayload: Codable {
@@ -66,9 +72,22 @@ actor ConversationActionItemsBackfillService {
     /// Walks finished, non-deleted sessions that have transcript segments and
     /// no `action_items_extracted_at` yet, and enqueues each. Idempotent —
     /// re-running is a no-op once the queue has caught up.
+    ///
+    /// On cold launch the database may not be ready yet (TierManager and
+    /// other services race the first `initialize()` call) — `fetchEligibleSessionIds`
+    /// throws, and historically that was swallowed with a generic info-level
+    /// log. Net effect: backfill silently skipped until next launch.
+    ///
+    /// FIX 8: surface the underlying error via `logError` (grep-able in
+    /// `/private/tmp/omi-dev.log`) and schedule a single 5-second retry. The
+    /// `pendingLaunchRetry` flag bounds it to one extra attempt per process.
     func enqueueHistoricalActionItemsIfNeeded(reason: String) async {
         do {
             let sessionIds = try await fetchEligibleSessionIds()
+            // Successful query — we're past the cold-launch window. Reset
+            // the retry guard so a later transient failure (e.g. DB
+            // recovery flow) can buy us one more retry.
+            pendingLaunchRetry = false
             guard !sessionIds.isEmpty else {
                 log("ConversationActionItemsBackfillService: no historical extractions needed (\(reason))")
                 return
@@ -79,6 +98,29 @@ actor ConversationActionItemsBackfillService {
             }
         } catch {
             logError("ConversationActionItemsBackfillService: enqueueHistoricalActionItemsIfNeeded failed (\(reason))", error: error)
+            await scheduleLaunchRetryIfNeeded(originalReason: reason)
+        }
+    }
+
+    /// Schedules exactly one delayed retry of `enqueueHistoricalActionItemsIfNeeded`
+    /// after a transient failure. The retry happens after 5 seconds, which
+    /// is enough for `RewindDatabase.initialize()` to complete in the
+    /// typical cold-launch race. Subsequent failures fall through to the
+    /// next launch — we don't loop forever.
+    private func scheduleLaunchRetryIfNeeded(originalReason: String) async {
+        guard !pendingLaunchRetry else {
+            log("ConversationActionItemsBackfillService: launch retry already scheduled, skipping (\(originalReason))")
+            return
+        }
+        pendingLaunchRetry = true
+        log("ConversationActionItemsBackfillService: scheduling 5s launch-retry of enqueueHistoricalActionItemsIfNeeded (\(originalReason))")
+
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self else { return }
+            await self.enqueueHistoricalActionItemsIfNeeded(
+                reason: "retry-after-fetch-failure:\(originalReason)"
+            )
         }
     }
 
