@@ -502,6 +502,10 @@ public final class BatteryAwareScheduler: ObservableObject {
         }
         // === /activity:G ===
       } catch {
+        logError(
+          "BatteryAwareScheduler: handler threw for \(work.kind.rawValue) id=\(storageId)",
+          error: error
+        )
         try? await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
         // === activity:G ===
         self.inFlight[work.kind] = nil

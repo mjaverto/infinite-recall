@@ -58,10 +58,29 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
         }
     }
 
+    /// Purge any leftover rows this test class has written to the real
+    /// `pending_work` table. Without this, `failed` and `dead` rows accumulate
+    /// in the developer's production DB and the `BatteryAwareScheduler` drain
+    /// loop later trips on their non-JSON payloads.
+    private func purgeTestRows() async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM pending_work WHERE payload LIKE 'delegate-test-%'"
+            )
+        }
+    }
+
+    override func setUp() async throws {
+        try await super.setUp()
+        try await purgeTestRows()
+    }
+
     override func tearDown() async throws {
         // Always clear the delegate so the singleton doesn't carry a stale
         // reference into the next test class.
         await PendingWorkStorage.shared.setDelegate(nil)
+        try await purgeTestRows()
         try await super.tearDown()
     }
 
