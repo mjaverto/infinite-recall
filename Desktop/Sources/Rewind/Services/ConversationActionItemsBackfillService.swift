@@ -15,7 +15,9 @@ actor ConversationActionItemsBackfillService {
     static let shared = ConversationActionItemsBackfillService()
 
     private static let workType: String = PendingWork.Kind.extractActionItems.rawValue
-    private static let dedupPrefix: String = "extractActionItems:"
+    /// Derived from `workType` so a future `PendingWork.Kind` rename keeps the
+    /// dedup prefix and the workType in lock-step automatically.
+    private static let dedupPrefix: String = "\(PendingWork.Kind.extractActionItems.rawValue):"
 
     private init() {}
 
@@ -125,6 +127,12 @@ actor ConversationActionItemsBackfillService {
         // key so a successful drain doesn't re-qualify on every launch.
         // `failed` rows are intentionally INCLUDED so launch backfill retries
         // permanently-failed sessions.
+        //
+        // Interpolation safe: `workType` and `dedupPrefix` are compile-time
+        // constants derived from `PendingWork.Kind.extractActionItems.rawValue`,
+        // not user input. Using interpolation here (rather than a hardcoded
+        // 'extractActionItems' literal) keeps a future enum rename from
+        // silently breaking dedup.
         let sql = """
             SELECT s.id FROM transcription_sessions AS s
              WHERE s.finishedAt IS NOT NULL
@@ -138,7 +146,7 @@ actor ConversationActionItemsBackfillService {
                )
                AND NOT EXISTS (
                    SELECT 1 FROM pending_work pw
-                    WHERE pw.workType = 'extractActionItems'
+                    WHERE pw.workType = '\(Self.workType)'
                       AND pw.status IN ('queued', 'claimed', 'done')
                       AND pw.dedupKey = '\(Self.dedupPrefix)' || s.id
                )
