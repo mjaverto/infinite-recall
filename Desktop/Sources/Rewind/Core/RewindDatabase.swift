@@ -2501,6 +2501,16 @@ actor RewindDatabase {
             }
         }
 
+        // Migration 50: Idempotency column for `.extractActionItems` pipeline.
+        // Set on success by `ConversationActionItemsBackfillService.markSessionExtracted`;
+        // eligibility query excludes non-null. Nullable so a user "clear + re-extract"
+        // workflow can re-qualify a session.
+        migrator.registerMigration("addActionItemsExtractedAt") { db in
+            try db.alter(table: "transcription_sessions") { t in
+                t.add(column: "action_items_extracted_at", .datetime)
+            }
+        }
+
         try migrator.migrate(queue)
     }
 

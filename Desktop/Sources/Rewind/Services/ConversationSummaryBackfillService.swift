@@ -37,9 +37,12 @@ actor ConversationSummaryBackfillService {
     /// Nanoseconds to sleep between individual LLM calls (~1 s).
     private static let throttleNanoseconds: UInt64 = 1_000_000_000
     /// Minimum total transcript length (chars) to bother summarizing.
-    private static let minTranscriptLength = 30
+    /// Aliased to `ConversationTranscriptLoader.minTranscriptLength` so summary
+    /// + extractActionItems share one source of truth.
+    private static let minTranscriptLength = ConversationTranscriptLoader.minTranscriptLength
     /// Maximum transcript length (chars) sent to the LLM.
-    private static let maxTranscriptLength = 6000
+    /// Aliased to `ConversationTranscriptLoader.maxTranscriptLength`.
+    private static let maxTranscriptLength = ConversationTranscriptLoader.maxTranscriptLength
     /// How many consecutive empty queries before we declare completion.
     private static let emptyBatchTerminationCount = 3
 
@@ -311,6 +314,13 @@ actor ConversationSummaryBackfillService {
         log("ConversationSummaryBackfillService: session \(sessionId) → \"\(structured.title)\" (\(mode))")
         await notifyConversationListNeedsRefresh()
 
+        // Now that the session has a usable summary (i.e. transcript + LLM
+        // both succeeded), enqueue the action-items extraction. Producing on
+        // summary-success — not transcript-finish — avoids double-extracting
+        // and racing transcript materialization.
+        await ConversationActionItemsBackfillService.shared
+            .enqueueActionItemsIfNeeded(sessionId: sessionId, reason: "post-summary:\(mode)")
+
         // Fire-and-forget: now that the conversation has its final title +
         // overview, hand it off to the local-integration outbox. This is the
         // unambiguous "conversation finished" moment in the local-first fork
@@ -458,20 +468,9 @@ actor ConversationSummaryBackfillService {
         }
 
         // Assemble transcript from segments, stripping WhisperKit tokens.
-        let segmentSQL = """
-            SELECT text FROM transcription_segments
-             WHERE sessionId = ?
-             ORDER BY segmentOrder ASC
-            """
-        let rawTexts: [String] = try await dbQueue.read { db in
-            try String.fetchAll(db, sql: segmentSQL, arguments: [sessionId])
-        }
-
-        let transcript = rawTexts
-            .map { $0.replacingOccurrences(of: #"<\|[^|>]+\|>"#, with: "", options: .regularExpression)
-                      .trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
+        // Single source of truth: `ConversationTranscriptLoader`.
+        let transcript = try await ConversationTranscriptLoader
+            .loadAssembled(sessionId: sessionId, dbQueue: dbQueue) ?? ""
 
         return PendingSession(id: sessionId, transcript: transcript)
     }

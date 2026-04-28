@@ -72,6 +72,15 @@ final class PowerWorkBridge {
             try await PowerWorkBridge.handleExtractKG(work)
         }
 
+        // .extractActionItems — pull task-shaped items from a finished
+        // conversation's transcript. Decodes `{"session_id": Int64}` and
+        // routes through `LLMBridge.generateJSON` (NOT `chatAutonomous`):
+        // this kind only requires `allowHeavyWork`, so the user may still be
+        // active and Memory Saver must be allowed to keep the model warm.
+        BatteryAwareScheduler.shared.registerHandler(for: .extractActionItems) { work in
+            try await PowerWorkBridge.handleExtractActionItems(work)
+        }
+
         // Start the periodic sweeper that reclaims expired leases and GCs old rows.
         PendingWorkSweeper.shared.start()
 
@@ -104,9 +113,11 @@ final class PowerWorkBridge {
                 .enqueueHistoricalSummariesIfNeeded(reason: "launch")
             await ConversationTranscribeBackfillService.shared
                 .enqueueHistoricalTranscribesIfNeeded(reason: "launch")
+            await ConversationActionItemsBackfillService.shared
+                .enqueueHistoricalActionItemsIfNeeded(reason: "launch")
         }
 
-        log("PowerWorkBridge: Started — registered .transcribe, .ocr, .summarize, and .extractKG handlers")
+        log("PowerWorkBridge: Started — registered .transcribe, .ocr, .summarize, .extractKG, and .extractActionItems handlers")
     }
 
     // MARK: - Dead-letter handler
@@ -123,6 +134,8 @@ final class PowerWorkBridge {
             await handleDeadLetterSummarize(payload: payload)
         case PendingWork.Kind.extractKG.rawValue:
             await handleDeadLetterExtractKG(payload: payload)
+        case PendingWork.Kind.extractActionItems.rawValue:
+            await handleDeadLetterExtractActionItems(payload: payload)
         default:
             return
         }
@@ -763,6 +776,348 @@ final class PowerWorkBridge {
         await KGProgressPublisher.shared.tick()
 
         log("PowerWorkBridge: .extractKG — memory \(realId) outcome=\(extraction.outcome) in \(String(format: "%.2f", drainDuration))s")
+    }
+
+    // MARK: - Extract Action Items handler
+
+    // Note: transcript length thresholds live on `ConversationTranscriptLoader`
+    // (single source of truth shared with `ConversationSummaryBackfillService`).
+    // Use `ConversationTranscriptLoader.minTranscriptLength` /
+    // `.maxTranscriptLength` directly here so a future tuning change to those
+    // constants applies to both summary + action-item paths in lock-step.
+
+    /// Decode an `.extractActionItems` payload (`{"session_id": Int64}`),
+    /// load the transcript, run the LLM, and persist any extracted items via
+    /// `ActionItemStorage.shared.insertLocalActionItem(...)`.
+    ///
+    /// LLM path uses `LLMBridge.generateJSON` (NOT `chatAutonomous`): this
+    /// kind only requires `allowHeavyWork`, so the user may still be active
+    /// and Memory Saver must be allowed to track the call.
+    ///
+    /// Outcome routing:
+    /// - Undecodable payload → log + ack (return). Mirrors `.summarize`.
+    /// - Empty/short transcript → mark extracted + ack (no insert).
+    /// - LLM returned nil OR JSON parse failure → throw (lets PendingWork retry).
+    /// - Successful empty array `[]` → mark extracted + ack.
+    /// - Successful items → insert each + mark extracted + post refresh.
+    fileprivate static func handleExtractActionItems(_ work: PendingWork) async throws {
+        try await _handleExtractActionItemsPayload(
+            work.payload,
+            processor: { sessionId in
+                try await processExtractActionItems(sessionId: sessionId)
+            },
+            notify: { sessionId in
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: .actionItemsListNeedsRefresh,
+                        object: nil,
+                        userInfo: ["session_id": sessionId]
+                    )
+                }
+            }
+        )
+    }
+
+    /// Testable seam for `handleExtractActionItems`. Same contract as
+    /// `_handleSummarizePayload`: undecodable payload → no throw, no notify,
+    /// no processor call; processor throw → re-thrown, no notify; success →
+    /// notify called.
+    static func _handleExtractActionItemsPayload(
+        _ payload: Data,
+        processor: (Int64) async throws -> Void,
+        notify: (Int64) async -> Void
+    ) async throws {
+        struct Payload: Decodable {
+            let session_id: Int64
+        }
+
+        let sessionId: Int64
+        do {
+            sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
+        } catch {
+            logError("PowerWorkBridge: .extractActionItems payload undecodable, dropping", error: error)
+            return
+        }
+
+        do {
+            try await processor(sessionId)
+        } catch {
+            logError("PowerWorkBridge: .extractActionItems — session \(sessionId) failed (will retry)", error: error)
+            throw error
+        }
+
+        await notify(sessionId)
+        log("PowerWorkBridge: .extractActionItems — session \(sessionId) done")
+    }
+
+    /// Production processor: load transcript, call LLM, insert items, mark
+    /// session extracted. Throws on retryable failure (LLM unreachable, JSON
+    /// parse failure, partial-insert failure) so PendingWork retry/backoff
+    /// takes over.
+    fileprivate static func processExtractActionItems(sessionId: Int64) async throws {
+        try await _processExtractActionItems(
+            sessionId: sessionId,
+            loadTranscript: { id in
+                try await ConversationTranscriptLoader.loadAssembled(sessionId: id)
+            },
+            extractItems: { transcript, id in
+                try await callExtractActionItemsLLM(truncated: transcript, sessionId: id)
+            },
+            insert: { record in
+                _ = try await ActionItemStorage.shared.insertLocalActionItem(record)
+            },
+            markExtracted: { id in
+                try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: id)
+            }
+        )
+    }
+
+    /// Testable seam: same body as `processExtractActionItems` but with all
+    /// side-effecting collaborators (transcript load, LLM call, insert, mark)
+    /// injected so tests can drive each branch (all-success, mid-loop
+    /// failure, all-fail, short-transcript, empty-result) without touching
+    /// the real DB or LLM.
+    ///
+    /// `loadTranscript` returns the assembled transcript (may be nil/empty —
+    /// short-transcript branch handles both as "too short").
+    /// `extractItems` runs the LLM on a (truncated) transcript and returns
+    /// the decoded array; throws on parse / I/O failure so the whole job
+    /// retries. Returns an empty array on a successful "no items" response.
+    static func _processExtractActionItems(
+        sessionId: Int64,
+        loadTranscript: (Int64) async throws -> String?,
+        extractItems: (String, Int64) async throws -> [LLMActionItem],
+        insert: (ActionItemRecord) async throws -> Void,
+        markExtracted: (Int64) async throws -> Void
+    ) async throws {
+        let transcript = (try await loadTranscript(sessionId)) ?? ""
+
+        if transcript.count < ConversationTranscriptLoader.minTranscriptLength {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) transcript too short (\(transcript.count) chars), marking extracted")
+            // FIX 7: don't propagate mark-failure here. The LLM didn't run, so
+            // re-throwing only buys us another drain re-checking the same
+            // too-short transcript. Eligibility query naturally re-picks the
+            // row next launch if it's still unmarked.
+            do {
+                try await markExtracted(sessionId)
+            } catch {
+                logError("PowerWorkBridge: .extractActionItems — markSessionExtracted failed for short-transcript session \(sessionId); ack-ing anyway", error: error)
+            }
+            return
+        }
+
+        let truncated = transcript.count > ConversationTranscriptLoader.maxTranscriptLength
+            ? String(transcript.prefix(ConversationTranscriptLoader.maxTranscriptLength)) + "..."
+            : transcript
+
+        let decoded: [LLMActionItem] = try await extractItems(truncated, sessionId)
+
+        if decoded.isEmpty {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) yielded zero items, marking extracted")
+            // FIX 7: same rationale as the short-transcript branch — the LLM
+            // already ran and returned an empty result. If markSessionExtracted
+            // fails, the eligibility query will pick the session back up next
+            // launch; re-throwing here only burns another LLM call right now.
+            do {
+                try await markExtracted(sessionId)
+            } catch {
+                logError("PowerWorkBridge: .extractActionItems — markSessionExtracted failed for empty-result session \(sessionId); ack-ing anyway", error: error)
+            }
+            return
+        }
+
+        // Insert-then-mark is NOT atomic. Track per-item failures and bail
+        // BEFORE marking the session done if any insert threw — otherwise
+        // a partial-failure would silently lose those items forever (the
+        // eligibility query excludes "extracted" sessions, no recovery).
+        //
+        // TODO: insert is not idempotent on retry — there's no unique
+        // constraint on (conversationId, description). A retry after
+        // mid-loop failure can re-insert items that already landed
+        // successfully. Acceptable trade-off vs. permanent silent loss; a
+        // follow-up should add a `(conversationId, hash(description))`
+        // upsert.
+        let validPriorities: Set<String> = ["high", "medium", "low"]
+        var inserted = 0
+        var anyInsertFailed = false
+        var firstFailure: Error?
+        for item in decoded {
+            let description = item.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !description.isEmpty else { continue }
+
+            let priority: String? = {
+                guard let p = item.priority?.lowercased() else { return nil }
+                return validPriorities.contains(p) ? p : nil
+            }()
+
+            let tagsJson: String? = {
+                guard let tags = item.tags, !tags.isEmpty else { return nil }
+                guard let data = try? JSONEncoder().encode(tags),
+                      let json = String(data: data, encoding: .utf8) else { return nil }
+                return json
+            }()
+
+            let record = ActionItemRecord(
+                description: description,
+                source: "conversation",
+                conversationId: String(sessionId),
+                priority: priority,
+                category: item.category,
+                tagsJson: tagsJson,
+                dueAt: item.dueAt,
+                fromStaged: false
+            )
+            do {
+                try await insert(record)
+                inserted += 1
+            } catch {
+                anyInsertFailed = true
+                if firstFailure == nil { firstFailure = error }
+                logError("PowerWorkBridge: .extractActionItems — insert failed for session \(sessionId) (will retry whole job)", error: error)
+            }
+        }
+
+        if anyInsertFailed {
+            log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) before failure; re-throwing so PendingWork can retry (NOT marking extracted)")
+            throw firstFailure ?? NSError(domain: "PowerWorkBridge", code: 8, userInfo: [
+                NSLocalizedDescriptionKey: "extractActionItems: at least one insert failed for session \(sessionId)"
+            ])
+        }
+
+        try await markExtracted(sessionId)
+        log("PowerWorkBridge: .extractActionItems — session \(sessionId) inserted \(inserted)/\(decoded.count) item(s)")
+    }
+
+    /// Runs the action-item extraction LLM call against `LLMBridge` and
+    /// decodes the envelope. Throws on nil result, non-UTF-8 bytes, or JSON
+    /// parse failure so the calling job retries via PendingWork backoff.
+    ///
+    /// Extracted from `_processExtractActionItems` so the seam can stub the
+    /// LLM out in tests while the production path still routes through this
+    /// single function.
+    fileprivate static func callExtractActionItemsLLM(
+        truncated: String,
+        sessionId: Int64
+    ) async throws -> [LLMActionItem] {
+        // LLMBridge.generateJSON appends a stock instruction telling the model
+        // to "respond ONLY with a single valid JSON object". Asking for a bare
+        // array on top of that contradicts the augment and noticeably trips
+        // the local 4-bit Qwen. So we wrap the array in an envelope object
+        // (`{"items": [...]}`) and decode that. Every other LLMBridge caller
+        // already returns an object — keeping the bridge contract uniform.
+        let systemPrompt = """
+            You are an action-item extractor. Read a conversation transcript and \
+            output a JSON object containing concrete tasks the speakers committed \
+            to. Output ONLY a single valid JSON object of the form \
+            `{"items": [...]}` — no code fences, no prose, no commentary. If the \
+            transcript contains no actionable tasks, output exactly {"items": []}.
+
+            Each element of the "items" array is an object with these fields:
+            - "description": string, required, a concise one-sentence task description \
+              (imperative voice, e.g. "Send the design review notes to Mike")
+            - "priority": string, optional, one of: "high", "medium", "low"
+            - "dueAt": string, optional, an ISO 8601 date-time (UTC, e.g. \
+              "2026-05-01T17:00:00Z") if the speakers named a specific deadline
+            - "category": string, optional, a short category label (e.g. "work", \
+              "personal", "follow-up")
+            - "tags": array of strings, optional, free-form labels
+
+            Be conservative: only emit items the speakers actually committed to doing. \
+            Skip aspirations, rhetorical questions, and hypotheticals.
+            """
+
+        let userPrompt = "Transcript:\n\n\(truncated)"
+        let label = "ConversationActionItemsBackfill[\(sessionId)]"
+
+        guard let raw = await LLMBridge.generateJSON(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt,
+            label: label
+        ) else {
+            throw NSError(domain: "PowerWorkBridge", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "extractActionItems: LLM returned nil for session \(sessionId)"
+            ])
+        }
+
+        guard let data = raw.data(using: .utf8) else {
+            throw NSError(domain: "PowerWorkBridge", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "extractActionItems: response not UTF-8 for session \(sessionId)"
+            ])
+        }
+
+        do {
+            return try JSONDecoder.iso8601().decode(LLMActionItemEnvelope.self, from: data).items
+        } catch {
+            let snippet = String(raw.prefix(500))
+            logError("PowerWorkBridge: .extractActionItems — JSON parse failed for session \(sessionId); raw (first 500): \(snippet)", error: error)
+            throw error
+        }
+    }
+
+    /// Envelope wrapping the array of extracted action items. Required
+    /// because `LLMBridge.generateJSON` appends a "respond ONLY with a single
+    /// valid JSON object" instruction to the prompt — asking for a bare
+    /// array would contradict that. Adapter pattern: only this caller needs
+    /// the envelope, so we keep the bridge contract uniform across callers
+    /// and unwrap inside the decode here.
+    struct LLMActionItemEnvelope: Decodable {
+        let items: [LLMActionItem]
+    }
+
+    /// Codable mirror for the LLM's per-item response. Internal (not
+    /// `private`) so the testable seam `_processExtractActionItems` can
+    /// surface this type to test stubs.
+    struct LLMActionItem: Decodable {
+        let description: String
+        let priority: String?
+        let dueAt: Date?
+        let category: String?
+        let tags: [String]?
+
+        init(
+            description: String,
+            priority: String? = nil,
+            dueAt: Date? = nil,
+            category: String? = nil,
+            tags: [String]? = nil
+        ) {
+            self.description = description
+            self.priority = priority
+            self.dueAt = dueAt
+            self.category = category
+            self.tags = tags
+        }
+    }
+
+    /// Dead-letter for `.extractActionItems`: mark the session extracted so
+    /// it stops re-qualifying on launch. No user-visible placeholder needed —
+    /// "no tasks for this conversation" is indistinguishable from a real
+    /// empty result. Surfaces in logs only.
+    @Sendable
+    fileprivate static func handleDeadLetterExtractActionItems(payload: Data) async {
+        struct Payload: Decodable { let session_id: Int64 }
+        let sessionId: Int64
+        do {
+            sessionId = try JSONDecoder().decode(Payload.self, from: payload).session_id
+        } catch {
+            logError("PowerWorkBridge: dead-letter — extractActionItems payload undecodable", error: error)
+            return
+        }
+
+        do {
+            try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: sessionId)
+            log("PowerWorkBridge: dead-letter — marked session \(sessionId) action_items_extracted_at to break re-enqueue loop")
+        } catch {
+            logError("PowerWorkBridge: dead-letter — failed to mark session \(sessionId) extracted", error: error)
+        }
+    }
+}
+
+private extension JSONDecoder {
+    static func iso8601() -> JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
     }
 }
 

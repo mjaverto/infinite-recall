@@ -619,10 +619,13 @@ actor ActionItemStorage {
         let db = try await ensureInitialized()
 
         let deleted = try await db.write { database -> Int in
+            // Exclude local-only rows (conversation-derived etc.) that legitimately
+            // lack a backendId — the API set cannot speak to those rows.
             let records = try ActionItemRecord
                 .filter(Column("completed") == false)
                 .filter(Column("deleted") == false)
                 .filter(Column("backendId") != nil)
+                .filter(Column("backendId") != "")
                 .fetchAll(database)
 
             var count = 0
@@ -644,6 +647,10 @@ actor ActionItemStorage {
     /// Hard-delete local tasks whose backendId is NOT in the given API set.
     /// Only targets synced records (backendSynced=true, backendId present) to avoid
     /// deleting locally-created tasks that haven't been pushed yet.
+    ///
+    /// Local-only sources (e.g. conversation-derived rows where backendId is nil/empty)
+    /// are explicitly excluded — the API has no awareness of them, so a missing entry
+    /// in the apiIds set is not a deletion signal.
     /// Returns the number of records deleted.
     func hardDeleteAbsentTasks(apiIds: Set<String>) async throws -> Int {
         // Safety guard: never wipe all tasks if the API set is empty (backend error)
@@ -655,10 +662,14 @@ actor ActionItemStorage {
         let db = try await ensureInitialized()
 
         let deleted = try await db.write { database -> Int in
+            // Only consider rows with a non-null, non-empty backendId AND backendSynced=true.
+            // Conversation-derived (and other local-only) rows have null/empty backendId
+            // and must be preserved across reconciliation passes.
             let records = try ActionItemRecord
                 .filter(Column("completed") == false)
                 .filter(Column("deleted") == false)
                 .filter(Column("backendId") != nil)
+                .filter(Column("backendId") != "")
                 .filter(Column("backendSynced") == true)
                 .fetchAll(database)
 
