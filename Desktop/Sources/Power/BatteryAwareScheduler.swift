@@ -399,7 +399,17 @@ public final class BatteryAwareScheduler: ObservableObject {
     let tag = workerTag
     var drainedAnyAutonomous = false
     while allowHeavyWork {
-      guard let work = try? await PendingWorkStorage.shared.claimNext(claimedBy: tag) else {
+      let claimed: PendingWork?
+      do {
+        claimed = try await PendingWorkStorage.shared.claimNext(claimedBy: tag)
+      } catch {
+        logError(
+          "BatteryAwareScheduler: claimNext threw, treating as empty queue",
+          error: error
+        )
+        break
+      }
+      guard let work = claimed else {
         break
       }
       // Per-kind readiness gate: `.summarize` (and future autonomous-LLM
@@ -416,7 +426,14 @@ public final class BatteryAwareScheduler: ObservableObject {
       // handler failures.
       if Self.requiresAutonomousReadiness(work.kind), !allowAutonomousAIWork {
         if let storageId = work.storageId {
-          try? await PendingWorkStorage.shared.releaseClaim(storageId: storageId)
+          do {
+            try await PendingWorkStorage.shared.releaseClaim(storageId: storageId)
+          } catch {
+            logError(
+              "BatteryAwareScheduler: releaseClaim threw for storageId=\(storageId)",
+              error: error
+            )
+          }
         }
         break
       }
@@ -479,7 +496,14 @@ public final class BatteryAwareScheduler: ObservableObject {
 
       do {
         try await handler(work)
-        try? await PendingWorkStorage.shared.ack(storageId: storageId)
+        do {
+          try await PendingWorkStorage.shared.ack(storageId: storageId)
+        } catch {
+          logError(
+            "BatteryAwareScheduler: ack threw for storageId=\(storageId)",
+            error: error
+          )
+        }
         if Self.requiresAutonomousReadiness(work.kind) {
           drainedAnyAutonomous = true
         }
@@ -506,7 +530,14 @@ public final class BatteryAwareScheduler: ObservableObject {
           "BatteryAwareScheduler: handler threw for \(work.kind.rawValue) id=\(storageId)",
           error: error
         )
-        try? await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
+        do {
+          try await PendingWorkStorage.shared.fail(storageId: storageId, error: error)
+        } catch let failError {
+          logError(
+            "BatteryAwareScheduler: fail threw for storageId=\(storageId)",
+            error: failError
+          )
+        }
         // === activity:G ===
         self.inFlight[work.kind] = nil
         if let wireKind = Self.toWireWorkKind(work.kind) {
@@ -537,7 +568,16 @@ public final class BatteryAwareScheduler: ObservableObject {
     // `IdleAIController.lastAICall`, so this release path is the only thing
     // that prevents autonomous drains from pinning the model in memory.
     if drainedAnyAutonomous {
-      let depth = try? await PendingWorkStorage.shared.depthSummary()
+      let depth: PendingWorkDepth?
+      do {
+        depth = try await PendingWorkStorage.shared.depthSummary()
+      } catch {
+        logError(
+          "BatteryAwareScheduler: depthSummary threw",
+          error: error
+        )
+        depth = nil
+      }
       let summarizeKey = PendingWork.Kind.summarize.rawValue
       let extractKGKey = PendingWork.Kind.extractKG.rawValue
       let summarizeRemaining = (depth?.queued[summarizeKey] ?? 0) + (depth?.failed[summarizeKey] ?? 0)
