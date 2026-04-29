@@ -35,16 +35,40 @@ private final class URLCapture: URLProtocol, @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Reads an `InputStream` to completion. Used to recover the request body
+    /// for POST/PUT/PATCH calls because URLSession migrates `httpBody` into
+    /// `httpBodyStream` before invoking URLProtocol — leaving `httpBody` nil.
+    fileprivate static func drain(_ stream: InputStream?) -> Data? {
+        guard let stream = stream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        let bufferSize = 4096
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        while true {
+            let read = stream.read(&buffer, maxLength: bufferSize)
+            if read <= 0 { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         if let url = request.url {
+            // URLSession converts `httpBody` to `httpBodyStream` before
+            // dispatching to URLProtocol, so reading `request.httpBody`
+            // returns nil for POST/PUT/PATCH bodies. Drain the stream so
+            // body-asserting tests (e.g. /synthesize/speech) can observe
+            // the payload without egressing to the network — see issue #67.
+            let body: Data? = request.httpBody ?? URLCapture.drain(request.httpBodyStream)
             URLCapture.record(CapturedRequest(
                 url: url,
                 method: request.httpMethod ?? "GET",
                 headers: request.allHTTPHeaderFields ?? [:],
-                body: request.httpBody
+                body: body
             ))
         }
         let response = HTTPURLResponse(url: request.url!, statusCode: 403, httpVersion: nil, headerFields: nil)!
