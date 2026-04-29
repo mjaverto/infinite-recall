@@ -2554,7 +2554,7 @@ struct SettingsContentView: View {
     guard visionModelDeleteInFlightId == nil else { return }
     visionModelDeleteInFlightId = modelId
     Task.detached(priority: .userInitiated) {
-      let ok = VLMLifecycleManager.deleteModel(modelId)
+      let ok = await VLMLifecycleManager.deleteModel(modelId)
       await MainActor.run {
         self.visionModelDeleteInFlightId = nil
         self.refreshVisionModelDiskSize(for: modelId)
@@ -3216,7 +3216,7 @@ struct SettingsContentView: View {
     guard localModelDeleteInFlightId == nil else { return }
     localModelDeleteInFlightId = modelId
     Task.detached(priority: .userInitiated) {
-      let ok = MLXLifecycleManager.deleteModel(modelId)
+      let ok = await MLXLifecycleManager.deleteModel(modelId)
       await MainActor.run {
         self.localModelDeleteInFlightId = nil
         self.refreshLocalModelDiskSize(for: modelId)
