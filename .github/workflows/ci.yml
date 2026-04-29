@@ -35,5 +35,5 @@ jobs:
       - name: cargo test -p infinite-recall-api
         run: cargo test --locked -p infinite-recall-api
 
-      - name: cargo test -p infinite-recall-api activity endpoints
-        run: cargo test --locked -p infinite-recall-api --features activity_test_wiring --test activity_endpoints
+      - name: cargo test -p infinite-recall-api --features activity_test_wiring
+        run: cargo test --locked -p infinite-recall-api --features activity_test_wiring
