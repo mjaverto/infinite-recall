@@ -45,12 +45,12 @@ private final class URLCapture: URLProtocol, @unchecked Sendable {
         var data = Data()
         let bufferSize = 4096
         var buffer = [UInt8](repeating: 0, count: bufferSize)
-        while stream.hasBytesAvailable {
+        while true {
             let read = stream.read(&buffer, maxLength: bufferSize)
             if read <= 0 { break }
             data.append(buffer, count: read)
         }
-        return data.isEmpty ? nil : data
+        return data
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
