@@ -259,6 +259,43 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
         XCTAssertEqual(payload.overview, "We agreed to ship the dispatcher refactor by EOQ.")
     }
 
+    /// Pins MemoryPayload's title-from-headline path so first-line-of-content fallback can't collapse title and overview.
+    func test_focusMemoryRecord_titleAndOverviewAreDistinct() throws {
+        let analysis = ScreenAnalysis(
+            status: .focused,
+            appOrSite: "Infinite Recall",
+            description: "Infinite Recall app is open",
+            message: nil
+        )
+        let strings = FocusAssistant.buildFocusMemoryStrings(
+            analysis: analysis,
+            windowTitle: "ProjectsView",
+            priorState: nil
+        )
+
+        XCTAssertEqual(strings.headline, "Focused on Infinite Recall")
+        XCTAssertTrue(strings.content.contains("App: Infinite Recall · Window: ProjectsView"))
+        XCTAssertTrue(strings.content.contains("Transition: new session → focused"))
+        XCTAssertNotEqual(strings.headline, strings.content)
+
+        let record = MemoryRecord(
+            backendSynced: false,
+            content: strings.content,
+            category: "system",
+            tagsJson: nil,
+            source: "desktop",
+            sourceApp: "Infinite Recall",
+            windowTitle: "ProjectsView",
+            contextSummary: analysis.description,
+            headline: strings.headline
+        )
+        let payload = MemoryPayload(from: record)
+
+        XCTAssertEqual(payload.title, "Focused on Infinite Recall")
+        XCTAssertEqual(payload.overview, strings.content)
+        XCTAssertNotEqual(payload.title, payload.overview)
+    }
+
     /// Multiple enabled integrations → exactly one outbox row per
     /// integration, all referencing the same memory id. Verifies the fan-out
     /// loop visits every enabled integration without duplicates or drops.

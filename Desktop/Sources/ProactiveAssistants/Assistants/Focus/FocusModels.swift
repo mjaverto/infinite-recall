@@ -5,6 +5,13 @@ import Foundation
 enum FocusStatus: String, Codable {
     case focused
     case distracted
+
+    var titleCased: String {
+        switch self {
+        case .focused: return "Focused"
+        case .distracted: return "Distracted"
+        }
+    }
 }
 
 // MARK: - Screen Analysis Result
