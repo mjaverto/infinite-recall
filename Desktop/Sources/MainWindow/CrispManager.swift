@@ -90,11 +90,11 @@ class CrispManager: ObservableObject {
         // no-op in this fork (see body).
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in Task { @MainActor in self?.pollForMessages() } }
+        ) { @MainActor [weak self] _ in self?.pollForMessages() }
 
         refreshAllObserver = NotificationCenter.default.addObserver(
             forName: .refreshAllData, object: nil, queue: .main
-        ) { [weak self] _ in Task { @MainActor in self?.pollForMessages() } }
+        ) { @MainActor [weak self] _ in self?.pollForMessages() }
 
         log("CrispManager: started (event-driven, no polling timer)")
     }
