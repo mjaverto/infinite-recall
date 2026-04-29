@@ -483,6 +483,7 @@ actor FocusAssistant: ProactiveAssistant {
             // e.g., if 3 frames all return "distracted", only the first one triggers
             if analysis.status == .distracted && lastNotifiedState != .distracted {
                 // Transitioning to distracted state
+                let priorState = lastNotifiedState
                 // Update notified state BEFORE other actions to prevent race with parallel frames
                 lastNotifiedState = .distracted
 
@@ -492,7 +493,7 @@ actor FocusAssistant: ProactiveAssistant {
                 }
 
                 // Save to SQLite and sync to backend
-                await saveFocusSessionToSQLite(analysis: analysis, screenshotId: frame.screenshotId, windowTitle: frame.windowTitle)
+                await saveFocusSessionToSQLite(analysis: analysis, screenshotId: frame.screenshotId, windowTitle: frame.windowTitle, priorState: priorState)
 
                 // Update FocusStorage UI state (sessions list, currentStatus, currentApp)
                 Task { @MainActor in
@@ -554,11 +555,12 @@ actor FocusAssistant: ProactiveAssistant {
                 }
             } else if analysis.status == .focused && lastNotifiedState != .focused {
                 // Transitioning to focused state (from distracted OR initial nil state)
-                let wasDistracted = lastNotifiedState == .distracted
+                let priorState = lastNotifiedState
+                let wasDistracted = priorState == .distracted
                 lastNotifiedState = .focused
 
                 // Save to SQLite and sync to backend
-                await saveFocusSessionToSQLite(analysis: analysis, screenshotId: frame.screenshotId, windowTitle: frame.windowTitle)
+                await saveFocusSessionToSQLite(analysis: analysis, screenshotId: frame.screenshotId, windowTitle: frame.windowTitle, priorState: priorState)
 
                 // Update FocusStorage UI state (sessions list, currentStatus, currentApp)
                 Task { @MainActor in
@@ -759,7 +761,7 @@ actor FocusAssistant: ProactiveAssistant {
     // MARK: - Storage
 
     /// Save focus session to SQLite (both tables) and sync to backend
-    private func saveFocusSessionToSQLite(analysis: ScreenAnalysis, screenshotId: Int64?, windowTitle: String? = nil) async {
+    private func saveFocusSessionToSQLite(analysis: ScreenAnalysis, screenshotId: Int64?, windowTitle: String?, priorState: FocusStatus?) async {
         // Save to focus_sessions table (for detailed tracking)
         let focusRecord = FocusSessionRecord(
             screenshotId: screenshotId,
@@ -780,10 +782,10 @@ actor FocusAssistant: ProactiveAssistant {
         }
 
         // Save to unified memories table (for search/filter)
-        let memoryId = await saveFocusToMemoriesTable(analysis: analysis, screenshotId: screenshotId, windowTitle: windowTitle)
+        let memoryId = await saveFocusToMemoriesTable(analysis: analysis, screenshotId: screenshotId, windowTitle: windowTitle, priorState: priorState)
 
         // Sync to backend once and update both tables with backendId
-        if let backendId = await syncFocusSessionToBackend(analysis: analysis, windowTitle: windowTitle) {
+        if let backendId = await syncFocusSessionToBackend(analysis: analysis, windowTitle: windowTitle, priorState: priorState) {
             // Update focus_sessions table
             if let recordId = focusSessionId {
                 do {
@@ -810,10 +812,8 @@ actor FocusAssistant: ProactiveAssistant {
 
     /// Save focus event to unified memories table for search/filter
     /// Returns the inserted memory ID if successful
-    private func saveFocusToMemoriesTable(analysis: ScreenAnalysis, screenshotId: Int64?, windowTitle: String? = nil) async -> Int64? {
-        // Build content for the memory
-        let statusText = analysis.status == .focused ? "Focused" : "Distracted"
-        let content = "\(statusText) on \(analysis.appOrSite): \(analysis.description)"
+    private func saveFocusToMemoriesTable(analysis: ScreenAnalysis, screenshotId: Int64?, windowTitle: String?, priorState: FocusStatus?) async -> Int64? {
+        let strings = Self.buildFocusMemoryStrings(analysis: analysis, windowTitle: windowTitle, priorState: priorState)
 
         // Build tags: ["focus", "focused"/"distracted", "app:{appName}"]
         let statusTag = analysis.status == .focused ? "focused" : "distracted"
@@ -836,14 +836,15 @@ actor FocusAssistant: ProactiveAssistant {
 
         let memoryRecord = MemoryRecord(
             backendSynced: false,
-            content: content,
+            content: strings.content,
             category: "system",
             tagsJson: tagsJson,
             source: "desktop",
             screenshotId: screenshotId,
             sourceApp: analysis.appOrSite,
             windowTitle: windowTitle,
-            contextSummary: analysis.description
+            contextSummary: analysis.description,
+            headline: strings.headline
         )
 
         do {
@@ -858,11 +859,10 @@ actor FocusAssistant: ProactiveAssistant {
     }
 
     /// Sync focus session to backend as a memory with focus tags, returns backend ID if successful
-    private func syncFocusSessionToBackend(analysis: ScreenAnalysis, windowTitle: String? = nil) async -> String? {
+    private func syncFocusSessionToBackend(analysis: ScreenAnalysis, windowTitle: String?, priorState: FocusStatus?) async -> String? {
         do {
-            // Build content for the memory
-            let statusText = analysis.status == .focused ? "Focused" : "Distracted"
-            let content = "\(statusText) on \(analysis.appOrSite): \(analysis.description)"
+            // Mirror the local memories-table content so backend and local records stay byte-equal.
+            let strings = Self.buildFocusMemoryStrings(analysis: analysis, windowTitle: windowTitle, priorState: priorState)
 
             // Build tags: ["focus", "focused"/"distracted", "app:{appName}"]
             let statusTag = analysis.status == .focused ? "focused" : "distracted"
@@ -875,7 +875,7 @@ actor FocusAssistant: ProactiveAssistant {
             }
 
             let response = try await APIClient.shared.createMemory(
-                content: content,
+                content: strings.content,
                 category: .system,
                 tags: tags,
                 source: "desktop",
@@ -888,6 +888,37 @@ actor FocusAssistant: ProactiveAssistant {
             logError("Focus: Failed to sync to backend", error: error)
             return nil
         }
+    }
+
+    /// Distinct headline vs content drive H1 vs Overview body in the exported markdown.
+    static func buildFocusMemoryStrings(
+        analysis: ScreenAnalysis,
+        windowTitle: String?,
+        priorState: FocusStatus?
+    ) -> (headline: String, content: String) {
+        let statusText = analysis.status.titleCased
+        let headline = "\(statusText) on \(analysis.appOrSite)"
+
+        let priorLabel = priorState?.rawValue ?? "new session"
+        let currentLabel = analysis.status.rawValue
+
+        var lines: [String] = []
+        lines.append("\(statusText) on \(analysis.appOrSite) · \(analysis.description)")
+        lines.append("")
+
+        var appLine = "App: \(analysis.appOrSite)"
+        if let wt = windowTitle, !wt.isEmpty {
+            appLine += " · Window: \(wt)"
+        }
+        lines.append(appLine)
+
+        var transitionLine = "Transition: \(priorLabel) → \(currentLabel)"
+        if let message = analysis.message, !message.isEmpty {
+            transitionLine += " · Note: \(message)"
+        }
+        lines.append(transitionLine)
+
+        return (headline: headline, content: lines.joined(separator: "\n"))
     }
 }
 
