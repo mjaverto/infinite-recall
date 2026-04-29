@@ -70,10 +70,33 @@ class CrispManager: ObservableObject {
     ///   from lifecycle unit tests that want to exercise observer registration
     ///   without touching the network, auth state, or firing real notifications.
     func start(performInitialPoll: Bool = true) {
-        log("[backend-stripped] CrispManager.start: no-op (local-first)")
-        // Disabled for local-first fork: no observers, no initial poll, no badge updates.
-        // Mark started so callers behave as if start() succeeded.
+        guard !isStarted else { return }
         isStarted = true
+
+        // Only set lastSeenTimestamp to "now" on first-ever launch.
+        // On subsequent launches, keep the persisted value so the first
+        // poll picks up messages that arrived while the app was closed.
+        if lastSeenTimestamp == 0 {
+            lastSeenTimestamp = UInt64(Date().timeIntervalSince1970)
+        }
+
+        if performInitialPoll {
+            pollForMessages()
+        }
+
+        // Refresh on app activation and Cmd+R (no periodic timer).
+        // Observers are local NotificationCenter wiring — no network — so they
+        // are kept in the local-first fork. `pollForMessages()` itself is a
+        // no-op in this fork (see body).
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { @MainActor [weak self] _ in self?.pollForMessages() }
+
+        refreshAllObserver = NotificationCenter.default.addObserver(
+            forName: .refreshAllData, object: nil, queue: .main
+        ) { @MainActor [weak self] _ in self?.pollForMessages() }
+
+        log("CrispManager: started (event-driven, no polling timer)")
     }
 
     /// Mark messages as read (called when user opens Help tab)
