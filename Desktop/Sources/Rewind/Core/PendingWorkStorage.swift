@@ -385,7 +385,26 @@ actor PendingWorkStorage {
     @discardableResult
     func runMaintenanceSweep(now: Date = Date()) async throws -> (recovered: Int, doneGC: Int, deadGC: Int) {
         let db = try await ensureInitialized()
-        let result = try await db.write { database -> (Int, Int, Int) in
+        let (result, deadLettered) = try await db.write {
+            database -> ((Int, Int, Int), [(workType: String, payload: Data)]) in
+
+            // Capture the rows that the lease-reclaim UPDATE will transition to
+            // `dead` BEFORE running the UPDATE, so we can fire the dead-letter
+            // callback once the transaction commits. Parity with `fail()`:
+            // a `.summarize` row whose worker crashes on every attempt would
+            // otherwise exhaust retries via the sweeper (lease expiry →
+            // attempts++) without ever getting the "Summary Unavailable"
+            // placeholder, leaving a stuck pending row in the UI.
+            let deadRows = try Row.fetchAll(database, sql: """
+                SELECT workType, payload FROM pending_work
+                WHERE status = 'claimed'
+                  AND leaseExpiresAt < ?
+                  AND attempts + 1 >= maxAttempts
+            """, arguments: [now])
+            let deadLettered: [(workType: String, payload: Data)] = deadRows.map { row in
+                (workType: row["workType"] ?? "", payload: row["payload"] ?? Data())
+            }
+
             try database.execute(sql: """
                 UPDATE pending_work
                 SET status = CASE
@@ -418,9 +437,18 @@ actor PendingWorkStorage {
             """, arguments: [now])
             let deadGCCount = database.changesCount
 
-            return (recoveredCount, doneGCCount, deadGCCount)
+            return ((recoveredCount, doneGCCount, deadGCCount), deadLettered)
         }
         notifyDidMutate()
+
+        // Fire dead-letter callbacks AFTER the transaction commits (mirrors
+        // `fail()`); the callback is async and may do its own DB writes.
+        if let cb = self.deadLetterCallback {
+            for entry in deadLettered where !entry.workType.isEmpty {
+                await cb(entry.workType, entry.payload)
+            }
+        }
+
         return result
     }
 
