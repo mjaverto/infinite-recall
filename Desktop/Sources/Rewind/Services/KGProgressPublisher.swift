@@ -285,7 +285,20 @@ actor KGProgressPublisher {
         // Pending-work depth for `.extractKG` decides whether there's work at
         // all. If the queue is empty, treat as `idleNoWork` regardless of
         // power state — there's nothing pending to be paused.
-        let depth = (try? await PendingWorkStorage.shared.depthSummary()) ?? PendingWorkDepth()
+        let depth: PendingWorkDepth
+        do {
+            depth = try await PendingWorkStorage.shared.depthSummary()
+        } catch {
+            // Mirror sample()'s skip-publish pattern (L243-248): a fallback to
+            // an empty PendingWorkDepth would yield pending=0 → .idleNoWork,
+            // causing the pill to flicker between "Up to date" and "Building"
+            // on transient DB errors. Preserve the prior state instead.
+            logError(
+                "KGProgressPublisher: depthSummary threw, falling back to previous state",
+                error: error
+            )
+            return lastSnapshot?.state ?? .idleNoWork
+        }
         let key = PendingWork.Kind.extractKG.rawValue
         let pending = (depth.queued[key] ?? 0) + (depth.failed[key] ?? 0) + (depth.claimed[key] ?? 0)
 
