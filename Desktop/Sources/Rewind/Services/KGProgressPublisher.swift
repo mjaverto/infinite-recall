@@ -285,7 +285,16 @@ actor KGProgressPublisher {
         // Pending-work depth for `.extractKG` decides whether there's work at
         // all. If the queue is empty, treat as `idleNoWork` regardless of
         // power state — there's nothing pending to be paused.
-        let depth = (try? await PendingWorkStorage.shared.depthSummary()) ?? PendingWorkDepth()
+        let depth: PendingWorkDepth
+        do {
+            depth = try await PendingWorkStorage.shared.depthSummary()
+        } catch {
+            logError(
+                "KGProgressPublisher: depthSummary threw, falling back to empty PendingWorkDepth",
+                error: error
+            )
+            depth = PendingWorkDepth()
+        }
         let key = PendingWork.Kind.extractKG.rawValue
         let pending = (depth.queued[key] ?? 0) + (depth.failed[key] ?? 0) + (depth.claimed[key] ?? 0)
 
