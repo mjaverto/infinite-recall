@@ -375,7 +375,7 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
             dedupKey: "delegate-deadletter-noop-\(UUID().uuidString)"
         )
         guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
-              claimed.storageId != nil else {
+              let sid = claimed.storageId else {
             return XCTFail("expected to claim our just-enqueued row")
         }
         // Note: we deliberately do NOT bump attempts. With attempts at 0 and
@@ -390,6 +390,26 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
             myCalls.count, 0,
             "claimed→queued sweep transition must NOT fire deadLetterCallback"
         )
+
+        // Prove the row actually transitioned to `queued`. Without this, a
+        // stuck-`claimed` row (e.g. lease predicate didn't match) would also
+        // produce zero callbacks — a false pass. Mirrors the assertion style
+        // in `test_runMaintenanceSweep_transitionsExhaustedRowToDead` above.
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            return XCTFail("database queue unavailable")
+        }
+        let landedStatus: String? = try await dbQueue.read { db in
+            try String.fetchOne(db, sql: "SELECT status FROM pending_work WHERE id = ?", arguments: [sid])
+        }
+        let landedAttempts: Int? = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT attempts FROM pending_work WHERE id = ?", arguments: [sid])
+        }
+        let landedLeaseExpiresAt: Double? = try await dbQueue.read { db in
+            try Double.fetchOne(db, sql: "SELECT leaseExpiresAt FROM pending_work WHERE id = ?", arguments: [sid])
+        }
+        XCTAssertEqual(landedStatus, "queued", "lease-expired row with attempts < max should land in `queued`")
+        XCTAssertEqual(landedAttempts, 1, "sweep's reclaim should bump attempts from 0 to 1")
+        XCTAssertNil(landedLeaseExpiresAt, "queued rows must have no active lease")
 
         // Cleanup: drain the now-`queued` row.
         if let again = try await storage.claimNext(claimedBy: "delegate-test-worker"),
