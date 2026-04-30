@@ -86,11 +86,77 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        // Always clear the delegate so the singleton doesn't carry a stale
-        // reference into the next test class.
+        // Always clear the delegate AND deadLetterCallback so the singleton
+        // doesn't carry a stale reference into the next test class. The
+        // callback reset has to be in async tearDown (not a per-test `defer`
+        // wrapping a fire-and-forget Task) so cleanup is deterministic and
+        // can't leak into the next test.
         await PendingWorkStorage.shared.setDelegate(nil)
+        await PendingWorkStorage.shared.setDeadLetterCallback(nil)
         try await purgeTestRows()
         try await super.tearDown()
+    }
+
+    // MARK: - Shared sweep-test helpers
+
+    /// Records `(workType, payload)` tuples observed by `deadLetterCallback`.
+    /// Wrapped in a final class so the closure can mutate state across the
+    /// actor boundary without capturing inout. Used by both sweep+callback
+    /// tests below.
+    private final class DeadLetterRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _calls: [(workType: String, payload: Data)] = []
+        var calls: [(workType: String, payload: Data)] {
+            lock.lock(); defer { lock.unlock() }
+            return _calls
+        }
+        func record(_ workType: String, _ payload: Data) {
+            lock.lock(); defer { lock.unlock() }
+            _calls.append((workType, payload))
+        }
+    }
+
+    /// Shared setup for the maintenance-sweep tests: enqueue a row with the
+    /// given payload+dedupKey, claim it, and (optionally) bump `attempts` so
+    /// the next attempt-bump trips it into `dead`. Returns the `storageId` of
+    /// the claimed row so the caller can assert the post-sweep state.
+    ///
+    /// `bumpToOneFromMax = true` forces `attempts = maxAttempts - 1`, so the
+    /// sweep's reclaim CASE evaluates `attempts + 1 >= maxAttempts` and lands
+    /// the row in `dead`. `false` leaves attempts at 0, exercising the
+    /// `claimed → queued` branch instead.
+    private struct SweepSetupError: Error { let message: String }
+
+    private func enqueueClaimedRow(
+        payload: Data,
+        dedupKey: String,
+        bumpToOneFromMax: Bool
+    ) async throws -> Int64 {
+        let storage = PendingWorkStorage.shared
+        _ = try await storage.enqueue(
+            workType: workType,
+            payload: payload,
+            dedupKey: dedupKey
+        )
+        guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
+              let sid = claimed.storageId else {
+            XCTFail("expected to claim our just-enqueued row")
+            throw SweepSetupError(message: "claim failed")
+        }
+        if bumpToOneFromMax {
+            guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+                XCTFail("database queue unavailable")
+                throw SweepSetupError(message: "no db queue")
+            }
+            try await dbQueue.write { db in
+                try db.execute(sql: """
+                    UPDATE pending_work
+                    SET attempts = maxAttempts - 1
+                    WHERE id = ?
+                """, arguments: [sid])
+            }
+        }
+        return sid
     }
 
     // MARK: - Mutators each fire exactly once
@@ -280,51 +346,17 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
         try await drainQueue()
         let storage = PendingWorkStorage.shared
 
-        // Records (workType, payload) tuples observed by the callback. Wrapped
-        // in a final class so the closure can mutate state across the actor
-        // boundary without capturing inout.
-        final class Recorder: @unchecked Sendable {
-            private let lock = NSLock()
-            private var _calls: [(workType: String, payload: Data)] = []
-            var calls: [(workType: String, payload: Data)] {
-                lock.lock(); defer { lock.unlock() }
-                return _calls
-            }
-            func record(_ workType: String, _ payload: Data) {
-                lock.lock(); defer { lock.unlock() }
-                _calls.append((workType, payload))
-            }
-        }
-        let recorder = Recorder()
+        let recorder = DeadLetterRecorder()
         await storage.setDeadLetterCallback { workType, payload in
             recorder.record(workType, payload)
         }
-        defer {
-            // Best-effort cleanup; ignored if the actor's already torn down.
-            Task { await PendingWorkStorage.shared.setDeadLetterCallback(nil) }
-        }
 
         let payload = Data("delegate-test-deadletter-callback".utf8)
-        _ = try await storage.enqueue(
-            workType: workType,
+        _ = try await enqueueClaimedRow(
             payload: payload,
-            dedupKey: "delegate-deadletter-cb-\(UUID().uuidString)"
+            dedupKey: "delegate-deadletter-cb-\(UUID().uuidString)",
+            bumpToOneFromMax: true
         )
-        guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
-              let sid = claimed.storageId else {
-            return XCTFail("expected to claim our just-enqueued row")
-        }
-
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            return XCTFail("database queue unavailable")
-        }
-        try await dbQueue.write { db in
-            try db.execute(sql: """
-                UPDATE pending_work
-                SET attempts = maxAttempts - 1
-                WHERE id = ?
-            """, arguments: [sid])
-        }
 
         let result = try await storage.runMaintenanceSweep(now: Date().addingTimeInterval(3600))
         XCTAssertGreaterThanOrEqual(result.recovered, 1, "sweep should reclaim our row")
@@ -348,39 +380,21 @@ final class PendingWorkStorageDelegateTests: XCTestCase {
         try await drainQueue()
         let storage = PendingWorkStorage.shared
 
-        final class Recorder: @unchecked Sendable {
-            private let lock = NSLock()
-            private var _calls: [(workType: String, payload: Data)] = []
-            var calls: [(workType: String, payload: Data)] {
-                lock.lock(); defer { lock.unlock() }
-                return _calls
-            }
-            func record(_ workType: String, _ payload: Data) {
-                lock.lock(); defer { lock.unlock() }
-                _calls.append((workType, payload))
-            }
-        }
-        let recorder = Recorder()
+        let recorder = DeadLetterRecorder()
         await storage.setDeadLetterCallback { workType, payload in
             recorder.record(workType, payload)
         }
-        defer {
-            Task { await PendingWorkStorage.shared.setDeadLetterCallback(nil) }
-        }
 
         let payload = Data("delegate-test-deadletter-noop".utf8)
-        _ = try await storage.enqueue(
-            workType: workType,
+        // Note: we deliberately do NOT bump attempts (`bumpToOneFromMax: false`).
+        // With attempts at 0 and maxAttempts at the schema default (8),
+        // `attempts + 1 >= maxAttempts` is false, so the sweep should send the
+        // row back to `queued`.
+        let sid = try await enqueueClaimedRow(
             payload: payload,
-            dedupKey: "delegate-deadletter-noop-\(UUID().uuidString)"
+            dedupKey: "delegate-deadletter-noop-\(UUID().uuidString)",
+            bumpToOneFromMax: false
         )
-        guard let claimed = try await storage.claimNext(claimedBy: "delegate-test-worker"),
-              let sid = claimed.storageId else {
-            return XCTFail("expected to claim our just-enqueued row")
-        }
-        // Note: we deliberately do NOT bump attempts. With attempts at 0 and
-        // maxAttempts at the schema default (8), `attempts + 1 >= maxAttempts`
-        // is false, so the sweep should send the row back to `queued`.
 
         let result = try await storage.runMaintenanceSweep(now: Date().addingTimeInterval(3600))
         XCTAssertGreaterThanOrEqual(result.recovered, 1, "sweep should reclaim the expired-lease row")
