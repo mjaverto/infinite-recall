@@ -278,6 +278,9 @@ fn make_state_with_writer(
         processing_gate_writer: gate_writer,
         pause_tx,
         local_model_gate,
+        db_path: Arc::new(std::path::PathBuf::from(":memory:")),
+        activity_db_path: Arc::new(std::path::PathBuf::from(":memory:")),
+        worker_errors: Arc::new(infinite_recall_api::worker_errors::WorkerErrorSink::default()),
     }
 }
 
