@@ -299,21 +299,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     UpdaterViewModel.shared.checkForUpdatesImmediatelyAfterLaunchIfNeeded()
 
     // Infinite Recall fork: one-time migration of legacy per-user data.
-    // The auth strip hardcoded the user id to "anonymous", which stranded
-    // existing users' data in `users/<old-firebase-uid>/`. This copies it
-    // into `users/anonymous/` on first launch after upgrade. Filesystem-only
-    // (no SQL); must run BEFORE any GRDB connection is opened against
-    // `users/anonymous/omi.db` (the static currentUserId is set ~75 lines
-    // below this, and DB init follows).
-    LegacyUserDirMigrator.runIfNeeded()
+    // Runs on a background executor so a multi-GB copy doesn't trip the macOS
+    // launch watchdog. Sign-in + DB init wait on `LegacyMigrationGate.isReady`
+    // so GRDB never opens `users/anonymous/omi.db` mid-copy.
+    LegacyMigrationGate.shared.checkPersistedMultiCandidateFlag()
+    Task { @MainActor in
+      let outcome = await LegacyUserDirMigrator.runIfNeeded()
+      LegacyMigrationGate.shared.markReady(outcome: outcome)
 
-    // Infinite Recall fork: force anonymous local-only mode on every launch.
-    // This unconditionally bypasses the Apple/Google/Firebase sign-in gate so
-    // the app boots straight into the main UI. Auto-completes onboarding too,
-    // so screen-recording / mic / accessibility permissions are requested on
-    // first use rather than gated behind an onboarding wizard.
-    AuthService.shared.signInAnonymously()
-    UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+      AuthService.shared.signInAnonymously()
+      UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+
+      let userId = UserDefaults.standard.string(forKey: "auth_userId")
+      RewindDatabase.currentUserId = (userId?.isEmpty == false) ? userId : "anonymous"
+
+      LegacyMigrationGate.shared.presentAlertIfNeeded()
+    }
 
     // Initialize analytics (MixPanel + PostHog)
     AnalyticsManager.shared.initialize()
@@ -328,6 +329,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Skips active recordings (status='recording' newer than 30s) to avoid
     // racing capture before the first segment lands.
     Task {
+      await LegacyMigrationGate.shared.waitUntilReady()
       do {
         let purged = try await TranscriptionStorage.shared.purgeEmptySessions()
         if purged > 0 {
@@ -383,10 +385,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     AnalyticsManager.shared.trackFirstLaunchIfNeeded()
 
-    // Set per-user database path before any async tasks can trigger DB initialization.
-    // This is synchronous and must happen before TierManager / TranscriptionRetryService.
-    let userId = UserDefaults.standard.string(forKey: "auth_userId")
-    RewindDatabase.currentUserId = (userId?.isEmpty == false) ? userId : "anonymous"
+    // Note: `RewindDatabase.currentUserId` is set inside the migration Task
+    // above so GRDB only opens `users/anonymous/omi.db` after the copy lands.
 
     // Start resource monitoring (memory, CPU, disk)
     ResourceMonitor.shared.start()
@@ -399,6 +399,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // One-time KG backfill: enqueues an .extractKG job for every existing
     // memory that hasn't been processed yet. Idempotent via migration_status.
     Task {
+      await LegacyMigrationGate.shared.waitUntilReady()
       await KGBackfillService.shared.runIfNeeded()
     }
 
@@ -427,6 +428,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Recover any pending/failed transcription sessions from previous runs
     Task {
+      await LegacyMigrationGate.shared.waitUntilReady()
       await TranscriptionRetryService.shared.recoverPendingTranscriptions()
       TranscriptionRetryService.shared.start()
     }
