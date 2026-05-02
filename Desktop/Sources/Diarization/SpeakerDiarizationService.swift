@@ -343,7 +343,7 @@ final class SpeakerDiarizationService: @unchecked Sendable {
         guard durationSec >= minTurnSeconds else { return }
         guard let embedding = mfcc.embed(samples: samples) else { return }
 
-        let speakerId = assignSessionCluster(for: embedding)
+        let speakerId = assignSessionClusterLocked(for: embedding)
         let startSec = Double(startSample) / Double(MFCCConfig.sampleRate)
         let endSec = Double(endSample) / Double(MFCCConfig.sampleRate)
         let sid = sessionId
@@ -528,7 +528,11 @@ final class SpeakerDiarizationService: @unchecked Sendable {
     private func assignSessionCluster(for embedding: [Float]) -> Int {
         stateLock.lock()
         defer { stateLock.unlock() }
+        return assignSessionClusterLocked(for: embedding)
+    }
 
+    // Caller must hold stateLock.
+    private func assignSessionClusterLocked(for embedding: [Float]) -> Int {
         var bestIdx: Int = -1
         var bestSim: Float = -.infinity
         for (i, cluster) in sessionClusters.enumerated() {
