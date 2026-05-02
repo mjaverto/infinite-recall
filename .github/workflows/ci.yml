@@ -59,3 +59,39 @@ jobs:
 
       - name: cargo test -p infinite-recall-api --features activity_test_wiring
         run: cargo test --locked -p infinite-recall-api --features activity_test_wiring
+
+      - name: cargo test -p infinite-recall-api --features test_introspection
+        run: cargo test --locked -p infinite-recall-api --features test_introspection
+
+  python-integration:
+    name: Python integration tests
+    runs-on: macos-15
+    timeout-minutes: 20
+    needs: rust-test
+    defaults:
+      run:
+        working-directory: Backend-Rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: Backend-Rust -> target
+
+      - name: cargo build -p infinite-recall-api --features test_introspection
+        run: cargo build --locked -p infinite-recall-api --features test_introspection
+
+      - name: uv sync && uv run pytest
+        working-directory: tests/integration
+        run: |
+          uv sync
+          uv run pytest -v
