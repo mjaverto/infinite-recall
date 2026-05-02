@@ -61,4 +61,15 @@ pub struct AppState {
     /// leave a TOCTOU window for pid-recycle). Tests inject a stub.
     pub local_model_gate: Arc<dyn LocalModelGate>,
     // === /activity:lane-d ===
+
+    /// Resolved on-disk path of the read-only Omi SQLite DB. Cached on
+    /// AppState so the `test_introspection` ground-truth endpoints can
+    /// report the same path the read pool was opened against without
+    /// re-running the env/$HOME resolution.
+    pub db_path: Arc<std::path::PathBuf>,
+    /// Resolved on-disk path of the activity SQLite DB.
+    pub activity_db_path: Arc<std::path::PathBuf>,
+    /// Bounded ring buffer of recent worker errors. No-op stub unless the
+    /// `test_introspection` Cargo feature is on (see `crate::worker_errors`).
+    pub worker_errors: Arc<crate::worker_errors::WorkerErrorSink>,
 }

@@ -193,6 +193,9 @@ fn make_state(allowed_pids: Vec<i32>) -> (AppState, tempfile::TempDir) {
         local_model_gate: Arc::new(StubLocalModelGate {
             allowed: allowed_pids,
         }),
+        db_path: Arc::new(std::path::PathBuf::from(":memory:")),
+        activity_db_path: Arc::new(std::path::PathBuf::from(":memory:")),
+        worker_errors: Arc::new(infinite_recall_api::worker_errors::WorkerErrorSink::default()),
     };
     (state, dir)
 }

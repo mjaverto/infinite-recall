@@ -20,10 +20,13 @@ mod memories;
 mod people;
 mod scores;
 mod search;
+#[cfg(feature = "test_introspection")]
+mod test_introspection;
 
 pub fn router(state: AppState) -> Router {
     // Authenticated routes — the bulk of the surface.
-    let authed = Router::new()
+    #[allow(unused_mut)]
+    let mut authed = Router::new()
         .route("/v1/conversations", get(conversations::list))
         .route("/v1/conversations/:id", get(conversations::get_one))
         .route("/v3/memories", get(memories::list))
@@ -70,10 +73,17 @@ pub fn router(state: AppState) -> Router {
             post(activity::terminate_process),
         )
         // === /activity:lane-d ===
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer,
-        ));
+        ;
+
+    #[cfg(feature = "test_introspection")]
+    {
+        authed = authed.merge(test_introspection::router());
+    }
+
+    let authed = authed.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_bearer,
+    ));
 
     // Public — health/version are unauthenticated so launchd & monitors can poll.
     let public = Router::new()

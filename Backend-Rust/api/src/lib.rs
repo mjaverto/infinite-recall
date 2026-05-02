@@ -12,6 +12,7 @@ pub mod error;
 pub mod routes;
 pub mod state;
 pub mod token;
+pub mod worker_errors;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -101,6 +102,9 @@ pub async fn run() -> Result<()> {
         // === activity:lane-d ===
         local_model_gate,
         // === /activity:lane-d ===
+        db_path: Arc::new(db_path.clone()),
+        activity_db_path: Arc::new(activity_db_path.clone()),
+        worker_errors: Arc::new(worker_errors::WorkerErrorSink::default()),
     };
     let app = routes::router(state);
 
@@ -126,7 +130,7 @@ pub async fn run() -> Result<()> {
 
 /// Pick the SQLite path. Honors `INFINITE_RECALL_DB`, otherwise falls back
 /// to the Swift app's location under Application Support.
-fn resolve_db_path() -> std::path::PathBuf {
+pub fn resolve_db_path() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("INFINITE_RECALL_DB") {
         return std::path::PathBuf::from(v);
     }
@@ -137,7 +141,7 @@ fn resolve_db_path() -> std::path::PathBuf {
 /// Pick the Activity Tab SQLite path (separate file from the read-only
 /// transcription DB). Honors `INFINITE_RECALL_ACTIVITY_DB`, otherwise
 /// falls back to the InfiniteRecall Application Support directory.
-fn resolve_activity_db_path() -> std::path::PathBuf {
+pub fn resolve_activity_db_path() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("INFINITE_RECALL_ACTIVITY_DB") {
         return std::path::PathBuf::from(v);
     }

@@ -60,6 +60,10 @@ libproc = "0.14"
 # run against the real `infinite_recall_api::routes::router` library
 # surface (now exposed by `lib.rs`).
 activity_test_wiring = []
+# Off-by-default ground-truth introspection endpoints under `/v1/_test/*`.
+# Compiled out of release builds; even when on, the handlers additionally
+# require the `IR_TEST_INTROSPECTION=1` env var at request time.
+test_introspection = []
 
 [dev-dependencies]
 tempfile = "3"
