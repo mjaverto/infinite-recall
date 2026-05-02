@@ -298,6 +298,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     _ = UpdaterViewModel.shared
     UpdaterViewModel.shared.checkForUpdatesImmediatelyAfterLaunchIfNeeded()
 
+    // Infinite Recall fork: one-time migration of legacy per-user data.
+    // The auth strip hardcoded the user id to "anonymous", which stranded
+    // existing users' data in `users/<old-firebase-uid>/`. This copies it
+    // into `users/anonymous/` on first launch after upgrade. Filesystem-only
+    // (no SQL); must run BEFORE any GRDB connection is opened against
+    // `users/anonymous/omi.db` (the static currentUserId is set ~75 lines
+    // below this, and DB init follows).
+    LegacyUserDirMigrator.runIfNeeded()
+
     // Infinite Recall fork: force anonymous local-only mode on every launch.
     // This unconditionally bypasses the Apple/Google/Firebase sign-in gate so
     // the app boots straight into the main UI. Auto-completes onboarding too,
