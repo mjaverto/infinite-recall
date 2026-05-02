@@ -81,8 +81,12 @@ linkedin-*.md
 # Agent configs (user-local)
 .agents/
 
-# Claude Code worktrees and per-session state (never commit)
-.claude/
+# Claude Code per-session state and personal config (never commit).
+# Shared project skills under .claude/skills/ ARE committed.
+.claude/settings*.json
+.claude/projects/
+.claude/cache/
+.claude/local/
 
 # Node.js projects
 **/node_modules/
