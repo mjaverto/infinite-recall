@@ -1,9 +1,21 @@
 import Foundation
 
+/// Narrow seam for the consumer of escalation banners. `ActivityMonitorService`
+/// is the production conformer; tests inject a stub so they don't have to
+/// touch the `@MainActor` singleton (which transitively hangs on macOS-15
+/// GitHub runners — see `InternalPostFailureTrackerTests` setUp comment).
+@MainActor
+protocol InternalPostFailureReporter: AnyObject {
+    var lastError: String? { get }
+    func clearLastError()
+    func reportInternalPostFailure(category: String, consecutive: Int)
+}
+
 /// Tracks consecutive failures of `_internal/*` POSTs (inflight, queue-depth,
 /// gate-state) so the user gets a banner when internal reporting is silently
 /// broken. Each category has its own counter; hitting `escalationThreshold`
-/// consecutive failures fires once into `ActivityMonitorService.lastError`.
+/// consecutive failures fires once into the attached
+/// `InternalPostFailureReporter` (`ActivityMonitorService` in production).
 /// A subsequent success resets the counter and re-arms escalation.
 @MainActor
 final class InternalPostFailureTracker {
@@ -24,11 +36,11 @@ final class InternalPostFailureTracker {
         case gateState = "gate-state"
     }
 
-    private weak var monitor: ActivityMonitorService?
+    private weak var monitor: InternalPostFailureReporter?
     private var counts: [Category: Int] = [:]
     private var escalated: Set<Category> = []
 
-    func attach(_ monitor: ActivityMonitorService) {
+    func attach(_ monitor: InternalPostFailureReporter) {
         self.monitor = monitor
     }
 
