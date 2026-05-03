@@ -33,6 +33,25 @@ public final class ActivityMonitorService: ObservableObject {
     private var keyObserver: NSObjectProtocol?
     private var resignObserver: NSObjectProtocol?
 
+    /// Issue #104 — cold-start grace.
+    ///
+    /// On launch, the Activity tab's first `getActivitySnapshot` can race the
+    /// Rust daemon's bind/init: the request hits a 5s `URLRequest.timeoutInterval`
+    /// before the daemon answers, surfacing a user-visible
+    /// "snapshot failed: The request timed out." banner even though the next
+    /// 1 Hz tick almost always succeeds.
+    ///
+    /// We swallow *transient daemon-startup* errors (timeout / connection
+    /// refused / 5xx) for the first `coldStartGraceAttempts` fetches before
+    /// the first successful snapshot. After grace is exhausted, or once we've
+    /// ever seen a successful snapshot, errors surface to the banner as before.
+    private var hasReceivedFirstSnapshot: Bool = false
+    private var coldStartFailureCount: Int = 0
+    /// 5 attempts × 1s poll interval ≈ 5s of grace beyond the per-request 5s
+    /// timeout, which empirically covers the worst observed cold-start race
+    /// in #104 without masking real outages.
+    static let coldStartGraceAttempts: Int = 5
+
     private init() {}
 
     deinit {
@@ -88,6 +107,10 @@ public final class ActivityMonitorService: ObservableObject {
             NotificationCenter.default.removeObserver(resignObserver)
             self.resignObserver = nil
         }
+        // Reset cold-start grace so the next `start()` (e.g. after window
+        // tear-down + relaunch in tests) gets a fresh window.
+        hasReceivedFirstSnapshot = false
+        coldStartFailureCount = 0
     }
 
     // MARK: - Public actions
@@ -240,15 +263,65 @@ public final class ActivityMonitorService: ObservableObject {
             let snap = try await APIClient.shared.getActivitySnapshot()
             self.snapshot = await snapshotWithAuthoritativeQueueDepth(snap)
             self.lastError = nil
+            self.hasReceivedFirstSnapshot = true
+            self.coldStartFailureCount = 0
         } catch APIError.daemonNotConfigured {
             // Distinct UI message: tells the user the daemon URL is unset
             // (almost always means `scripts/run.sh` wasn't re-run after a
             // checkout), instead of letting it fall through to a misleading
             // generic "HTTP error: 404" string.
+            //
+            // This is a *configuration* error (not a daemon-startup race), so
+            // it is never silenced by the cold-start grace.
             self.lastError = APIError.daemonNotConfigured.localizedDescription
         } catch {
+            // Issue #104 — cold-start grace. If we haven't yet seen a
+            // successful snapshot AND the error is a transient daemon-startup
+            // indicator (timeout, connection refused, 5xx), don't surface a
+            // banner yet — the 1 Hz timer will retry and almost always
+            // succeeds within the next few ticks. Only surface the error
+            // after `coldStartGraceAttempts` consecutive transient failures.
+            if !hasReceivedFirstSnapshot,
+               Self.isTransientStartupError(error) {
+                coldStartFailureCount += 1
+                if coldStartFailureCount < Self.coldStartGraceAttempts {
+                    // Stay quiet during grace; preserve any prior error
+                    // message so a stale banner doesn't get overwritten by
+                    // a transient one.
+                    return
+                }
+            }
             self.lastError = "snapshot failed: \(error.localizedDescription)"
         }
+    }
+
+    /// Mirrors `InternalPostFailureTracker.isDaemonRestartIndicator` —
+    /// transient errors that almost always clear themselves within a few
+    /// 1 Hz polls during daemon launch.
+    nonisolated static func isTransientStartupError(_ error: Error) -> Bool {
+        if let api = error as? APIError {
+            switch api {
+            case .unauthorized:
+                return true
+            case .httpError(let code) where code == 502 || code == 503 || code == 504:
+                return true
+            default:
+                break
+            }
+        }
+        let nsErr = error as NSError
+        if nsErr.domain == NSURLErrorDomain {
+            switch nsErr.code {
+            case NSURLErrorCannotConnectToHost,
+                 NSURLErrorNetworkConnectionLost,
+                 NSURLErrorNotConnectedToInternet,
+                 NSURLErrorTimedOut:
+                return true
+            default:
+                break
+            }
+        }
+        return false
     }
 
     private func snapshotWithAuthoritativeQueueDepth(_ snap: ActivitySnapshot) async -> ActivitySnapshot {
