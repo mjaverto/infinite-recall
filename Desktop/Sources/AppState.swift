@@ -1281,23 +1281,26 @@ class AppState: ObservableObject {
         // Initialize audio capture service
         audioCaptureService = AudioCaptureService()
 
-        // Initialize audio mixer for combining mic and system audio
-        audioMixer = AudioMixer()
-
         // Initialize system audio capture if supported (macOS 14.4+)
         // Can be disabled via: defaults write com.omi.desktop-dev disableSystemAudioCapture -bool true
         //                  or: defaults write com.omi.computer-macos disableSystemAudioCapture -bool true
         let systemAudioDisabled = UserDefaults.standard.bool(forKey: "disableSystemAudioCapture")
+        var systemAudioAvailable = false
         if systemAudioDisabled {
           log(
             "Transcription: System audio capture DISABLED by user preference (disableSystemAudioCapture)"
           )
         } else if #available(macOS 14.4, *) {
           systemAudioCaptureService = SystemAudioCaptureService()
+          systemAudioAvailable = true
           log("Transcription: System audio capture initialized (macOS 14.4+)")
         } else {
           log("Transcription: System audio capture not available (requires macOS 14.4+)")
         }
+
+        // Initialize audio mixer after source availability is known. When system
+        // capture is available, the mixer waits briefly for both sides before padding.
+        audioMixer = AudioMixer(systemAudioAvailable: systemAudioAvailable)
       }
       // For BLE device, BleAudioService will be used in startAudioCapture
 
@@ -1343,6 +1346,7 @@ class AppState: ObservableObject {
       liveSpeakerPersonMap = [:]
       LiveTranscriptMonitor.shared.clear()
       recordingStartTime = Date()
+      let audioCaptureStartedAt = recordingStartTime ?? Date()
       AudioLevelMonitor.shared.reset()
       RecordingTimer.shared.start()
 
@@ -1356,12 +1360,18 @@ class AppState: ObservableObject {
           self?.handleDiarizationTurn(turn)
         }
       }
-
       log(
         "Transcription: Using source: \(effectiveSource.rawValue), device: \(recordingInputDeviceName ?? "Unknown")"
       )
 
-      // Create crash-safe DB session for persistence
+      // Create crash-safe DB session for persistence. The audio persistence start
+      // is sequenced before session attachment so a delayed start(nil) cannot
+      // overwrite a real session id.
+      AudioPersistenceService.shared.enqueueStart(
+        source: effectiveSource == .bleDevice ? "ble_device" : "mixed",
+        transcriptionSessionId: nil,
+        captureStartedAt: audioCaptureStartedAt
+      )
       Task {
         do {
           let sessionId = try await TranscriptionStorage.shared.startSession(
@@ -1369,6 +1379,10 @@ class AppState: ObservableObject {
             language: effectiveLanguage,
             timezone: TimeZone.current.identifier,
             inputDeviceName: recordingInputDeviceName
+          )
+          await alignTranscriptionSessionStartTime(
+            sessionId: sessionId,
+            startedAt: audioCaptureStartedAt
           )
           await MainActor.run {
             self.currentSessionId = sessionId
@@ -1380,6 +1394,7 @@ class AppState: ObservableObject {
               sessionId,
               startedAt: self.recordingStartTime
             )
+            AudioPersistenceService.shared.enqueueSetTranscriptionSessionId(sessionId)
           }
           log("Transcription: Created DB session \(sessionId)")
         } catch {
@@ -1449,6 +1464,7 @@ class AppState: ObservableObject {
     audioMixer?.start { [weak self] monoMixed in
       self?.transcriptionService?.sendAudio(monoMixed)
       SpeakerDiarizationService.shared.appendAudio(monoMixed)
+      AudioPersistenceService.shared.enqueueAppend(monoMixed)
     }
 
     do {
@@ -1485,6 +1501,7 @@ class AppState: ObservableObject {
           } catch {
             // System audio is optional — continue with mic only (mixer will just
             // emit mic samples summed with zero system samples).
+            self.audioMixer?.setSystemAudioAvailable(false)
             logError(
               "Transcription: System audio capture failed (continuing with mic only)", error: error)
           }
@@ -1540,7 +1557,11 @@ class AppState: ObservableObject {
     await BleAudioService.shared.startProcessing(
       from: connection,
       transcriptionService: transcriptionService,
-      audioDataHandler: { _ in
+      audioDataHandler: { pcmData in
+        if !pcmData.isEmpty && pcmData.count.isMultiple(of: 2) {
+          SpeakerDiarizationService.shared.appendAudio(pcmData)
+          AudioPersistenceService.shared.enqueueAppend(pcmData)
+        }
         // Audio level is updated by BleAudioService
         Task { @MainActor in
           AudioLevelMonitor.shared.updateMicrophoneLevel(BleAudioService.shared.audioLevel)
@@ -1667,6 +1688,32 @@ class AppState: ObservableObject {
     }
   }
 
+  private func notifyLocalConversationMayNeedSpeakerReview(
+    sessionId: Int64,
+    segmentCount: Int,
+    chunkCount: Int
+  ) {
+    let conversationId = "local-\(sessionId)"
+    let userInfo: [String: Any] = [
+      "conversationId": conversationId,
+      "sessionId": sessionId,
+    ]
+
+    if segmentCount > 0 {
+      NotificationCenter.default.post(
+        name: .completedConversationMayNeedSpeakerReview,
+        object: nil,
+        userInfo: userInfo
+      )
+    } else if chunkCount > 0 {
+      NotificationCenter.default.post(
+        name: .localConversationAwaitingSpeakerReviewTranscriptSegments,
+        object: nil,
+        userInfo: userInfo
+      )
+    }
+  }
+
   /// Reconcile a local session by checking if a matching conversation exists on the backend.
   /// If found, marks the session as completed. Otherwise leaves it as pendingUpload for retry.
   private func reconcileSession(sessionId: Int64, startTime: Date) async {
@@ -1694,6 +1741,24 @@ class AppState: ObservableObject {
     }
   }
 
+  /// Keep the durable session anchor aligned with the first sample timeline.
+  /// Review audio slices use transcription_sessions.startedAt as audio zero.
+  private func alignTranscriptionSessionStartTime(sessionId: Int64, startedAt: Date?) async {
+    guard let startedAt else { return }
+    guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+    do {
+      try await dbQueue.write { db in
+        try db.execute(
+          sql: "UPDATE transcription_sessions SET startedAt = ?, updatedAt = ? WHERE id = ?",
+          arguments: [startedAt, Date(), sessionId]
+        )
+      }
+    } catch {
+      logError("Transcription: Failed to align session audio anchor", error: error)
+      await RewindDatabase.shared.reportQueryError(error)
+    }
+  }
+
   /// Finish the current conversation and keep recording for a new one.
   /// Disconnects the WebSocket (triggers backend conversation processing) then reconnects.
   func finishConversation() async -> FinishConversationResult {
@@ -1713,6 +1778,8 @@ class AppState: ObservableObject {
     // (backend will process it; memory_created event may arrive on the new session's WebSocket)
     if let sessionId = currentSessionId {
       do {
+        await AudioPersistenceService.shared.flushQueued()
+        AudioPersistenceService.shared.enqueueSetTranscriptionSessionId(nil)
         let segmentCount = try await TranscriptionStorage.shared.getSegmentCount(sessionId: sessionId)
         let chunkCount = try await TranscriptionStorage.shared.getAudioChunkCount(sessionId: sessionId)
         let elapsed: Double = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
@@ -1722,6 +1789,13 @@ class AppState: ObservableObject {
         } else {
           try await TranscriptionStorage.shared.finishSession(id: sessionId)
           log("Transcription: Finished DB session \(sessionId) before reconnect")
+          await MainActor.run {
+            self.notifyLocalConversationMayNeedSpeakerReview(
+              sessionId: sessionId,
+              segmentCount: segmentCount,
+              chunkCount: chunkCount
+            )
+          }
           Task(priority: .background) {
             await ConversationSummaryBackfillService.shared.summarizeSessionIfNeeded(
               sessionId, reason: "finishConversation")
@@ -1744,6 +1818,7 @@ class AppState: ObservableObject {
     // must not be persisted against the finished session. They'll be buffered in memory until
     // the new session ID is set in the Task below.
     currentSessionId = nil
+    AudioPersistenceService.shared.enqueueSetTranscriptionSessionId(nil)
 
     // Clear segments for the next conversation but keep recording active
     speakerSegments = []
@@ -1806,6 +1881,7 @@ class AppState: ObservableObject {
 
     // Start a new DB session for the next conversation
     let lang = AssistantSettings.shared.effectiveTranscriptionLanguage
+    let nextRecordingStartTime = recordingStartTime
     Task {
       do {
         let sessionId = try await TranscriptionStorage.shared.startSession(
@@ -1813,6 +1889,10 @@ class AppState: ObservableObject {
           language: lang,
           timezone: TimeZone.current.identifier,
           inputDeviceName: recordingInputDeviceName
+        )
+        await alignTranscriptionSessionStartTime(
+          sessionId: sessionId,
+          startedAt: nextRecordingStartTime
         )
         await MainActor.run {
           self.currentSessionId = sessionId
@@ -1826,6 +1906,7 @@ class AppState: ObservableObject {
               self?.handleDiarizationTurn(turn)
             }
           }
+          AudioPersistenceService.shared.enqueueSetTranscriptionSessionId(sessionId)
         }
         log("Transcription: Created new DB session \(sessionId) for next conversation")
       } catch {
@@ -1871,6 +1952,7 @@ class AppState: ObservableObject {
     // Stop audio mixer
     audioMixer?.stop()
     audioMixer = nil
+    AudioPersistenceService.shared.enqueueStop()
 
     // Infinite Recall fork: stop on-device diarization (flushes any in-flight turn).
     SpeakerDiarizationService.shared.stop()
@@ -1903,6 +1985,7 @@ class AppState: ObservableObject {
       }()
       Task {
         do {
+          await AudioPersistenceService.shared.stopQueued()
           let segmentCount = try await TranscriptionStorage.shared.getSegmentCount(sessionId: sessionId)
           let chunkCount = try await TranscriptionStorage.shared.getAudioChunkCount(sessionId: sessionId)
           if segmentCount == 0 && chunkCount == 0 && elapsedSeconds < 5 {
@@ -1911,6 +1994,13 @@ class AppState: ObservableObject {
           } else {
             try await TranscriptionStorage.shared.finishSession(id: sessionId)
             log("Transcription: Finished DB session \(sessionId)")
+            await MainActor.run {
+              self.notifyLocalConversationMayNeedSpeakerReview(
+                sessionId: sessionId,
+                segmentCount: segmentCount,
+                chunkCount: chunkCount
+              )
+            }
             Task(priority: .background) {
               await ConversationSummaryBackfillService.shared.summarizeSessionIfNeeded(
                 sessionId, reason: "stopTranscription")
@@ -2353,7 +2443,30 @@ class AppState: ObservableObject {
     let backendIds = split.backendIds
     let fallbackOrders = split.fallbackOrders
 
-    // Update in-memory conversations list so the prop is fresh on next open.
+    guard let sessionId = await TranscriptionStorage.shared.sessionIdForBackendId(conversationId) else {
+      logError(
+        "People: Failed to resolve transcription session for conversation \(conversationId)",
+        error: NSError(domain: "PeopleStore", code: -2)
+      )
+      return false
+    }
+
+    let assigned = await PeopleStore.shared.assignSegments(
+      sessionId: sessionId,
+      segmentIds: segmentIds,
+      personId: personId,
+      isUser: isUser
+    )
+    guard assigned else {
+      logError(
+        "People: Failed to assign segments/backfill embeddings",
+        error: NSError(domain: "PeopleStore", code: -3)
+      )
+      return false
+    }
+
+    // Update in-memory conversations list only after the local segment rows and
+    // embedding backfill have committed.
     if let idx = conversations.firstIndex(where: { $0.id == conversationId }) {
       if !backendIds.isEmpty {
         let backendSet = Set(backendIds)
@@ -2401,26 +2514,6 @@ class AppState: ObservableObject {
       }
     }
 
-    // Persist to local SQLite (transcription_segments).
-    do {
-      try await TranscriptionStorage.shared.updateSpeakerAssignmentByBackendId(
-        conversationId,
-        segmentIds: backendIds,
-        fallbackSegmentOrders: fallbackOrders,
-        isUser: isUser,
-        personId: isUser ? nil : personId
-      )
-    } catch {
-      logError("People: Failed to update local segment cache", error: error)
-    }
-    if let sessionId = await TranscriptionStorage.shared.sessionIdForBackendId(conversationId) {
-      _ = await PeopleStore.shared.assignSegments(
-        sessionId: sessionId,
-        segmentIds: segmentIds,
-        personId: personId,
-        isUser: isUser
-      )
-    }
     log("People: Assigned \(segmentIds.count) segments in conversation \(conversationId)")
     return true
   }
@@ -2600,12 +2693,19 @@ class AppState: ObservableObject {
       // Refresh conversations list
       Task {
         await loadConversations()
+        if memoryId != "?", !memoryId.isEmpty {
+          NotificationCenter.default.post(
+            name: .completedConversationMayNeedSpeakerReview,
+            object: nil,
+            userInfo: ["conversationId": memoryId]
+          )
+        }
       }
 
       // Local integrations: enqueue webhook/filesystem dispatches for this
       // memory. This only writes outbox rows; the drain service does the
       // actual sending in the background.
-      if memoryId != "?" {
+      if memoryId != "?", !memoryId.isEmpty {
         Task {
           await LocalIntegrationDispatcher.shared.enqueueDispatch(conversationId: memoryId)
         }
@@ -3202,6 +3302,13 @@ extension Notification.Name {
   /// Posted when conversation rows are mutated under the UI (e.g. backfill
   /// service rewrites title/overview). Listeners should refetch.
   static let conversationsListNeedsRefresh = Notification.Name("conversationsListNeedsRefresh")
+  /// Posted after a completed conversation has refreshed into the list and may need speaker review.
+  static let completedConversationMayNeedSpeakerReview = Notification.Name(
+    "completedConversationMayNeedSpeakerReview")
+  /// Posted for a just-finished local conversation whose transcript must arrive via backfill
+  /// before speaker review can be considered.
+  static let localConversationAwaitingSpeakerReviewTranscriptSegments = Notification.Name(
+    "localConversationAwaitingSpeakerReviewTranscriptSegments")
   /// Posted when action_items rows are mutated under the UI (e.g. the
   /// `.extractActionItems` handler inserts conversation-derived tasks).
   /// Listeners should refetch (e.g. `TasksStore.loadTasks()`).

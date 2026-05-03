@@ -60,6 +60,19 @@ struct ConversationsPage: View {
   @State private var showMergeConfirmation: Bool = false
   @State private var isMerging: Bool = false
   @State private var mergeError: String? = nil
+  @Binding var autoOpenIdentifySpeakersConversationId: String?
+
+  init(
+    appState: AppState,
+    selectedConversation: Binding<ServerConversation?>,
+    embedded: Bool = false,
+    autoOpenIdentifySpeakersConversationId: Binding<String?> = .constant(nil)
+  ) {
+    self.appState = appState
+    self._selectedConversation = selectedConversation
+    self.embedded = embedded
+    self._autoOpenIdentifySpeakersConversationId = autoOpenIdentifySpeakersConversationId
+  }
 
   var body: some View {
     Group {
@@ -67,6 +80,12 @@ struct ConversationsPage: View {
         // Detail view for selected conversation
         ConversationDetailView(
           conversation: selected,
+          autoOpenIdentifySpeakers: autoOpenIdentifySpeakersConversationId == selected.id,
+          onAutoOpenIdentifySpeakersHandled: {
+            if autoOpenIdentifySpeakersConversationId == selected.id {
+              autoOpenIdentifySpeakersConversationId = nil
+            }
+          },
           onBack: { selectedConversation = nil },
           folders: appState.folders,
           onMoveToFolder: { conversationId, folderId in
@@ -190,6 +209,7 @@ struct ConversationsPage: View {
       }
     }
   }
+
   // MARK: - Main View with Recording Header + List
 
   private var mainConversationsView: some View {
@@ -801,7 +821,10 @@ private struct TranscriptNotesDivider: View {
 }
 
 #Preview {
-  ConversationsPage(appState: AppState(), selectedConversation: .constant(nil))
+  ConversationsPage(
+    appState: AppState(),
+    selectedConversation: .constant(nil),
+    autoOpenIdentifySpeakersConversationId: .constant(nil))
     .frame(width: 600, height: 800)
     .background(OmiColors.backgroundSecondary)
 }

@@ -1,47 +1,72 @@
-# Voice Fingerprinting For Transcript Speaker Identity
+# Descript-Style Speaker Identification
 
-Issue: #111
+Issue: #112
 
-## Implementation Checklist
+## UX Scenarios
 
-- [x] Confirm current speaker diarization, assignment, and people flows
-- [x] Add voice-profile metadata migrations for speaker embedding samples
-- [x] Replace raw optional person match with conservative known/suggested/unknown result
-- [x] Make speaker assignment apply to all same-session speaker segments by default
-- [x] Persist confirmed assignment metadata and backfill matching speaker embeddings
-- [x] Surface confidence/suggestion metadata to transcript models where needed
-- [x] Add People voice-profile management primitives for reset/delete/merge basics
-- [x] Add focused tests for assignment and matcher behavior
-- [x] Run Swift build/tests
-- [x] Review diff, update docs if API/UX behavior changed
+- [x] From a transcript, Mike can click any speaker label or avatar, including the purple `Y`, to correct who is speaking.
+- [x] From a transcript, Mike can open an `Identify Speakers` flow that reviews each unknown/suggested speaker cluster one at a time.
+- [x] For each detected speaker, Mike hears a short representative audio sample before choosing an existing person or creating a new one.
+- [x] If the sample is unclear, Mike can play another sample from the same speaker cluster.
+- [x] Once Mike identifies a speaker, IR labels matching segments in that conversation and updates the local voice profile.
+- [x] Over time, confirmed profiles let IR suggest or auto-apply names across newly recorded conversations.
+- [x] Raw mixed mic+system audio is retained locally only for a configurable review window, defaulting to 7 days, then deleted while embeddings and transcript labels remain.
+- [x] After a recording finishes, IR prompts Mike to identify speakers when unknown or suggested speakers exist.
 
-## Verification
+## Current State
 
-- [x] `xcrun swift build -c debug --package-path Desktop`
-- [x] `xcrun swift test --package-path Desktop --filter TranscriptSpeakerAssignmentTests`
-- [x] Delegate read-only review of recent session changes to at least 3 subagents
-- [x] Aggregate review feedback and identify actionable findings
-- [x] Delegate fixes for actionable findings; issues were addressed
-- [x] Adjudicate questionable single-agent findings; only consensus fixes were delegated for implementation
-- [x] Delegate local CI-equivalent workflow run for `.github/workflows/*`; Swift build/tests, Rust cargo tests, and diff check passed
-- [ ] Review all user commands from this session and confirm completion
-- [ ] Close exit-gate items from the default workflow
-- [ ] Commit completed work
-- [ ] Merge completed work to main
-- [ ] Cleanup branch/worktree artifacts
-- [ ] Verify GitHub Actions on main are passing green
+- [x] Voice profiles and conservative known/suggested/unknown identity decisions exist from #111.
+- [x] Transcript speaker picker exists, but `isUser` / `You` bubbles are not clickable.
+- [x] `audio_chunks` schema already exists for local PCM storage.
+- [x] `AudioPersistenceService` already exists, but the current live audio path does not appear wired to append mixed audio chunks.
 
-## Results
+## Plan
 
-- First-pass voice identity backbone landed: conservative matching states, voice-profile sample metadata, assignment backfill hardening, and focused tests.
-- Adjudication round completed: consensus fixes are migration append-ordering, short/noisy manual-sample gating, and separating suggested/unknown confidence from applied identities.
-- Final CI-equivalent verification completed after all fixes: `xcrun swift build`, full Swift tests, Rust tests with/without `activity_test_wiring`, and `git diff --check` passed.
-- `test-install.yml` was checked with non-mutating equivalents; full install flow was not run because it writes to `/Applications`, mounts a DMG, launches the GUI app, and deletes the app.
-- Read-only release lookup found latest Omi release assets `omi.dmg` and `Omi.zip`, while `test-install.yml` currently looks for `Omi.Beta.dmg`.
-- People management UI remains a follow-up layer on top of the new reset/delete/merge store primitives.
+- [x] Make speaker labels and avatars clickable for every segment, including `You`.
+  - Existing code gates taps in `TranscriptDetailView`, `ConversationDetailView.transcriptBubblesContent`, and `SpeakerBubbleView`.
+- [x] Update `NameSpeakerSheet` so reassignment from `You` to a person is first-class, not blocked by `isUser`.
+  - Existing same-speaker filters exclude `isUser`; remove that exclusion while still saving `isUser=false` for normal people.
+- [x] Add an `Identify Speakers` entry point in the transcript header or speaker count pill.
+  - Use the drawer header because unknown/suggested state is visible while reviewing transcript detail.
+- [x] Build a review queue grouped by session speaker cluster and suggested/unknown identity state.
+  - Use `TranscriptSegment.speakerId`, `personId`, and suggested metadata; exclude already named known speakers from the default queue.
+- [x] Select good playback samples per speaker: prefer clear speech, 3-8 seconds, enough duration, no music/noise-only text, avoid very short turns.
+  - Add deterministic sample-selection helpers so tests can cover the filter without SwiftUI.
+- [x] Wire live mixed audio into `AudioPersistenceService` and link chunks to `transcriptionSessionId`.
+  - Existing tee in `AppState.startMicrophoneAudioCapture` sends mono mix to WhisperKit and diarization only.
+- [x] Add audio fetch APIs for a session/time range and convert PCM to playable audio for review.
+  - Add this to `AudioPersistenceService` near existing chunk writes; UI can play a temporary WAV file via `AVAudioPlayer`.
+- [x] Add a configurable local retention policy for `audio_chunks`; default to 7 days and purge on app launch and periodically.
+  - Store the setting in `UserDefaults` and purge from `RewindDatabase.performInitialization` plus service timer/explicit calls.
+- [x] Confirmed speaker identification should update transcript segments plus speaker embeddings for the selected sample ranges.
+  - Existing `PeopleStore.assignSegments` already backfills embeddings by segment time range; review flow should call the same assignment path.
+- [x] Cross-conversation behavior should apply automatically when confidence is high; do not add a second broad-apply confirmation step.
+- [x] Keep wrong-name risk low with strict thresholds, sample-count gates, and no training from excluded samples.
+- [x] Exclude short/music/noise-only segments like `(gentle music)` from speaker review and voice training.
+- [x] Add tests for clickable-user reassignment, audio retention purge, sample selection, and assignment backfill by sample range.
 
-## Review Notes
+## Decisions
 
-- Optimize for fewer wrong names over faster auto-labeling.
-- Store embeddings only; do not retain raw audio snippets for voice identity.
-- Treat Mike as a normal person profile, not a special `You` identity.
+- [x] Retain mixed mic+system audio only; no separate mic/system channel storage for this feature.
+- [x] Make retention a setting, with 7 days as the default.
+- [x] Show the Identify Speakers prompt automatically after a recording when reviewable speakers exist.
+- [x] Do not require a second cross-conversation apply confirmation.
+- [x] Exclude short/music/noise segments from speaker review and voice training.
+
+## References
+
+- Descript flow: detect speakers, then identify by listening to samples and assigning names.
+- Descript docs: https://help.descript.com/hc/en-us/articles/10249423506061-Detect-and-label-speakers-in-your-transcript
+- Descript speaker labels docs: https://help.descript.com/hc/en-us/articles/10164803814285-Speakers
+
+## Open Questions
+
+- When one speaker cluster has multiple possible people, should the UI require review before applying any name, or show suggested names inline?
+
+## Follow-up Review Todo
+
+- [x] Delegate at least 3 subagents to code review the recent session changes.
+- [x] Aggregate review feedback and identify consensus findings.
+- [x] Delegate fixes for consensus review findings.
+- [x] If a questionable finding appears from only one reviewer, delegate 3 more subagents to validate whether it is real before fixing.
+- [x] After addressing feedback, delegate a local CI-equivalent run covering the same logic as `.github/workflows/*`.

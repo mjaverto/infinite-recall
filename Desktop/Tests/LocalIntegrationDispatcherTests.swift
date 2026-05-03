@@ -46,6 +46,14 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
 
     override func setUp() async throws {
         try await super.setUp()
+
+        // Disable background drain during dispatcher tests so we can
+        // deterministically assert on outbox row counts without the
+        // service racing to consume them.
+        await MainActor.run {
+            LocalIntegrationDrainService.shared.isEnabled = false
+        }
+
         // Real `try` — if `listEnabled()` fails we MUST NOT proceed: the
         // dispatcher fan-out below would otherwise write test memories to
         // whatever real integrations the user has enabled. Letting setUp
@@ -64,6 +72,11 @@ final class LocalIntegrationDispatcherTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        // Restore background drain.
+        await MainActor.run {
+            LocalIntegrationDrainService.shared.isEnabled = true
+        }
+
         // Defensive sweep: drop every outbox row that belongs to one of our
         // test integrations, then drop the integrations themselves. Other
         // tests (and prior runs of this suite) may have left rows; we only

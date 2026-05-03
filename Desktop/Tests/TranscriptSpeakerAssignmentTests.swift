@@ -656,6 +656,216 @@ final class TranscriptSpeakerAssignmentTests: XCTestCase {
     XCTAssertEqual(assignment.fallbackOrders, [0])
   }
 
+  func testSpeakerReviewQueueExcludesUserShortAndNoiseOnlySegments() {
+    let segments = [
+      TranscriptSegment(
+        id: "user",
+        text: "this is mike",
+        speaker: "SPEAKER_00",
+        isUser: true,
+        personId: nil,
+        start: 0,
+        end: 5
+      ),
+      TranscriptSegment(
+        id: "short",
+        text: "hi",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 5,
+        end: 5.5
+      ),
+      TranscriptSegment(
+        id: "music",
+        text: "(gentle music)",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 6,
+        end: 10
+      ),
+      TranscriptSegment(
+        id: "reviewable",
+        text: "We should label this voice.",
+        speaker: "SPEAKER_02",
+        isUser: false,
+        personId: nil,
+        start: 11,
+        end: 15
+      )
+    ]
+
+    let queue = SpeakerReviewQueueBuilder.makeQueue(from: segments)
+    XCTAssertEqual(queue.count, 1)
+    XCTAssertEqual(queue[0].speakerId, 2)
+    XCTAssertEqual(queue[0].segmentIndices, [3])
+    XCTAssertEqual(queue[0].samples.first?.start, 11)
+    XCTAssertEqual(queue[0].samples.first?.end, 15)
+  }
+
+  func testSpeakerReviewQueueAssignsFullClusterWhileSamplingReviewableSegments() {
+    let segments = [
+      TranscriptSegment(
+        id: "short",
+        text: "ok",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 0,
+        end: 0.5
+      ),
+      TranscriptSegment(
+        id: "music",
+        text: "(gentle music)",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 1,
+        end: 4
+      ),
+      TranscriptSegment(
+        id: "reviewable",
+        text: "This is the sample we should review.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 5,
+        end: 9
+      ),
+      TranscriptSegment(
+        id: "already-named",
+        text: "Already assigned should not be relabeled by this queue item.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: "existing-person",
+        start: 10,
+        end: 14
+      )
+    ]
+
+    let queue = SpeakerReviewQueueBuilder.makeQueue(from: segments)
+
+    XCTAssertEqual(queue.count, 1)
+    XCTAssertEqual(queue[0].segmentIndices, [0, 1, 2])
+    XCTAssertEqual(queue[0].samples.map(\.segmentIndex), [2])
+  }
+
+  func testSpeakerReviewQueueRequiresThreeSecondSamplesAndDoesNotCrossSegmentBounds() {
+    let segments = [
+      TranscriptSegment(
+        id: "too-short",
+        text: "This turn has words but is too short for review playback.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 1,
+        end: 3.5
+      ),
+      TranscriptSegment(
+        id: "reviewable",
+        text: "This turn is long enough to review safely.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 10,
+        end: 13.25
+      )
+    ]
+
+    let queue = SpeakerReviewQueueBuilder.makeQueue(from: segments)
+
+    XCTAssertEqual(queue.count, 1)
+    XCTAssertEqual(queue[0].segmentIndices, [0, 1])
+    XCTAssertEqual(queue[0].samples.map(\.segmentIndex), [1])
+    XCTAssertEqual(queue[0].samples.first?.start, 10)
+    XCTAssertEqual(queue[0].samples.first?.end, 13.25)
+  }
+
+  func testSpeakerReviewQueuePrioritizesSuggestedSpeakers() {
+    let segments = [
+      TranscriptSegment(
+        id: "unknown",
+        text: "Unknown speaker with enough speech.",
+        speaker: "SPEAKER_03",
+        isUser: false,
+        personId: nil,
+        start: 0,
+        end: 4
+      ),
+      TranscriptSegment(
+        id: "suggested",
+        text: "Suggested speaker with enough speech.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        suggestedPersonId: "p1",
+        suggestedSimilarity: 0.78,
+        suggestedMargin: 0.05,
+        suggestedSampleCount: 2,
+        start: 5,
+        end: 9
+      )
+    ]
+
+    let queue = SpeakerReviewQueueBuilder.makeQueue(from: segments)
+    XCTAssertEqual(queue.map(\.speakerId), [1, 3])
+    XCTAssertEqual(queue.first?.suggestedPersonId, "p1")
+  }
+
+  func testSpeakerReviewQueuePreservesSuggestionWhenLongestSampleIsUnknown() {
+    let segments = [
+      TranscriptSegment(
+        id: "long-unknown",
+        text: "This long sample lacks suggested identity metadata.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 0,
+        end: 8
+      ),
+      TranscriptSegment(
+        id: "short-suggested",
+        text: "yes",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        suggestedPersonId: "p1",
+        suggestedSimilarity: 0.82,
+        suggestedMargin: 0.04,
+        suggestedSampleCount: 2,
+        start: 9,
+        end: 9.5
+      ),
+      TranscriptSegment(
+        id: "other-unknown",
+        text: "Another unknown speaker with enough speech.",
+        speaker: "SPEAKER_02",
+        isUser: false,
+        personId: nil,
+        start: 10,
+        end: 14
+      )
+    ]
+
+    let queue = SpeakerReviewQueueBuilder.makeQueue(from: segments)
+
+    XCTAssertEqual(queue.map(\.speakerId), [1, 2])
+    XCTAssertEqual(queue.first?.suggestedPersonId, "p1")
+    XCTAssertEqual(queue.first?.suggestedSimilarity, 0.82)
+    XCTAssertEqual(queue.first?.segmentIndices, [0, 1])
+    XCTAssertEqual(queue.first?.samples.map(\.segmentIndex), [0])
+  }
+
+  func testSpeakerAssignmentTargetEncodesYouAndPersonAssignments() {
+    XCTAssertNil(SpeakerAssignmentTarget.you.personId)
+    XCTAssertTrue(SpeakerAssignmentTarget.you.isUser)
+
+    let personTarget = SpeakerAssignmentTarget.person("person-1")
+    XCTAssertEqual(personTarget.personId, "person-1")
+    XCTAssertFalse(personTarget.isUser)
+  }
+
   func testTranscriptSegmentDecodesSuggestedCandidateMetadata() throws {
     let json = """
       {

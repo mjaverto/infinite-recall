@@ -14,7 +14,7 @@ struct TranscriptDetailView: View {
                         segment: segment,
                         isUser: segment.isUser,
                         personName: segment.personId.flatMap { peopleById[$0]?.name },
-                        onSpeakerTapped: segment.isUser ? nil : (onSpeakerTapped != nil ? { onSpeakerTapped?(segment) } : nil)
+                        onSpeakerTapped: onSpeakerTapped != nil ? { onSpeakerTapped?(segment) } : nil
                     )
                 }
             }

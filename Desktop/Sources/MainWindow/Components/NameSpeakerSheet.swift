@@ -1,5 +1,28 @@
 import SwiftUI
 
+enum SpeakerAssignmentTarget: Equatable {
+    case you
+    case person(String)
+
+    var personId: String? {
+        switch self {
+        case .you:
+            return nil
+        case .person(let id):
+            return id
+        }
+    }
+
+    var isUser: Bool {
+        switch self {
+        case .you:
+            return true
+        case .person:
+            return false
+        }
+    }
+}
+
 /// Modal sheet for naming a speaker in a transcript
 struct NameSpeakerSheet: View {
     let segment: TranscriptSegment
@@ -9,7 +32,7 @@ struct NameSpeakerSheet: View {
     let onCreatePerson: (_ name: String) async -> Person?
     let onDismiss: () -> Void
 
-    @State private var selectedPersonId: String? = nil
+    @State private var selectedTarget: SpeakerAssignmentTarget? = nil
     @State private var isAddingNewPerson: Bool = false
     @State private var newPersonName: String = ""
     @State private var duplicateWarning: String? = nil
@@ -19,13 +42,13 @@ struct NameSpeakerSheet: View {
 
     /// Segments from the same speaker in this conversation
     private var sameSpeakerSegments: [TranscriptSegment] {
-        allSegments.filter { $0.speaker == segment.speaker && !$0.isUser }
+        allSegments.filter { $0.speaker == segment.speaker }
     }
 
     /// Segment indices (positional index in allSegments) for the same speaker
     private var sameSpeakerIndices: [Int] {
         allSegments.enumerated().compactMap { index, seg in
-            seg.speaker == segment.speaker && !seg.isUser ? index : nil
+            seg.speaker == segment.speaker ? index : nil
         }
     }
 
@@ -129,7 +152,7 @@ struct NameSpeakerSheet: View {
                             .scaledFont(size: 12, weight: .semibold)
                             .foregroundColor(OmiColors.textPrimary)
                     )
-                Text("Speaker \(segment.speakerId)")
+                Text(segment.isUser ? "You" : "Speaker \(segment.speakerId)")
                     .scaledFont(size: 14, weight: .medium)
                     .foregroundColor(OmiColors.textPrimary)
             }
@@ -151,88 +174,18 @@ struct NameSpeakerSheet: View {
     // MARK: - People Selection
 
     private var peopleSelectionSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Who is this?")
-                .scaledFont(size: 13, weight: .medium)
-                .foregroundColor(OmiColors.textSecondary)
-
-            FlowLayout(spacing: 8) {
-                // Existing people chips
-                ForEach(people) { person in
-                    personChip(label: person.name, isSelected: selectedPersonId == person.id) {
-                        selectedPersonId = person.id
-                        isAddingNewPerson = false
-                        newPersonName = ""
-                        duplicateWarning = nil
-                    }
-                }
-
-                // "+ Add Person" chip
-                personChip(label: "+ Add Person", isSelected: isAddingNewPerson, isAction: true) {
-                    isAddingNewPerson = true
-                    selectedPersonId = nil
-                    duplicateWarning = nil
-                }
-            }
-
-            // Inline text field for new person name
-            if isAddingNewPerson {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        TextField("Person name", text: $newPersonName)
-                            .textFieldStyle(.plain)
-                            .scaledFont(size: 13)
-                            .foregroundColor(OmiColors.textPrimary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(OmiColors.backgroundSecondary)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(duplicateWarning != nil ? OmiColors.error : OmiColors.border, lineWidth: 1)
-                            )
-                            .onChange(of: newPersonName) { _, newValue in
-                                validateName(newValue)
-                            }
-                            .onSubmit {
-                                if !newPersonName.trimmingCharacters(in: .whitespaces).isEmpty && duplicateWarning == nil {
-                                    Task { await createAndSelect() }
-                                }
-                            }
-
-                        Button(action: {
-                            Task { await createAndSelect() }
-                        }) {
-                            if isCreating {
-                                ProgressView()
-                                    .scaleEffect(0.5)
-                                    .frame(width: 14, height: 14)
-                            } else {
-                                Text("Add")
-                                    .scaledFont(size: 12, weight: .medium)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(canCreate ? .black : OmiColors.textTertiary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(
-                            Capsule()
-                                .fill(canCreate ? Color.white : OmiColors.backgroundTertiary)
-                        )
-                        .disabled(!canCreate || isCreating)
-                    }
-
-                    if let warning = duplicateWarning {
-                        Text(warning)
-                            .scaledFont(size: 11)
-                            .foregroundColor(OmiColors.error)
-                    }
-                }
-            }
-        }
+        SpeakerPeopleSelectionSection(
+            people: people,
+            selectedTarget: $selectedTarget,
+            isAddingNewPerson: $isAddingNewPerson,
+            newPersonName: $newPersonName,
+            duplicateWarning: $duplicateWarning,
+            canCreate: canCreate,
+            isCreating: isCreating,
+            showsCreationProgress: true,
+            onNameChange: validateName,
+            onCreate: { Task { await createAndSelect() } }
+        )
     }
 
     // MARK: - Tag Other Segments Toggle
@@ -249,7 +202,7 @@ struct NameSpeakerSheet: View {
     // MARK: - Helpers
 
     private var canSave: Bool {
-        selectedPersonId != nil
+        selectedTarget != nil
     }
 
     private var canCreate: Bool {
@@ -272,7 +225,7 @@ struct NameSpeakerSheet: View {
 
         isCreating = true
         if let person = await onCreatePerson(trimmed) {
-            selectedPersonId = person.id
+            selectedTarget = .person(person.id)
             isAddingNewPerson = false
             newPersonName = ""
         }
@@ -280,27 +233,10 @@ struct NameSpeakerSheet: View {
     }
 
     private func save() {
+        guard let target = selectedTarget else { return }
         isSaving = true
         let segmentIndices = tagAllFromSpeaker ? sameSpeakerIndices : [tappedSegmentIndex]
-        onSave(selectedPersonId, false, segmentIndices)
+        onSave(target.personId, target.isUser, segmentIndices)
     }
 
-    private func personChip(label: String, isSelected: Bool, isAction: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .scaledFont(size: 13, weight: isSelected ? .semibold : .regular)
-                .foregroundColor(isSelected ? .black : (isAction ? OmiColors.purplePrimary : OmiColors.textPrimary))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(
-                    Capsule()
-                        .fill(isSelected ? Color.white : OmiColors.backgroundTertiary)
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(isSelected ? OmiColors.border : (isAction ? OmiColors.purplePrimary.opacity(0.3) : Color.clear), lineWidth: 1)
-                )
-        }
-        .buttonStyle(.plain)
-    }
 }

@@ -21,6 +21,9 @@ struct DesktopHomeView: View {
     let tier = UserDefaults.standard.integer(forKey: "currentTierLevel")
     return SidebarNavItem.dashboard.rawValue
   }()
+  @State private var selectedConversation: ServerConversation? = nil
+  @State private var autoOpenIdentifySpeakersConversationId: String? = nil
+  @State private var pendingLocalSpeakerReviewSessionIds: Set<Int64> = []
   @State private var isSidebarCollapsed: Bool = false
   @AppStorage("currentTierLevel") private var currentTierLevel = 0
   @AppStorage("onboardingStep") private var onboardingStep = 0
@@ -598,6 +601,141 @@ struct DesktopHomeView: View {
       index == SidebarNavItem.memories.rawValue
   }
 
+  private func handleCompletedConversationMayNeedSpeakerReview(_ notification: Notification) {
+    guard let conversationId = notification.userInfo?["conversationId"] as? String,
+      !conversationId.isEmpty
+    else { return }
+
+    let sessionId = notificationSessionId(from: notification)
+    Task {
+      await appState.loadConversations()
+
+      let conversation: ServerConversation?
+      if let sessionId {
+        if let localConversation = await conversationForSpeakerReviewIfNeeded(sessionId: sessionId) {
+          conversation = localConversation
+        } else {
+          conversation = await conversationForSpeakerReviewIfNeeded(conversationId: conversationId)
+        }
+      } else {
+        conversation = await conversationForSpeakerReviewIfNeeded(conversationId: conversationId)
+      }
+
+      guard let conversation else { return }
+      await MainActor.run {
+        presentConversationForSpeakerReview(conversation)
+      }
+    }
+  }
+
+  private func handleLocalConversationAwaitingSpeakerReviewTranscriptSegments(
+    _ notification: Notification
+  ) {
+    guard let sessionId = notificationSessionId(from: notification) else { return }
+    pendingLocalSpeakerReviewSessionIds.insert(sessionId)
+  }
+
+  private func handleConversationsListNeedsRefreshForPendingSpeakerReview(_ notification: Notification) {
+    guard let sessionId = notificationSessionId(from: notification),
+      pendingLocalSpeakerReviewSessionIds.contains(sessionId)
+    else { return }
+
+    Task {
+      await appState.loadConversations()
+      let conversation = await conversationForSpeakerReviewIfNeeded(sessionId: sessionId)
+      await MainActor.run {
+        pendingLocalSpeakerReviewSessionIds.remove(sessionId)
+        guard let conversation else { return }
+        presentConversationForSpeakerReview(conversation)
+      }
+    }
+  }
+
+  private func presentConversationForSpeakerReview(_ conversation: ServerConversation) {
+    autoOpenIdentifySpeakersConversationId = conversation.id
+    selectedConversation = conversation
+    withAnimation(.easeInOut(duration: 0.2)) {
+      selectedIndex = SidebarNavItem.conversations.rawValue
+    }
+  }
+
+  private func conversationForSpeakerReviewIfNeeded(sessionId: Int64) async -> ServerConversation? {
+    do {
+      guard let session = try await TranscriptionStorage.shared.getSession(id: sessionId),
+        let rowId = session.id
+      else { return nil }
+
+      let segmentRecords = try await TranscriptionStorage.shared.getSegments(sessionId: rowId)
+      let segments = segmentRecords.map { $0.toTranscriptSegment() }
+      guard !SpeakerReviewQueueBuilder.makeQueue(from: segments).isEmpty else { return nil }
+
+      let conversationId = session.backendId ?? "local-\(rowId)"
+      if var conversation = appState.conversations.first(where: { $0.id == conversationId }) {
+        conversation.transcriptSegments = segments
+        return conversation
+      }
+
+      return session.toServerConversation(segments: segmentRecords)
+    } catch {
+      logError("DesktopHomeView: Failed to load local conversation for speaker review", error: error)
+      return nil
+    }
+  }
+
+  private func conversationForSpeakerReviewIfNeeded(conversationId: String) async -> ServerConversation? {
+    guard var conversation = appState.conversations.first(where: { $0.id == conversationId }) else {
+      return nil
+    }
+
+    if conversation.transcriptSegments.isEmpty,
+      let segments = await loadTranscriptSegments(for: conversation)
+    {
+      conversation.transcriptSegments = segments
+    }
+
+    guard !SpeakerReviewQueueBuilder.makeQueue(from: conversation.transcriptSegments).isEmpty else {
+      return nil
+    }
+
+    return conversation
+  }
+
+  private func loadTranscriptSegments(for conversation: ServerConversation) async -> [TranscriptSegment]? {
+    do {
+      let session: TranscriptionSessionRecord?
+      if conversation.id.hasPrefix("local-"),
+        let rowId = Int64(conversation.id.dropFirst("local-".count))
+      {
+        session = try await TranscriptionStorage.shared.getSession(id: rowId)
+      } else {
+        session = try await TranscriptionStorage.shared.getSessionByBackendId(conversation.id)
+      }
+
+      guard let session, let sessionRowId = session.id else { return nil }
+      return try await TranscriptionStorage.shared.getSegments(sessionId: sessionRowId)
+        .map { $0.toTranscriptSegment() }
+    } catch {
+      logError("DesktopHomeView: Failed to load transcript segments for speaker review", error: error)
+      return nil
+    }
+  }
+
+  private func notificationSessionId(from notification: Notification) -> Int64? {
+    guard let userInfo = notification.userInfo else { return nil }
+    for key in ["sessionId", "session_id"] {
+      if let value = userInfo[key] as? Int64 {
+        return value
+      }
+      if let value = userInfo[key] as? Int {
+        return Int64(value)
+      }
+      if let value = userInfo[key] as? String, let parsed = Int64(value) {
+        return parsed
+      }
+    }
+    return nil
+  }
+
   private var mainContent: some View {
     HStack(spacing: 0) {
       // Sidebar slot: settings sidebar overlays main sidebar
@@ -660,7 +798,9 @@ struct DesktopHomeView: View {
           viewModelContainer: viewModelContainer,
           selectedSettingsSection: $selectedSettingsSection,
           highlightedSettingId: $highlightedSettingId,
-          selectedTabIndex: $selectedIndex
+          selectedTabIndex: $selectedIndex,
+          selectedConversation: $selectedConversation,
+          autoOpenIdentifySpeakersConversationId: $autoOpenIdentifySpeakersConversationId
         )
         .id(selectedIndex)
         .transition(.opacity.combined(with: .move(edge: .trailing)))
@@ -696,6 +836,14 @@ struct DesktopHomeView: View {
     .onReceive(NotificationCenter.default.publisher(for: .showTryAskingPopup)) { _ in
       showTryAskingPopup = true
     }
+    .modifier(
+      SpeakerReviewNavigationNotifications(
+        onCompletedConversationMayNeedReview: handleCompletedConversationMayNeedSpeakerReview,
+        onLocalConversationAwaitingSegments:
+          handleLocalConversationAwaitingSpeakerReviewTranscriptSegments,
+        onConversationsListNeedsRefresh: handleConversationsListNeedsRefreshForPendingSpeakerReview
+      )
+    )
     .onReceive(NotificationCenter.default.publisher(for: .navigateToRewindSettings)) { _ in
       // Set the section directly and navigate to settings
       selectedSettingsSection = .rewind
@@ -785,6 +933,30 @@ struct DesktopHomeView: View {
   }
 }
 
+private struct SpeakerReviewNavigationNotifications: ViewModifier {
+  let onCompletedConversationMayNeedReview: (Notification) -> Void
+  let onLocalConversationAwaitingSegments: (Notification) -> Void
+  let onConversationsListNeedsRefresh: (Notification) -> Void
+
+  func body(content: Content) -> some View {
+    content
+      .onReceive(NotificationCenter.default.publisher(for: .completedConversationMayNeedSpeakerReview)) {
+        notification in
+        onCompletedConversationMayNeedReview(notification)
+      }
+      .onReceive(
+        NotificationCenter.default.publisher(
+          for: .localConversationAwaitingSpeakerReviewTranscriptSegments)
+      ) { notification in
+        onLocalConversationAwaitingSegments(notification)
+      }
+      .onReceive(NotificationCenter.default.publisher(for: .conversationsListNeedsRefresh)) {
+        notification in
+        onConversationsListNeedsRefresh(notification)
+      }
+  }
+}
+
 /// Isolated page content switch — does NOT observe AppState or ViewModelContainer
 /// as @ObservedObject, so pages like TasksPage won't re-render when unrelated
 /// AppState properties (conversations, permissions, etc.) change.
@@ -795,6 +967,8 @@ private struct PageContentView: View {
   @Binding var selectedSettingsSection: SettingsContentView.SettingsSection
   @Binding var highlightedSettingId: String?
   @Binding var selectedTabIndex: Int
+  @Binding var selectedConversation: ServerConversation?
+  @Binding var autoOpenIdentifySpeakersConversationId: String?
 
   var body: some View {
     let _ = log("RENDER: PageContentView body evaluated (index=\(selectedIndex))")
@@ -808,7 +982,10 @@ private struct PageContentView: View {
           chatProvider: viewModelContainer.chatProvider,
           selectedIndex: $selectedTabIndex)
       case 1:
-        ConversationsPageHost(appState: appState)
+        ConversationsPageHost(
+          appState: appState,
+          selectedConversation: $selectedConversation,
+          autoOpenIdentifySpeakersConversationId: $autoOpenIdentifySpeakersConversationId)
       case 2:
         ChatPage(
           appProvider: viewModelContainer.appProvider, chatProvider: viewModelContainer.chatProvider
@@ -861,10 +1038,14 @@ private struct PageContentView: View {
 /// so tapping a row navigates to the detail view.
 private struct ConversationsPageHost: View {
   let appState: AppState
-  @State private var selectedConversation: ServerConversation? = nil
+  @Binding var selectedConversation: ServerConversation?
+  @Binding var autoOpenIdentifySpeakersConversationId: String?
 
   var body: some View {
-    ConversationsPage(appState: appState, selectedConversation: $selectedConversation)
+    ConversationsPage(
+      appState: appState,
+      selectedConversation: $selectedConversation,
+      autoOpenIdentifySpeakersConversationId: $autoOpenIdentifySpeakersConversationId)
   }
 }
 

@@ -22,16 +22,29 @@ class AudioMixer {
     // MARK: - Properties
 
     private let outputMode: OutputMode
+    private let counterpartWaitTimeout: TimeInterval
     private var onMixedChunk: AudioChunkHandler?
     private var isRunning = false
+    private var micAudioAvailable: Bool
+    private var systemAudioAvailable: Bool
 
-    init(outputMode: OutputMode = .mono) {
+    init(
+        outputMode: OutputMode = .mono,
+        micAudioAvailable: Bool = true,
+        systemAudioAvailable: Bool = true,
+        counterpartWaitTimeout: TimeInterval = 0.25
+    ) {
         self.outputMode = outputMode
+        self.micAudioAvailable = micAudioAvailable
+        self.systemAudioAvailable = systemAudioAvailable
+        self.counterpartWaitTimeout = counterpartWaitTimeout
     }
 
     // Audio buffers (16kHz mono Int16 PCM)
     private var micBuffer = Data()
     private var systemBuffer = Data()
+    private var micBufferFirstSampleAt: Date?
+    private var systemBufferFirstSampleAt: Date?
     private let bufferLock = NSLock()
 
     // Minimum samples before producing output (100ms at 16kHz = 1600 samples = 3200 bytes)
@@ -51,6 +64,8 @@ class AudioMixer {
         self.isRunning = true
         micBuffer = Data()
         systemBuffer = Data()
+        micBufferFirstSampleAt = nil
+        systemBufferFirstSampleAt = nil
         bufferLock.unlock()
         log("AudioMixer: Started (mode=\(outputMode == .mono ? "mono" : "stereo"))")
     }
@@ -63,9 +78,33 @@ class AudioMixer {
         processBuffers(flush: true)
         micBuffer = Data()
         systemBuffer = Data()
+        micBufferFirstSampleAt = nil
+        systemBufferFirstSampleAt = nil
         onMixedChunk = nil
         bufferLock.unlock()
         log("AudioMixer: Stopped")
+    }
+
+    func setMicAudioAvailable(_ available: Bool) {
+        bufferLock.lock()
+        defer { bufferLock.unlock() }
+        micAudioAvailable = available
+        if !available {
+            micBuffer = Data()
+            micBufferFirstSampleAt = nil
+        }
+        processBuffers()
+    }
+
+    func setSystemAudioAvailable(_ available: Bool) {
+        bufferLock.lock()
+        defer { bufferLock.unlock() }
+        systemAudioAvailable = available
+        if !available {
+            systemBuffer = Data()
+            systemBufferFirstSampleAt = nil
+        }
+        processBuffers()
     }
 
     /// Add microphone audio (16kHz mono Int16 PCM)
@@ -75,12 +114,13 @@ class AudioMixer {
 
         guard isRunning else { return }
 
-        micBuffer.append(data)
+        append(data, to: &micBuffer, firstSampleAt: &micBufferFirstSampleAt)
 
         // Prevent unbounded buffer growth
         if micBuffer.count > maxBufferBytes {
             let excess = micBuffer.count - maxBufferBytes
             micBuffer.removeFirst(excess)
+            micBufferFirstSampleAt = Date()
         }
 
         processBuffers()
@@ -93,12 +133,13 @@ class AudioMixer {
 
         guard isRunning else { return }
 
-        systemBuffer.append(data)
+        append(data, to: &systemBuffer, firstSampleAt: &systemBufferFirstSampleAt)
 
         // Prevent unbounded buffer growth
         if systemBuffer.count > maxBufferBytes {
             let excess = systemBuffer.count - maxBufferBytes
             systemBuffer.removeFirst(excess)
+            systemBufferFirstSampleAt = Date()
         }
 
         processBuffers()
@@ -111,22 +152,10 @@ class AudioMixer {
     private func processBuffers(flush: Bool = false) {
         guard isRunning || flush else { return }
 
-        // Check if we have enough data (or flushing)
         let minRequired = flush ? 2 : minBufferBytes  // At least 1 sample (2 bytes) when flushing
         guard micBuffer.count >= minRequired || systemBuffer.count >= minRequired else { return }
 
-        // Determine how many bytes to process (match the shorter buffer, aligned to sample boundary)
-        let bytesToProcess: Int
-        if flush {
-            // When flushing, process whatever is available
-            bytesToProcess = max(micBuffer.count, systemBuffer.count)
-        } else {
-            // Normal operation: process when both have data
-            let minAvailable = min(micBuffer.count, systemBuffer.count)
-            guard minAvailable >= minBufferBytes else { return }
-            // Align to sample boundary (2 bytes per Int16 sample)
-            bytesToProcess = (minAvailable / 2) * 2
-        }
+        guard let bytesToProcess = bytesToProcess(flush: flush) else { return }
 
         guard bytesToProcess >= 2 else { return }
 
@@ -141,6 +170,7 @@ class AudioMixer {
             // Pad mic buffer with silence
             micData = micBuffer + Data(repeating: 0, count: bytesToProcess - micBuffer.count)
             micBuffer = Data()
+            micBufferFirstSampleAt = nil
         }
 
         if systemBuffer.count >= bytesToProcess {
@@ -150,7 +180,9 @@ class AudioMixer {
             // Pad system buffer with silence
             sysData = systemBuffer + Data(repeating: 0, count: bytesToProcess - systemBuffer.count)
             systemBuffer = Data()
+            systemBufferFirstSampleAt = nil
         }
+        updateFirstSampleMarkersAfterRemoval()
 
         // Produce mixed output in the configured mode
         let mixed: Data
@@ -163,6 +195,71 @@ class AudioMixer {
 
         // Send to callback
         onMixedChunk?(mixed)
+    }
+
+    private func append(_ data: Data, to buffer: inout Data, firstSampleAt: inout Date?) {
+        if buffer.isEmpty {
+            firstSampleAt = Date()
+        }
+        buffer.append(data)
+    }
+
+    private func bytesToProcess(flush: Bool) -> Int? {
+        if flush {
+            return (max(micBuffer.count, systemBuffer.count) / 2) * 2
+        }
+
+        let micCount = micAudioAvailable ? micBuffer.count : 0
+        let systemCount = systemAudioAvailable ? systemBuffer.count : 0
+        let maxAvailable = max(micCount, systemCount)
+        guard maxAvailable >= minBufferBytes else { return nil }
+
+        if micAudioAvailable && systemAudioAvailable {
+            let minAvailable = min(micBuffer.count, systemBuffer.count)
+            if minAvailable >= minBufferBytes {
+                return (minAvailable / 2) * 2
+            }
+            guard hasWaitedForCounterpartLongEnough() else { return nil }
+            return (maxAvailable / 2) * 2
+        }
+
+        if micAudioAvailable {
+            return (micBuffer.count / 2) * 2
+        }
+        if systemAudioAvailable {
+            return (systemBuffer.count / 2) * 2
+        }
+        return nil
+    }
+
+    private func hasWaitedForCounterpartLongEnough(now: Date = Date()) -> Bool {
+        let oldestBufferedAt: Date?
+        switch (micBufferFirstSampleAt, systemBufferFirstSampleAt) {
+        case let (micStarted?, systemStarted?):
+            oldestBufferedAt = min(micStarted, systemStarted)
+        case let (micStarted?, nil):
+            oldestBufferedAt = micStarted
+        case let (nil, systemStarted?):
+            oldestBufferedAt = systemStarted
+        case (nil, nil):
+            oldestBufferedAt = nil
+        }
+        guard let oldestBufferedAt else { return false }
+        return now.timeIntervalSince(oldestBufferedAt) >= counterpartWaitTimeout
+    }
+
+    private func updateFirstSampleMarkersAfterRemoval() {
+        if micBuffer.isEmpty {
+            micBufferFirstSampleAt = nil
+        } else {
+            micBufferFirstSampleAt = Date()
+        }
+
+        if systemBuffer.isEmpty {
+            systemBufferFirstSampleAt = nil
+        } else {
+            systemBufferFirstSampleAt = Date()
+        }
     }
 
     /// Sum two mono Int16 streams into a single mono Int16 stream.

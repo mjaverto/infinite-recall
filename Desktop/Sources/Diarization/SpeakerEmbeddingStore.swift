@@ -76,6 +76,10 @@ enum VoiceMatchDecision: Equatable {
     }
 }
 
+enum SpeakerEmbeddingStoreError: Error {
+    case databaseUnavailable
+}
+
 /// Actor that owns DB I/O for speaker embeddings + the in-memory match index.
 actor SpeakerEmbeddingStore {
     static let shared = SpeakerEmbeddingStore()
@@ -94,6 +98,18 @@ actor SpeakerEmbeddingStore {
         var centroid: [Float]
         var sampleCount: Int
         var totalDuration: Double
+    }
+
+    struct AssignmentRange {
+        let start: Double
+        let end: Double
+        let allowsTraining: Bool
+
+        init(start: Double, end: Double, allowsTraining: Bool = true) {
+            self.start = start
+            self.end = end
+            self.allowsTraining = allowsTraining
+        }
     }
 
     /// Cached centroid embedding per person (mean of their stored embeddings).
@@ -184,122 +200,185 @@ actor SpeakerEmbeddingStore {
 
     /// Backfill `personId` on previously-recorded embeddings (e.g. when the
     /// user names "Speaker 1" mid-conversation).
+    @discardableResult
     func assignPersonToEmbeddings(
         sessionId: Int64,
         speakerId: Int,
         personId: String?
-    ) async {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+    ) async throws -> Int {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw SpeakerEmbeddingStoreError.databaseUnavailable
+        }
         do {
-            try await dbQueue.write { db in
-                try db.execute(
-                    sql: """
-                        UPDATE speaker_embeddings
-                        SET personId = ?,
-                            assignmentSource = ?,
-                            matchConfidence = NULL,
-                            isTrainingSample = CASE
-                                WHEN ? IS NULL THEN 0
-                                WHEN embeddingModel = ?
-                                  AND embeddingVersion = ?
-                                  AND (endTime - startTime) >= ? THEN 1
-                                ELSE 0
-                            END
-                        WHERE sessionId = ? AND speakerId = ?
-                        """,
-                    arguments: [
-                        personId,
-                        personId == nil ? nil : VoiceProfileAssignmentSource.manual.rawValue,
-                        personId,
-                        SpeakerEmbeddingStore.defaultEmbeddingModel,
-                        SpeakerEmbeddingStore.defaultEmbeddingVersion,
-                        SpeakerEmbeddingStore.minimumMatchDuration,
-                        sessionId,
-                        speakerId
-                    ]
+            let updated = try await dbQueue.write { db in
+                try Self.assignPersonToEmbeddings(
+                    in: db,
+                    sessionId: sessionId,
+                    speakerId: speakerId,
+                    personId: personId
                 )
             }
             // Invalidate cached centroid so next match call rebuilds it.
             if let pid = personId { personProfiles.removeValue(forKey: pid) }
             centroidsLoaded = false
+            return updated
         } catch {
             logError("SpeakerEmbeddingStore: backfill failed", error: error)
             await RewindDatabase.shared.reportQueryError(error)
+            throw error
         }
     }
 
     /// Assign a person only for embeddings overlapping the provided time ranges.
     /// Used to avoid contaminating an entire session-local speaker cluster when
     /// the user tags only a subset of segments.
+    @discardableResult
     func assignPersonToEmbeddings(
         sessionId: Int64,
         speakerId: Int,
         personId: String?,
         overlapping ranges: [(start: Double, end: Double)]
-    ) async {
-        guard !ranges.isEmpty else { return }
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+    ) async throws -> Int {
+        guard !ranges.isEmpty else { return 0 }
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw SpeakerEmbeddingStoreError.databaseUnavailable
+        }
         do {
-            try await dbQueue.write { db in
-                for r in ranges {
-                    // Overlap test: [startTime, endTime] intersects [r.start, r.end].
-                    try db.execute(
-                        sql: """
-                            UPDATE speaker_embeddings
-                            SET personId = ?,
-                                assignmentSource = ?,
-                                matchConfidence = NULL,
-                                isTrainingSample = 0
-                            WHERE sessionId = ?
-                              AND speakerId = ?
-                              AND NOT (endTime <= ? OR startTime >= ?)
-                            """,
-                        arguments: [
-                            personId,
-                            personId == nil ? nil : VoiceProfileAssignmentSource.manual.rawValue,
-                            sessionId,
-                            speakerId,
-                            r.start,
-                            r.end
-                        ]
-                    )
-                }
-                if personId != nil {
-                    for r in ranges {
-                        try db.execute(
-                            sql: """
-                                UPDATE speaker_embeddings
-                                SET isTrainingSample = 1
-                                WHERE sessionId = ?
-                                  AND speakerId = ?
-                                  AND personId = ?
-                                  AND embeddingModel = ?
-                                  AND embeddingVersion = ?
-                                  AND NOT (endTime <= ? OR startTime >= ?)
-                                  AND (MIN(endTime, ?) - MAX(startTime, ?)) >= ?
-                                """,
-                            arguments: [
-                                sessionId,
-                                speakerId,
-                                personId,
-                                SpeakerEmbeddingStore.defaultEmbeddingModel,
-                                SpeakerEmbeddingStore.defaultEmbeddingVersion,
-                                r.start,
-                                r.end,
-                                r.end,
-                                r.start,
-                                SpeakerEmbeddingStore.minimumMatchDuration
-                            ]
-                        )
-                    }
-                }
+            let assignmentRanges = ranges.map {
+                AssignmentRange(start: $0.start, end: $0.end)
+            }
+            let updated = try await dbQueue.write { db in
+                try Self.assignPersonToEmbeddings(
+                    in: db,
+                    sessionId: sessionId,
+                    speakerId: speakerId,
+                    personId: personId,
+                    overlapping: assignmentRanges
+                )
             }
             if let pid = personId { personProfiles.removeValue(forKey: pid) }
             centroidsLoaded = false
+            return updated
         } catch {
             logError("SpeakerEmbeddingStore: ranged backfill failed", error: error)
             await RewindDatabase.shared.reportQueryError(error)
+            throw error
         }
+    }
+
+    @discardableResult
+    static func assignPersonToEmbeddings(
+        in db: Database,
+        sessionId: Int64,
+        speakerId: Int,
+        personId: String?,
+        overlapping ranges: [AssignmentRange]? = nil
+    ) throws -> Int {
+        if let ranges {
+            guard !ranges.isEmpty else { return 0 }
+            return try assignPersonToEmbeddingsInRanges(
+                in: db,
+                sessionId: sessionId,
+                speakerId: speakerId,
+                personId: personId,
+                ranges: ranges
+            )
+        }
+
+        try db.execute(
+            sql: """
+                UPDATE speaker_embeddings
+                SET personId = ?,
+                    assignmentSource = ?,
+                    matchConfidence = NULL,
+                    isTrainingSample = CASE
+                        WHEN ? IS NULL THEN 0
+                        WHEN embeddingModel = ?
+                          AND embeddingVersion = ?
+                          AND (endTime - startTime) >= ? THEN 1
+                        ELSE 0
+                    END
+                WHERE sessionId = ? AND speakerId = ?
+                """,
+            arguments: [
+                personId,
+                personId == nil ? nil : VoiceProfileAssignmentSource.manual.rawValue,
+                personId,
+                SpeakerEmbeddingStore.defaultEmbeddingModel,
+                SpeakerEmbeddingStore.defaultEmbeddingVersion,
+                SpeakerEmbeddingStore.minimumMatchDuration,
+                sessionId,
+                speakerId
+            ]
+        )
+        return db.changesCount
+    }
+
+    private static func assignPersonToEmbeddingsInRanges(
+        in db: Database,
+        sessionId: Int64,
+        speakerId: Int,
+        personId: String?,
+        ranges: [AssignmentRange]
+    ) throws -> Int {
+        var updatedRows = 0
+        for range in ranges {
+            // Overlap test: [startTime, endTime] intersects [range.start, range.end].
+            try db.execute(
+                sql: """
+                    UPDATE speaker_embeddings
+                    SET personId = ?,
+                        assignmentSource = ?,
+                        matchConfidence = NULL,
+                        isTrainingSample = 0
+                    WHERE sessionId = ?
+                      AND speakerId = ?
+                      AND NOT (endTime <= ? OR startTime >= ?)
+                    """,
+                arguments: [
+                    personId,
+                    personId == nil ? nil : VoiceProfileAssignmentSource.manual.rawValue,
+                    sessionId,
+                    speakerId,
+                    range.start,
+                    range.end
+                ]
+            )
+            updatedRows += db.changesCount
+        }
+
+        guard personId != nil else { return updatedRows }
+
+        for range in ranges where range.allowsTraining {
+            try db.execute(
+                sql: """
+                    UPDATE speaker_embeddings
+                    SET isTrainingSample = 1
+                    WHERE sessionId = ?
+                      AND speakerId = ?
+                      AND personId = ?
+                      AND embeddingModel = ?
+                      AND embeddingVersion = ?
+                      AND NOT (endTime <= ? OR startTime >= ?)
+                      AND (MIN(endTime, ?) - MAX(startTime, ?)) >= ?
+                    """,
+                arguments: [
+                    sessionId,
+                    speakerId,
+                    personId,
+                    SpeakerEmbeddingStore.defaultEmbeddingModel,
+                    SpeakerEmbeddingStore.defaultEmbeddingVersion,
+                    range.start,
+                    range.end,
+                    range.end,
+                    range.start,
+                    SpeakerEmbeddingStore.minimumMatchDuration
+                ]
+            )
+            updatedRows += db.changesCount
+        }
+
+        return updatedRows
     }
 
     // MARK: - Matching
