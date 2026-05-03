@@ -308,31 +308,11 @@ public final class ProcessingGateReporter {
   /// True when the error looks like the Rust daemon just restarted (token
   /// rotated → 401, socket gone → connection refused, gateway-class 5xx).
   /// Used to invalidate the local `lastPostedState` cache so the next
-  /// successful POST re-syncs the daemon.
+  /// successful POST re-syncs the daemon. Delegates to
+  /// `DaemonErrorClassifier` so this reporter, `InternalPostFailureTracker`,
+  /// and `ActivityMonitorService` cannot drift.
   private static func isDaemonRestartIndicator(_ error: Error) -> Bool {
-    if let api = error as? APIError {
-      switch api {
-      case .unauthorized:
-        return true
-      case .httpError(let code) where code == 502 || code == 503 || code == 504:
-        return true
-      default:
-        break
-      }
-    }
-    let nsErr = error as NSError
-    if nsErr.domain == NSURLErrorDomain {
-      switch nsErr.code {
-      case NSURLErrorCannotConnectToHost,
-        NSURLErrorNetworkConnectionLost,
-        NSURLErrorNotConnectedToInternet,
-        NSURLErrorTimedOut:
-        return true
-      default:
-        break
-      }
-    }
-    return false
+    DaemonErrorClassifier.isTransient(error)
   }
 
   /// Pull the live signal values from `BatteryAwareScheduler` /
