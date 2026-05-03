@@ -53,6 +53,29 @@ final class AudioPersistenceServiceTests: XCTestCase {
         XCTAssertEqual(row?["byteCount"] as Int?, 3_200)
     }
 
+    func testQueuedStopDrainsPreviouslyQueuedAppends() async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw XCTSkip("database queue unavailable")
+        }
+        let now = Date()
+        let sessionId = try await insertSession(dbQueue: dbQueue, startedAt: now)
+
+        await AudioPersistenceService.shared.start(source: "mixed", transcriptionSessionId: sessionId)
+        for _ in 0..<5 {
+            AudioPersistenceService.shared.enqueueAppend(Data(repeating: 7, count: 3_200))
+        }
+        await AudioPersistenceService.shared.stopQueued()
+
+        let byteCount = try await dbQueue.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT LENGTH(pcm) FROM audio_chunks WHERE transcriptionSessionId = ?",
+                arguments: [sessionId]
+            )
+        }
+        XCTAssertEqual(byteCount, 16_000)
+    }
+
     func testPreSessionChunksAreLinkedWhenSessionIdArrives() async throws {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             throw XCTSkip("database queue unavailable")
@@ -88,29 +111,29 @@ final class AudioPersistenceServiceTests: XCTestCase {
         XCTAssertEqual(linkedCount, 1)
     }
 
-    func testReviewAudioWAVSlicesAcrossChunksUsingAudioAnchor() async throws {
+    func testReviewAudioWAVSlicesUsingSessionStartAnchor() async throws {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             throw XCTSkip("database queue unavailable")
         }
-        let audioStartedAt = Date()
+        let sessionStartedAt = Date()
         let sessionId = try await insertSession(
             dbQueue: dbQueue,
-            startedAt: audioStartedAt.addingTimeInterval(60)
+            startedAt: sessionStartedAt
         )
         let conversationId = "local-\(sessionId)"
 
         try await insertAudioChunk(
             dbQueue: dbQueue,
-            startedAt: audioStartedAt,
-            endedAt: audioStartedAt.addingTimeInterval(1),
+            startedAt: sessionStartedAt.addingTimeInterval(-1),
+            endedAt: sessionStartedAt,
             sessionId: sessionId,
             sampleRate: 4,
             pcm: pcmData([0, 1, 2, 3])
         )
         try await insertAudioChunk(
             dbQueue: dbQueue,
-            startedAt: audioStartedAt.addingTimeInterval(1),
-            endedAt: audioStartedAt.addingTimeInterval(2),
+            startedAt: sessionStartedAt,
+            endedAt: sessionStartedAt.addingTimeInterval(1),
             sessionId: sessionId,
             sampleRate: 4,
             pcm: pcmData([4, 5, 6, 7])
@@ -118,11 +141,11 @@ final class AudioPersistenceServiceTests: XCTestCase {
 
         let wav = await AudioPersistenceService.shared.reviewAudioWAV(
             conversationId: conversationId,
-            startTime: 0.5,
-            endTime: 1.5
+            startTime: 0.25,
+            endTime: 0.75
         )
         let pcm = try XCTUnwrap(wav.map(wavPCM))
-        XCTAssertEqual(pcm, pcmData([2, 3, 4, 5]))
+        XCTAssertEqual(pcm, pcmData([5, 6]))
     }
 
     func testRetentionPurgeDeletesOnlyExpiredChunks() async throws {
@@ -171,7 +194,7 @@ final class AudioPersistenceServiceTests: XCTestCase {
     }
 
     func testAudioMixerEmitsMicOnlyChunksWhenSystemAudioIsAbsent() {
-        let mixer = AudioMixer()
+        let mixer = AudioMixer(systemAudioAvailable: false)
         let micOnlyPCM = pcmData(Array(repeating: 42, count: 1_600))
         var chunks: [Data] = []
 
@@ -182,6 +205,38 @@ final class AudioPersistenceServiceTests: XCTestCase {
         mixer.stop()
 
         XCTAssertEqual(chunks.first, micOnlyPCM)
+    }
+
+    func testAudioMixerWaitsForTemporarilyEmptySystemBuffer() {
+        let mixer = AudioMixer(counterpartWaitTimeout: 60)
+        let micPCM = pcmData(Array(repeating: 10, count: 1_600))
+        let systemPCM = pcmData(Array(repeating: 5, count: 1_600))
+        var chunks: [Data] = []
+
+        mixer.start { chunk in
+            chunks.append(chunk)
+        }
+        mixer.setMicAudio(micPCM)
+        XCTAssertTrue(chunks.isEmpty)
+
+        mixer.setSystemAudio(systemPCM)
+        mixer.stop()
+
+        XCTAssertEqual(chunks.first, pcmData(Array(repeating: 15, count: 1_600)))
+    }
+
+    func testAudioMixerPadsAfterCounterpartWaitTimeout() {
+        let mixer = AudioMixer(counterpartWaitTimeout: 0)
+        let micPCM = pcmData(Array(repeating: 9, count: 1_600))
+        var chunks: [Data] = []
+
+        mixer.start { chunk in
+            chunks.append(chunk)
+        }
+        mixer.setMicAudio(micPCM)
+        mixer.stop()
+
+        XCTAssertEqual(chunks.first, micPCM)
     }
 
     private func insertSession(dbQueue: DatabasePool, startedAt: Date) async throws -> Int64 {

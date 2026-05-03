@@ -60,7 +60,19 @@ struct ConversationsPage: View {
   @State private var showMergeConfirmation: Bool = false
   @State private var isMerging: Bool = false
   @State private var mergeError: String? = nil
-  @State private var autoOpenIdentifySpeakersConversationId: String? = nil
+  @Binding var autoOpenIdentifySpeakersConversationId: String?
+
+  init(
+    appState: AppState,
+    selectedConversation: Binding<ServerConversation?>,
+    embedded: Bool = false,
+    autoOpenIdentifySpeakersConversationId: Binding<String?> = .constant(nil)
+  ) {
+    self.appState = appState
+    self._selectedConversation = selectedConversation
+    self.embedded = embedded
+    self._autoOpenIdentifySpeakersConversationId = autoOpenIdentifySpeakersConversationId
+  }
 
   var body: some View {
     Group {
@@ -143,10 +155,6 @@ struct ConversationsPage: View {
       // Re-fetch so the list shows the latest data.
       Task { await appState.loadConversations() }
     }
-    .onReceive(NotificationCenter.default.publisher(for: .completedConversationMayNeedSpeakerReview)) {
-      notification in
-      handleCompletedConversationMayNeedSpeakerReview(notification)
-    }
     .dismissableSheet(isPresented: $showCreateFolderSheet) {
       FolderFormSheet(folder: nil, onDismiss: { showCreateFolderSheet = false })
         .environmentObject(appState)
@@ -202,61 +210,6 @@ struct ConversationsPage: View {
     }
   }
 
-  private func handleCompletedConversationMayNeedSpeakerReview(_ notification: Notification) {
-    guard let conversationId = notification.userInfo?["conversationId"] as? String,
-      !conversationId.isEmpty
-    else { return }
-
-    Task {
-      await appState.loadConversations()
-      guard let conversation = await conversationForSpeakerReviewIfNeeded(conversationId: conversationId) else {
-        return
-      }
-
-      await MainActor.run {
-        autoOpenIdentifySpeakersConversationId = conversation.id
-        selectedConversation = conversation
-      }
-    }
-  }
-
-  private func conversationForSpeakerReviewIfNeeded(conversationId: String) async -> ServerConversation? {
-    guard var conversation = appState.conversations.first(where: { $0.id == conversationId }) else {
-      return nil
-    }
-
-    if conversation.transcriptSegments.isEmpty,
-      let segments = await loadTranscriptSegments(for: conversation)
-    {
-      conversation.transcriptSegments = segments
-    }
-
-    guard !SpeakerReviewQueueBuilder.makeQueue(from: conversation.transcriptSegments).isEmpty else {
-      return nil
-    }
-
-    return conversation
-  }
-
-  private func loadTranscriptSegments(for conversation: ServerConversation) async -> [TranscriptSegment]? {
-    do {
-      let session: TranscriptionSessionRecord?
-      if conversation.id.hasPrefix("local-"),
-        let rowId = Int64(conversation.id.dropFirst("local-".count))
-      {
-        session = try await TranscriptionStorage.shared.getSession(id: rowId)
-      } else {
-        session = try await TranscriptionStorage.shared.getSessionByBackendId(conversation.id)
-      }
-
-      guard let session, let sessionRowId = session.id else { return nil }
-      return try await TranscriptionStorage.shared.getSegments(sessionId: sessionRowId)
-        .map { $0.toTranscriptSegment() }
-    } catch {
-      logError("Conversations: Failed to load transcript segments for speaker review", error: error)
-      return nil
-    }
-  }
   // MARK: - Main View with Recording Header + List
 
   private var mainConversationsView: some View {
@@ -868,7 +821,10 @@ private struct TranscriptNotesDivider: View {
 }
 
 #Preview {
-  ConversationsPage(appState: AppState(), selectedConversation: .constant(nil))
+  ConversationsPage(
+    appState: AppState(),
+    selectedConversation: .constant(nil),
+    autoOpenIdentifySpeakersConversationId: .constant(nil))
     .frame(width: 600, height: 800)
     .background(OmiColors.backgroundSecondary)
 }

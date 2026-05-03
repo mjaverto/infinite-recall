@@ -22,7 +22,7 @@ struct SpeakerReviewQueueItem: Identifiable, Equatable {
 }
 
 enum SpeakerReviewQueueBuilder {
-    static let minimumReviewableDuration: Double = 1.2
+    static let minimumReviewableDuration: Double = 3.0
     static let minimumSampleDuration: Double = 3.0
     static let maximumSampleDuration: Double = 8.0
 
@@ -124,14 +124,15 @@ enum SpeakerReviewQueueBuilder {
 
     private static func sample(for segment: TranscriptSegment, index: Int) -> SpeakerReviewSample {
         let duration = max(0, segment.end - segment.start)
-        let targetDuration = min(max(duration, minimumSampleDuration), maximumSampleDuration)
+        let targetDuration = min(duration, maximumSampleDuration)
         let midpoint = (segment.start + segment.end) * 0.5
-        let start = max(0, midpoint - targetDuration * 0.5)
+        let start = max(segment.start, midpoint - targetDuration * 0.5)
+        let end = min(segment.end, start + targetDuration)
         return SpeakerReviewSample(
             id: segment.id,
             segmentIndex: index,
             start: start,
-            end: start + targetDuration,
+            end: end,
             text: segment.text
         )
     }
@@ -155,6 +156,7 @@ struct SpeakerIdentificationReviewSheet: View {
     @State private var isSaving = false
     @State private var isCreating = false
     @State private var isLoadingAudio = false
+    @State private var playbackError: String?
     @State private var audioPlayer: AVAudioPlayer?
 
     init(
@@ -287,6 +289,7 @@ struct SpeakerIdentificationReviewSheet: View {
                 Button("Another Sample") {
                     guard let item = currentItem, item.samples.count > 1 else { return }
                     currentSampleIndex = (currentSampleIndex + 1) % item.samples.count
+                    playbackError = nil
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(OmiColors.textSecondary)
@@ -294,6 +297,12 @@ struct SpeakerIdentificationReviewSheet: View {
                 .padding(.vertical, 7)
                 .background(Capsule().fill(OmiColors.backgroundTertiary))
                 .disabled((currentItem?.samples.count ?? 0) < 2)
+            }
+
+            if let playbackError {
+                Text(playbackError)
+                    .scaledFont(size: 11)
+                    .foregroundColor(OmiColors.error)
             }
         }
     }
@@ -469,10 +478,12 @@ struct SpeakerIdentificationReviewSheet: View {
         isAddingNewPerson = false
         newPersonName = ""
         duplicateWarning = nil
+        playbackError = nil
     }
 
     private func playCurrentSample() async {
         guard let sample = currentSample else { return }
+        playbackError = nil
         isLoadingAudio = true
         let data = await AudioPersistenceService.shared.reviewAudioWAV(
             conversationId: conversationId,
@@ -480,14 +491,21 @@ struct SpeakerIdentificationReviewSheet: View {
             endTime: sample.end
         )
         isLoadingAudio = false
-        guard let data, !data.isEmpty else { return }
+        guard let data, !data.isEmpty else {
+            playbackError = "Review audio is missing or expired for this sample."
+            return
+        }
         do {
             let player = try AVAudioPlayer(data: data)
             audioPlayer = player
             player.prepareToPlay()
-            player.play()
+            guard player.play() else {
+                playbackError = "Couldn't start playback for this sample."
+                return
+            }
         } catch {
             logError("Identify Speakers: failed to play review sample", error: error)
+            playbackError = "Couldn't play this sample."
         }
     }
 

@@ -751,6 +751,37 @@ final class TranscriptSpeakerAssignmentTests: XCTestCase {
     XCTAssertEqual(queue[0].samples.map(\.segmentIndex), [2])
   }
 
+  func testSpeakerReviewQueueRequiresThreeSecondSamplesAndDoesNotCrossSegmentBounds() {
+    let segments = [
+      TranscriptSegment(
+        id: "too-short",
+        text: "This turn has words but is too short for review playback.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 1,
+        end: 3.5
+      ),
+      TranscriptSegment(
+        id: "reviewable",
+        text: "This turn is long enough to review safely.",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 10,
+        end: 13.25
+      )
+    ]
+
+    let queue = SpeakerReviewQueueBuilder.makeQueue(from: segments)
+
+    XCTAssertEqual(queue.count, 1)
+    XCTAssertEqual(queue[0].segmentIndices, [0, 1])
+    XCTAssertEqual(queue[0].samples.map(\.segmentIndex), [1])
+    XCTAssertEqual(queue[0].samples.first?.start, 10)
+    XCTAssertEqual(queue[0].samples.first?.end, 13.25)
+  }
+
   func testSpeakerReviewQueuePrioritizesSuggestedSpeakers() {
     let segments = [
       TranscriptSegment(

@@ -46,6 +46,29 @@ actor PeopleStore {
         return (backendIds, fallbackOrders)
     }
 
+    private static func canUseSegmentForVoiceTraining(text: String, start: Double, end: Double) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard end - start >= SpeakerEmbeddingStore.minimumMatchDuration else { return false }
+        return !isNoiseOnly(trimmed)
+    }
+
+    private static func isNoiseOnly(_ text: String) -> Bool {
+        let lowered = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}"))
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !lowered.isEmpty else { return true }
+
+        let noiseWords = [
+            "music", "gentle music", "background music", "noise", "silence",
+            "applause", "laughter", "inaudible", "static", "beep", "tone"
+        ]
+        if noiseWords.contains(lowered) { return true }
+        return noiseWords.contains { lowered == "[\($0)]" || lowered == "(\($0))" }
+    }
+
     // MARK: - Read
 
     /// Fetch all known people, ordered by display name.
@@ -159,12 +182,7 @@ actor PeopleStore {
                         arguments: [resolvedPerson, resolvedIsUser, sessionId, encodedOrders]
                     )
                 }
-            }
 
-            // Backfill embeddings only for the time windows represented by the
-            // selected segments. This avoids contaminating a whole session-local
-            // speaker cluster when the user tags just one/few segments.
-            let rows: [Row] = try await dbQueue.read { db in
                 var clauses: [String] = []
                 var args: [DatabaseValueConvertible] = [sessionId]
                 if !backendIds.isEmpty {
@@ -177,29 +195,42 @@ actor PeopleStore {
                     clauses.append("segmentOrder IN (\(placeholders))")
                     args.append(contentsOf: fallbackOrders)
                 }
-                guard !clauses.isEmpty else { return [] }
+                guard !clauses.isEmpty else { return }
                 let sql = """
-                    SELECT speaker, startTime, endTime
+                    SELECT speaker, text, startTime, endTime
                     FROM transcription_segments
                     WHERE sessionId = ? AND (\(clauses.joined(separator: " OR ")))
                     """
-                return try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                var bySpeaker: [Int: [SpeakerEmbeddingStore.AssignmentRange]] = [:]
+                for row in rows {
+                    let speaker: Int = row["speaker"]
+                    let text: String = row["text"] ?? ""
+                    let start: Double = row["startTime"]
+                    let end: Double = row["endTime"]
+                    bySpeaker[speaker, default: []].append(
+                        SpeakerEmbeddingStore.AssignmentRange(
+                            start: start,
+                            end: end,
+                            allowsTraining: Self.canUseSegmentForVoiceTraining(
+                                text: text,
+                                start: start,
+                                end: end
+                            )
+                        )
+                    )
+                }
+                for (sid, ranges) in bySpeaker {
+                    try SpeakerEmbeddingStore.assignPersonToEmbeddings(
+                        in: db,
+                        sessionId: sessionId,
+                        speakerId: sid,
+                        personId: resolvedPerson,
+                        overlapping: ranges
+                    )
+                }
             }
-            var bySpeaker: [Int: [(start: Double, end: Double)]] = [:]
-            for row in rows {
-                let speaker: Int = row["speaker"]
-                let start: Double = row["startTime"]
-                let end: Double = row["endTime"]
-                bySpeaker[speaker, default: []].append((start, end))
-            }
-            for (sid, ranges) in bySpeaker {
-                await SpeakerEmbeddingStore.shared.assignPersonToEmbeddings(
-                    sessionId: sessionId,
-                    speakerId: sid,
-                    personId: resolvedPerson,
-                    overlapping: ranges
-                )
-            }
+            await SpeakerEmbeddingStore.shared.reset()
             return true
         } catch {
             logError("PeopleStore: assignSegments failed", error: error)

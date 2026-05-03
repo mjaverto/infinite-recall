@@ -847,9 +847,14 @@ struct ConversationDetailView: View {
 
     private func autoPromptIdentifySpeakersIfNeeded(_ segments: [TranscriptSegment]) {
         guard autoOpenIdentifySpeakers, !didAutoPromptIdentifySpeakers else { return }
+        guard !SpeakerReviewQueueBuilder.makeQueue(from: segments).isEmpty else {
+            if !segments.isEmpty {
+                onAutoOpenIdentifySpeakersHandled?()
+            }
+            return
+        }
         didAutoPromptIdentifySpeakers = true
         defer { onAutoOpenIdentifySpeakersHandled?() }
-        guard !SpeakerReviewQueueBuilder.makeQueue(from: segments).isEmpty else { return }
         showIdentifySpeakers = true
     }
 

@@ -28,10 +28,56 @@ actor AudioPersistenceService {
     private var source: String = "mixed"
     private var lastPurgeAt: Date?
     private var retentionCleanupTask: Task<Void, Never>?
+    private static let operationQueue = DispatchQueue(label: "com.omi.audioPersistence.operations")
 
     private init() {}
 
     // MARK: - Lifecycle
+
+    nonisolated func enqueueStart(
+        source: String = "mixed",
+        transcriptionSessionId: Int64? = nil,
+        captureStartedAt: Date = Date()
+    ) {
+        enqueue {
+            await self.start(
+                source: source,
+                transcriptionSessionId: transcriptionSessionId,
+                captureStartedAt: captureStartedAt
+            )
+        }
+    }
+
+    nonisolated func enqueueAppend(_ data: Data) {
+        guard !data.isEmpty else { return }
+        enqueue {
+            await self.append(data)
+        }
+    }
+
+    nonisolated func enqueueSetTranscriptionSessionId(_ id: Int64?) {
+        enqueue {
+            await self.setTranscriptionSessionId(id)
+        }
+    }
+
+    nonisolated func flushQueued() async {
+        await performQueued {
+            await self.flush()
+        }
+    }
+
+    nonisolated func enqueueStop() {
+        enqueue {
+            await self.stop()
+        }
+    }
+
+    nonisolated func stopQueued() async {
+        await performQueued {
+            await self.stop()
+        }
+    }
 
     /// Begin a new always-on capture window. Safe to call repeatedly — flushes any
     /// in-flight buffer first.
@@ -155,12 +201,7 @@ actor AudioPersistenceService {
                 ) else { return nil }
 
                 let sessionId: Int64 = session["id"]
-                let sessionStartedAt: Date = session["startedAt"]
-                let audioStartedAt = try Date.fetchOne(
-                    db,
-                    sql: "SELECT MIN(startedAt) FROM audio_chunks WHERE transcriptionSessionId = ?",
-                    arguments: [sessionId]
-                ) ?? sessionStartedAt
+                let audioStartedAt: Date = session["startedAt"]
                 let requestedStart = audioStartedAt.addingTimeInterval(startTime)
                 let requestedEnd = audioStartedAt.addingTimeInterval(endTime)
                 let rows = try Row.fetchAll(
@@ -315,6 +356,31 @@ actor AudioPersistenceService {
                     break
                 }
                 await self?.purgeExpiredChunksIfNeeded()
+            }
+        }
+    }
+
+    private nonisolated func enqueue(_ operation: @escaping @Sendable () async -> Void) {
+        Self.operationQueue.async {
+            let semaphore = DispatchSemaphore(value: 0)
+            Task {
+                await operation()
+                semaphore.signal()
+            }
+            semaphore.wait()
+        }
+    }
+
+    private nonisolated func performQueued(_ operation: @escaping @Sendable () async -> Void) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Self.operationQueue.async {
+                let semaphore = DispatchSemaphore(value: 0)
+                Task {
+                    await operation()
+                    semaphore.signal()
+                    continuation.resume()
+                }
+                semaphore.wait()
             }
         }
     }

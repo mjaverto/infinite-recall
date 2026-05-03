@@ -62,3 +62,11 @@ Issue: #112
 ## Open Questions
 
 - When one speaker cluster has multiple possible people, should the UI require review before applying any name, or show suggested names inline?
+
+## Follow-up Review Todo
+
+- [x] Delegate at least 3 subagents to code review the recent session changes.
+- [x] Aggregate review feedback and identify consensus findings.
+- [x] Delegate fixes for consensus review findings.
+- [x] If a questionable finding appears from only one reviewer, delegate 3 more subagents to validate whether it is real before fixing.
+- [x] After addressing feedback, delegate a local CI-equivalent run covering the same logic as `.github/workflows/*`.

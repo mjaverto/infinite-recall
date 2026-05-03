@@ -150,7 +150,7 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
             )
         }
 
-        await SpeakerEmbeddingStore.shared.assignPersonToEmbeddings(sessionId: sessionId, speakerId: 1, personId: pid)
+        try await SpeakerEmbeddingStore.shared.assignPersonToEmbeddings(sessionId: sessionId, speakerId: 1, personId: pid)
 
         let training: Int = try await dbQueue.read { db in
             try Int.fetchOne(
@@ -230,6 +230,99 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
 
         XCTAssertEqual(row.0, pid)
         XCTAssertEqual(row.1, 0, "Short selected overlap should not train the voice profile")
+    }
+
+    func testFullClusterAssignmentLabelsExcludedSegmentsButOnlyReviewableRangesTrain() async throws {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            throw XCTSkip("database queue unavailable")
+        }
+
+        let now = Date()
+        let sessionId: Int64 = try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
+                    VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
+                    """,
+                arguments: [now, now, now]
+            )
+            return db.lastInsertedRowID
+        }
+        try await dbQueue.write { db in
+            try db.execute(sql: "UPDATE transcription_sessions SET backendId = ? WHERE id = ?", arguments: ["local-\(sessionId)", sessionId])
+        }
+
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
+                    VALUES(?, 1, 'ok', 0.0, 0.5, 0, ?, 'seg-short', 'SPEAKER_01', 0, NULL)
+                    """,
+                arguments: [sessionId, now]
+            )
+            try db.execute(
+                sql: """
+                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
+                    VALUES(?, 1, '(gentle music)', 1.0, 5.0, 1, ?, 'seg-music', 'SPEAKER_01', 0, NULL)
+                    """,
+                arguments: [sessionId, now]
+            )
+            try db.execute(
+                sql: """
+                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
+                    VALUES(?, 1, 'This is a clean reviewable speaker turn.', 6.0, 10.0, 2, ?, 'seg-reviewable', 'SPEAKER_01', 0, NULL)
+                    """,
+                arguments: [sessionId, now]
+            )
+        }
+
+        let embedding = SpeakerEmbeddingRecord.encode([1, 0, 0])
+        try await dbQueue.write { db in
+            for (start, end) in [(0.0, 0.5), (1.0, 5.0), (6.0, 10.0)] {
+                try db.execute(
+                    sql: """
+                        INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
+                        VALUES(?, NULL, ?, 3, ?, ?, 1, NULL, ?, NULL, NULL, 'mfcc', 1, 0)
+                        """,
+                    arguments: [sessionId, embedding, start, end, now]
+                )
+            }
+        }
+
+        let pid = UUID().uuidString
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Cluster Person', NULL, ?, ?)",
+                arguments: [pid, now, now]
+            )
+        }
+
+        let ok = await PeopleStore.shared.assignSegments(
+            sessionId: sessionId,
+            segmentIds: ["#index:0", "#index:1", "#index:2"],
+            personId: pid,
+            isUser: false
+        )
+        XCTAssertTrue(ok)
+
+        let segmentPeople: [String?] = try await dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: "SELECT personId FROM transcription_segments WHERE sessionId = ? ORDER BY segmentOrder",
+                arguments: [sessionId]
+            ).map { $0["personId"] }
+        }
+        XCTAssertEqual(segmentPeople, [pid, pid, pid])
+
+        let embeddings: [(Double, String?, Int)] = try await dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: "SELECT startTime, personId, isTrainingSample FROM speaker_embeddings WHERE sessionId = ? ORDER BY startTime",
+                arguments: [sessionId]
+            ).map { ($0["startTime"], $0["personId"], $0["isTrainingSample"] ?? 0) }
+        }
+        XCTAssertEqual(embeddings.map(\.1), [pid, pid, pid])
+        XCTAssertEqual(embeddings.map(\.2), [0, 0, 1])
     }
 
     func testRecordEmbeddingDoesNotPersistConfidenceWithoutAppliedPerson() async throws {
