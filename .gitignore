@@ -91,3 +91,4 @@ linkedin-*.md
 demo/out/
 
 # (CLAUDE.md is intentionally committed in this fork — project-level docs)
+.gitnexus
