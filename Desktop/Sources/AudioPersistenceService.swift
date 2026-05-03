@@ -373,14 +373,9 @@ actor AudioPersistenceService {
 
     private nonisolated func performQueued(_ operation: @escaping @Sendable () async -> Void) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            Self.operationQueue.async {
-                let semaphore = DispatchSemaphore(value: 0)
-                Task {
-                    await operation()
-                    semaphore.signal()
-                    continuation.resume()
-                }
-                semaphore.wait()
+            enqueue {
+                await operation()
+                continuation.resume()
             }
         }
     }

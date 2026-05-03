@@ -83,19 +83,7 @@ enum SpeakerReviewQueueBuilder {
     }
 
     static func isNoiseOnly(_ text: String) -> Bool {
-        let lowered = text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}"))
-            .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !lowered.isEmpty else { return true }
-
-        let noiseWords = [
-            "music", "gentle music", "background music", "noise", "silence",
-            "applause", "laughter", "inaudible", "static", "beep", "tone"
-        ]
-        if noiseWords.contains(lowered) { return true }
-        return noiseWords.contains { lowered == "[\($0)]" || lowered == "(\($0))" }
+        SpeakerContentFilter.isNoiseOnly(text)
     }
 
     private static func suggestedCandidate(
@@ -308,70 +296,18 @@ struct SpeakerIdentificationReviewSheet: View {
     }
 
     private var peopleSelectionSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Who is this?")
-                .scaledFont(size: 13, weight: .medium)
-                .foregroundColor(OmiColors.textSecondary)
-
-            FlowLayout(spacing: 8) {
-                personChip(label: "You", isSelected: selectedTarget == .you) {
-                    selectedTarget = .you
-                    isAddingNewPerson = false
-                    newPersonName = ""
-                    duplicateWarning = nil
-                }
-
-                ForEach(people) { person in
-                    personChip(label: person.name, isSelected: selectedTarget == .person(person.id)) {
-                        selectedTarget = .person(person.id)
-                        isAddingNewPerson = false
-                        newPersonName = ""
-                        duplicateWarning = nil
-                    }
-                }
-
-                personChip(label: "+ Add Person", isSelected: isAddingNewPerson, isAction: true) {
-                    isAddingNewPerson = true
-                    selectedTarget = nil
-                    duplicateWarning = nil
-                }
-            }
-
-            if isAddingNewPerson {
-                HStack(spacing: 8) {
-                    TextField("Person name", text: $newPersonName)
-                        .textFieldStyle(.plain)
-                        .scaledFont(size: 13)
-                        .foregroundColor(OmiColors.textPrimary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(OmiColors.backgroundSecondary))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(duplicateWarning != nil ? OmiColors.error : OmiColors.border, lineWidth: 1)
-                        )
-                        .onChange(of: newPersonName) { _, value in validateName(value) }
-                        .onSubmit { Task { await createAndSelect() } }
-
-                    Button(action: { Task { await createAndSelect() } }) {
-                        Text(isCreating ? "Adding" : "Add")
-                            .scaledFont(size: 12, weight: .medium)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(canCreate ? .black : OmiColors.textTertiary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .background(Capsule().fill(canCreate ? Color.white : OmiColors.backgroundTertiary))
-                    .disabled(!canCreate || isCreating)
-                }
-
-                if let duplicateWarning {
-                    Text(duplicateWarning)
-                        .scaledFont(size: 11)
-                        .foregroundColor(OmiColors.error)
-                }
-            }
-        }
+        SpeakerPeopleSelectionSection(
+            people: people,
+            selectedTarget: $selectedTarget,
+            isAddingNewPerson: $isAddingNewPerson,
+            newPersonName: $newPersonName,
+            duplicateWarning: $duplicateWarning,
+            canCreate: canCreate,
+            isCreating: isCreating,
+            showsCreationProgress: false,
+            onNameChange: validateName,
+            onCreate: { Task { await createAndSelect() } }
+        )
     }
 
     private func footer(_ item: SpeakerReviewQueueItem) -> some View {
@@ -509,19 +445,4 @@ struct SpeakerIdentificationReviewSheet: View {
         }
     }
 
-    private func personChip(label: String, isSelected: Bool, isAction: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .scaledFont(size: 13, weight: isSelected ? .semibold : .regular)
-                .foregroundColor(isSelected ? .black : (isAction ? OmiColors.purplePrimary : OmiColors.textPrimary))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Capsule().fill(isSelected ? Color.white : OmiColors.backgroundTertiary))
-                .overlay(
-                    Capsule()
-                        .stroke(isSelected ? OmiColors.border : (isAction ? OmiColors.purplePrimary.opacity(0.3) : Color.clear), lineWidth: 1)
-                )
-        }
-        .buttonStyle(.plain)
-    }
 }

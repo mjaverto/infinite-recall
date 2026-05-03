@@ -18,14 +18,15 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
         try await super.tearDown()
     }
 
-    func testAssignSegmentsBackfillsOnlyOverlappingEmbeddings() async throws {
+    private func requireDatabaseQueue() async throws -> DatabasePool {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             throw XCTSkip("database queue unavailable")
         }
+        return dbQueue
+    }
 
-        // Seed one session with two segments that share a speaker cluster but are far apart in time.
-        let now = Date()
-        let sessionId: Int64 = try await dbQueue.write { db in
+    private func insertSession(in dbQueue: DatabasePool, now: Date) async throws -> Int64 {
+        try await dbQueue.write { db in
             try db.execute(
                 sql: """
                     INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
@@ -35,58 +36,108 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
             )
             return db.lastInsertedRowID
         }
+    }
+
+    private func assignStableBackendId(_ sessionId: Int64, in dbQueue: DatabasePool) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE transcription_sessions SET backendId = ? WHERE id = ?",
+                arguments: ["local-\(sessionId)", sessionId]
+            )
+        }
+    }
+
+    @discardableResult
+    private func insertPerson(
+        in dbQueue: DatabasePool,
+        name: String,
+        now: Date,
+        id: String = UUID().uuidString
+    ) async throws -> String {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, ?, NULL, ?, ?)",
+                arguments: [id, name, now, now]
+            )
+        }
+        return id
+    }
+
+    private func insertSegment(
+        in dbQueue: DatabasePool,
+        sessionId: Int64,
+        text: String,
+        start: Double,
+        end: Double,
+        order: Int,
+        now: Date,
+        speakerId: Int = 1,
+        segmentId: String? = nil
+    ) async throws {
+        let resolvedSegmentId = segmentId ?? "seg-\(order)"
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                    """,
+                arguments: [
+                    sessionId,
+                    speakerId,
+                    text,
+                    start,
+                    end,
+                    order,
+                    now,
+                    resolvedSegmentId,
+                    String(format: "SPEAKER_%02d", speakerId)
+                ]
+            )
+        }
+    }
+
+    private func insertEmbedding(
+        in dbQueue: DatabasePool,
+        sessionId: Int64,
+        embedding: Data,
+        start: Double,
+        end: Double,
+        now: Date,
+        speakerId: Int = 1,
+        embeddingModel: String = "mfcc"
+    ) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
+                    VALUES(?, NULL, ?, 3, ?, ?, ?, NULL, ?, NULL, NULL, ?, 1, 0)
+                    """,
+                arguments: [sessionId, embedding, start, end, speakerId, now, embeddingModel]
+            )
+        }
+    }
+
+    func testAssignSegmentsBackfillsOnlyOverlappingEmbeddings() async throws {
+        let dbQueue = try await requireDatabaseQueue()
+        // Seed one session with two segments that share a speaker cluster but are far apart in time.
+        let now = Date()
+        let sessionId = try await insertSession(in: dbQueue, now: now)
 
         // Force stable local backendId so PeopleStore paths can resolve.
-        try await dbQueue.write { db in
-            try db.execute(sql: "UPDATE transcription_sessions SET backendId = ? WHERE id = ?", arguments: ["local-\(sessionId)", sessionId])
-        }
+        try await assignStableBackendId(sessionId, in: dbQueue)
 
         // Segment order 0: 0-1s. Segment order 1: 10-11s.
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
-                    VALUES(?, 1, 'a', 0.0, 1.0, 0, ?, 'seg0', 'SPEAKER_01', 0, NULL)
-                    """,
-                arguments: [sessionId, now]
-            )
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
-                    VALUES(?, 1, 'b', 10.0, 11.0, 1, ?, 'seg1', 'SPEAKER_01', 0, NULL)
-                    """,
-                arguments: [sessionId, now]
-            )
-        }
+        try await insertSegment(in: dbQueue, sessionId: sessionId, text: "a", start: 0.0, end: 1.0, order: 0, now: now, segmentId: "seg0")
+        try await insertSegment(in: dbQueue, sessionId: sessionId, text: "b", start: 10.0, end: 11.0, order: 1, now: now, segmentId: "seg1")
 
         // Two embeddings, same speakerId=1 but different time windows.
         let e0 = SpeakerEmbeddingRecord.encode([0.1, 0.2, 0.3])
         let e1 = SpeakerEmbeddingRecord.encode([0.2, 0.2, 0.2])
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
-                    VALUES(?, NULL, ?, 3, 0.0, 1.0, 1, NULL, ?, NULL, NULL, 'mfcc', 1, 0)
-                    """,
-                arguments: [sessionId, e0, now]
-            )
-            try db.execute(
-                sql: """
-                    INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
-                    VALUES(?, NULL, ?, 3, 10.0, 11.0, 1, NULL, ?, NULL, NULL, 'mfcc', 1, 0)
-                    """,
-                arguments: [sessionId, e1, now]
-            )
-        }
+        try await insertEmbedding(in: dbQueue, sessionId: sessionId, embedding: e0, start: 0.0, end: 1.0, now: now)
+        try await insertEmbedding(in: dbQueue, sessionId: sessionId, embedding: e1, start: 10.0, end: 11.0, now: now)
 
         // Seed people.
-        let pid = UUID().uuidString
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Test', NULL, ?, ?)",
-                arguments: [pid, now, now]
-            )
-        }
+        let pid = try await insertPerson(in: dbQueue, name: "Test", now: now)
 
         // Assign only segment order 0.
         let ok = await PeopleStore.shared.assignSegments(
@@ -115,40 +166,22 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
     }
 
     func testNonMFCCEmbeddingsNeverBecomeTrainingSamplesOnManualAssignment() async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            throw XCTSkip("database queue unavailable")
-        }
-
+        let dbQueue = try await requireDatabaseQueue()
         let now = Date()
-        let sessionId: Int64 = try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
-                    VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
-                    """,
-                arguments: [now, now, now]
-            )
-            return db.lastInsertedRowID
-        }
+        let sessionId = try await insertSession(in: dbQueue, now: now)
 
-        let pid = UUID().uuidString
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Test', NULL, ?, ?)",
-                arguments: [pid, now, now]
-            )
-        }
+        let pid = try await insertPerson(in: dbQueue, name: "Test", now: now)
 
         let e = SpeakerEmbeddingRecord.encode([1, 0, 0])
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
-                    VALUES(?, NULL, ?, 3, 0.0, 1.0, 1, NULL, ?, NULL, NULL, 'speakerkit-synthetic', 1, 0)
-                    """,
-                arguments: [sessionId, e, now]
-            )
-        }
+        try await insertEmbedding(
+            in: dbQueue,
+            sessionId: sessionId,
+            embedding: e,
+            start: 0.0,
+            end: 1.0,
+            now: now,
+            embeddingModel: "speakerkit-synthetic"
+        )
 
         try await SpeakerEmbeddingStore.shared.assignPersonToEmbeddings(sessionId: sessionId, speakerId: 1, personId: pid)
 
@@ -163,53 +196,26 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
     }
 
     func testShortManualOverlapAssignsPersonButDoesNotTrainVoiceProfile() async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            throw XCTSkip("database queue unavailable")
-        }
-
+        let dbQueue = try await requireDatabaseQueue()
         let now = Date()
-        let sessionId: Int64 = try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
-                    VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
-                    """,
-                arguments: [now, now, now]
-            )
-            return db.lastInsertedRowID
-        }
-        try await dbQueue.write { db in
-            try db.execute(sql: "UPDATE transcription_sessions SET backendId = ? WHERE id = ?", arguments: ["local-\(sessionId)", sessionId])
-        }
+        let sessionId = try await insertSession(in: dbQueue, now: now)
+        try await assignStableBackendId(sessionId, in: dbQueue)
 
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
-                    VALUES(?, 1, 'short noisy clip', 0.0, 0.3, 0, ?, 'seg-short', 'SPEAKER_01', 0, NULL)
-                    """,
-                arguments: [sessionId, now]
-            )
-        }
+        try await insertSegment(
+            in: dbQueue,
+            sessionId: sessionId,
+            text: "short noisy clip",
+            start: 0.0,
+            end: 0.3,
+            order: 0,
+            now: now,
+            segmentId: "seg-short"
+        )
 
         let e = SpeakerEmbeddingRecord.encode([1, 0, 0])
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
-                    VALUES(?, NULL, ?, 3, 0.0, 1.0, 1, NULL, ?, NULL, NULL, 'mfcc', 1, 0)
-                    """,
-                arguments: [sessionId, e, now]
-            )
-        }
+        try await insertEmbedding(in: dbQueue, sessionId: sessionId, embedding: e, start: 0.0, end: 1.0, now: now)
 
-        let pid = UUID().uuidString
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Short Clip', NULL, ?, ?)",
-                arguments: [pid, now, now]
-            )
-        }
+        let pid = try await insertPerson(in: dbQueue, name: "Short Clip", now: now)
 
         let ok = await PeopleStore.shared.assignSegments(
             sessionId: sessionId,
@@ -233,69 +239,30 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
     }
 
     func testFullClusterAssignmentLabelsExcludedSegmentsButOnlyReviewableRangesTrain() async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            throw XCTSkip("database queue unavailable")
-        }
-
+        let dbQueue = try await requireDatabaseQueue()
         let now = Date()
-        let sessionId: Int64 = try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
-                    VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
-                    """,
-                arguments: [now, now, now]
-            )
-            return db.lastInsertedRowID
-        }
-        try await dbQueue.write { db in
-            try db.execute(sql: "UPDATE transcription_sessions SET backendId = ? WHERE id = ?", arguments: ["local-\(sessionId)", sessionId])
-        }
+        let sessionId = try await insertSession(in: dbQueue, now: now)
+        try await assignStableBackendId(sessionId, in: dbQueue)
 
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
-                    VALUES(?, 1, 'ok', 0.0, 0.5, 0, ?, 'seg-short', 'SPEAKER_01', 0, NULL)
-                    """,
-                arguments: [sessionId, now]
-            )
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
-                    VALUES(?, 1, '(gentle music)', 1.0, 5.0, 1, ?, 'seg-music', 'SPEAKER_01', 0, NULL)
-                    """,
-                arguments: [sessionId, now]
-            )
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_segments(sessionId, speaker, text, startTime, endTime, segmentOrder, createdAt, segmentId, speakerLabel, isUser, personId)
-                    VALUES(?, 1, 'This is a clean reviewable speaker turn.', 6.0, 10.0, 2, ?, 'seg-reviewable', 'SPEAKER_01', 0, NULL)
-                    """,
-                arguments: [sessionId, now]
-            )
-        }
+        try await insertSegment(in: dbQueue, sessionId: sessionId, text: "ok", start: 0.0, end: 0.5, order: 0, now: now, segmentId: "seg-short")
+        try await insertSegment(in: dbQueue, sessionId: sessionId, text: "(gentle music)", start: 1.0, end: 5.0, order: 1, now: now, segmentId: "seg-music")
+        try await insertSegment(
+            in: dbQueue,
+            sessionId: sessionId,
+            text: "This is a clean reviewable speaker turn.",
+            start: 6.0,
+            end: 10.0,
+            order: 2,
+            now: now,
+            segmentId: "seg-reviewable"
+        )
 
         let embedding = SpeakerEmbeddingRecord.encode([1, 0, 0])
-        try await dbQueue.write { db in
-            for (start, end) in [(0.0, 0.5), (1.0, 5.0), (6.0, 10.0)] {
-                try db.execute(
-                    sql: """
-                        INSERT INTO speaker_embeddings(sessionId, chunkId, embedding, embeddingDim, startTime, endTime, speakerId, personId, createdAt, assignmentSource, matchConfidence, embeddingModel, embeddingVersion, isTrainingSample)
-                        VALUES(?, NULL, ?, 3, ?, ?, 1, NULL, ?, NULL, NULL, 'mfcc', 1, 0)
-                        """,
-                    arguments: [sessionId, embedding, start, end, now]
-                )
-            }
+        for (start, end) in [(0.0, 0.5), (1.0, 5.0), (6.0, 10.0)] {
+            try await insertEmbedding(in: dbQueue, sessionId: sessionId, embedding: embedding, start: start, end: end, now: now)
         }
 
-        let pid = UUID().uuidString
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Cluster Person', NULL, ?, ?)",
-                arguments: [pid, now, now]
-            )
-        }
+        let pid = try await insertPerson(in: dbQueue, name: "Cluster Person", now: now)
 
         let ok = await PeopleStore.shared.assignSegments(
             sessionId: sessionId,
@@ -326,21 +293,9 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
     }
 
     func testRecordEmbeddingDoesNotPersistConfidenceWithoutAppliedPerson() async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            throw XCTSkip("database queue unavailable")
-        }
-
+        let dbQueue = try await requireDatabaseQueue()
         let now = Date()
-        let sessionId: Int64 = try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
-                    VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
-                    """,
-                arguments: [now, now, now]
-            )
-            return db.lastInsertedRowID
-        }
+        let sessionId = try await insertSession(in: dbQueue, now: now)
 
         _ = await SpeakerEmbeddingStore.shared.recordEmbedding(
             sessionId: sessionId,
@@ -354,13 +309,7 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
             matchConfidence: 0.77
         )
 
-        let pid = UUID().uuidString
-        try await dbQueue.write { db in
-            try db.execute(
-                sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Known', NULL, ?, ?)",
-                arguments: [pid, now, now]
-            )
-        }
+        let pid = try await insertPerson(in: dbQueue, name: "Known", now: now)
 
         _ = await SpeakerEmbeddingStore.shared.recordEmbedding(
             sessionId: sessionId,
@@ -392,28 +341,14 @@ final class VoiceProfileAssignmentRegressionTests: XCTestCase {
     }
 
     func testMergePersonIsAtomicAcrossSegmentsEmbeddingsAndPeople() async throws {
-        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
-            throw XCTSkip("database queue unavailable")
-        }
-
+        let dbQueue = try await requireDatabaseQueue()
         let now = Date()
-        let sessionId: Int64 = try await dbQueue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
-                    VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
-                    """,
-                arguments: [now, now, now]
-            )
-            return db.lastInsertedRowID
-        }
+        let sessionId = try await insertSession(in: dbQueue, now: now)
 
         let sourceId = UUID().uuidString
         let targetId = UUID().uuidString
-        try await dbQueue.write { db in
-            try db.execute(sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Source', NULL, ?, ?)", arguments: [sourceId, now, now])
-            try db.execute(sql: "INSERT INTO people(id, displayName, defaultEmoji, createdAt, updatedAt) VALUES(?, 'Target', NULL, ?, ?)", arguments: [targetId, now, now])
-        }
+        try await insertPerson(in: dbQueue, name: "Source", now: now, id: sourceId)
+        try await insertPerson(in: dbQueue, name: "Target", now: now, id: targetId)
 
         try await dbQueue.write { db in
             try db.execute(

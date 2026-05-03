@@ -50,23 +50,7 @@ actor PeopleStore {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard end - start >= SpeakerEmbeddingStore.minimumMatchDuration else { return false }
-        return !isNoiseOnly(trimmed)
-    }
-
-    private static func isNoiseOnly(_ text: String) -> Bool {
-        let lowered = text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "()[]{}"))
-            .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !lowered.isEmpty else { return true }
-
-        let noiseWords = [
-            "music", "gentle music", "background music", "noise", "silence",
-            "applause", "laughter", "inaudible", "static", "beep", "tone"
-        ]
-        if noiseWords.contains(lowered) { return true }
-        return noiseWords.contains { lowered == "[\($0)]" || lowered == "(\($0))" }
+        return !SpeakerContentFilter.isNoiseOnly(trimmed)
     }
 
     // MARK: - Read
