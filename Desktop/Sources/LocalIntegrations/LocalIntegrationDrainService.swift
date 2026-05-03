@@ -19,6 +19,9 @@ final class LocalIntegrationDrainService: LocalIntegrationOutboxDelegate {
   static let shared = LocalIntegrationDrainService()
   private init() {}
 
+  /// If false, kick() is a no-op. Used in tests to prevent background races.
+  var isEnabled = true
+
   /// Posted on the main thread after every per-row outcome is applied
   /// (success/retry/permanentFailure). UI surfaces (e.g. `MyAppsSection`)
   /// listen so pending-count badges and `lastError` reflect drain progress
@@ -70,6 +73,8 @@ final class LocalIntegrationDrainService: LocalIntegrationOutboxDelegate {
   /// Manual / post-enqueue trigger. Cheap, idempotent, safe to call from
   /// any `@MainActor` context. Coalesces concurrent calls.
   func kick() {
+    guard isEnabled else { return }
+
     // Cancel any pending sleep — we want to drain now.
     pendingWakeTask?.cancel()
     pendingWakeTask = nil
