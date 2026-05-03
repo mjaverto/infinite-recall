@@ -116,6 +116,14 @@ actor RewindDatabase {
         close()
         configure(userId: userId)
         try await initialize()
+        // Issue #98 follow-up (Gemini review on PR #108):
+        // KGProgressPublisher's schemaUnavailable kill switch is process-wide
+        // because the publisher is a singleton. Without this reset, a
+        // structural error encountered against user A's DB would
+        // permanently blind the publisher for user B even if their schema
+        // is healthy. Reset on every user switch so a fresh DB gets a
+        // fresh poller.
+        await KGProgressPublisher.shared.resetForUserSwitch()
     }
 
     /// Returns the per-user base directory: ~/Library/Application Support/Omi/users/{userId}/
