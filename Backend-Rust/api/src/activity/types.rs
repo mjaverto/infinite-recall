@@ -18,6 +18,13 @@ pub enum WorkKind {
     Summarize,
     ExtractMemory,
     ExtractActionItems,
+    /// Brain-map / knowledge-graph extraction. Issue #105: previously
+    /// scheduler-only (Swift `PendingWork.Kind.extractKG`), so its queue
+    /// depth was counted by the menu-bar badge but absent from the
+    /// Activity snapshot's per-kind table — making the two surfaces
+    /// disagree. Promoted to a wire kind so both surfaces aggregate the
+    /// same set of `pending_work` rows.
+    ExtractKg,
 }
 
 /// Live capture surfaces (separate from deferred work).
@@ -67,6 +74,7 @@ impl WorkKind {
             WorkKind::Summarize => "summarize",
             WorkKind::ExtractMemory => "extract_memory",
             WorkKind::ExtractActionItems => "extract_action_items",
+            WorkKind::ExtractKg => "extract_kg",
         }
     }
 }
@@ -345,6 +353,7 @@ mod tests {
             WorkKind::Summarize,
             WorkKind::ExtractMemory,
             WorkKind::ExtractActionItems,
+            WorkKind::ExtractKg,
         ] {
             assert_eq!(
                 serde_json::to_value(k).unwrap(),

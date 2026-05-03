@@ -183,4 +183,33 @@ final class ActivityPagePowerGateTests: XCTestCase {
             isRunOnceActive: false
         ), "Run now must hide for .thermal via disablesRunNowOverride alone, independent of the isThermalBlocked flag.")
     }
+
+    /// Issue #105: A snapshot gate of `.blocked(.onBattery, …)` can be stale
+    /// (e.g. cached from before the user plugged in). When `resources` reports
+    /// the device is on AC and not in low-power, the corrected gate must
+    /// downgrade to `.allowed` so the Activity banner doesn't read
+    /// "Waiting for AC power" while the user is already on AC.
+    func test_correctedGateDowngradesStaleOnBatteryWhenResourcesSayOnAC() {
+        let res = resources(onBattery: false, lowPower: false)
+        let staleSnapshotGate = GateState.blocked(
+            reason: .onBattery,
+            since: now,
+            waitingFor: .acPower
+        )
+
+        let corrected = activityCorrectedGate(
+            snapshotGate: staleSnapshotGate,
+            resources: res,
+            queued: 5,
+            thermalState: .nominal,
+            isRunOnceActive: false,
+            runOnceStartedAt: nil,
+            now: now
+        )
+
+        XCTAssertTrue(
+            corrected.isAllowed,
+            "Stale snapshot .onBattery must be downgraded to .allowed when resources report on-AC and not low-power."
+        )
+    }
 }

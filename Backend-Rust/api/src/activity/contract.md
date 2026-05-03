@@ -142,7 +142,7 @@ and a stringly-typed `waiting_for`.
 
 | Field | Allowed values |
 |---|---|
-| `KindRow.kind` / `WorkKind` | `transcribe`, `ocr`, `summarize`, `extract_memory`, `extract_action_items` |
+| `KindRow.kind` / `WorkKind` | `transcribe`, `ocr`, `summarize`, `extract_memory`, `extract_action_items`, `extract_kg` |
 | `CaptureRow.kind` / `CaptureKind` | `audio`, `screen` |
 | `PauseRequest.target` / `ResumeRequest.target` / `PauseTargetId` | `kind`, `capture` (with typed `id` payload — see below) |
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |

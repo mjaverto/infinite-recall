@@ -81,6 +81,17 @@ func activityCorrectedGate(
     if activityPowerBlock(resources: resources, queued: queued) != nil {
         return .blocked(reason: .onBattery, since: snapshotGate.since, waitingFor: .acPower)
     }
+    // Issue #105: discard a stale `Blocked(.onBattery)` from the daemon
+    // snapshot when the live `ResourceSample` says we're actually on AC
+    // and not in Low Power Mode. Without this, the user can see
+    // "Waiting for AC power" while plugged in — the snapshot poll runs at
+    // 1 Hz and the gate-state reporter de-dupes posts, so a brief
+    // disagreement at the AC/battery transition window can otherwise stick
+    // until the next gate-state diff is observed.
+    if case .blocked(.onBattery, _, _) = snapshotGate,
+       !resources.onBattery, !resources.lowPower {
+        return .allowed(since: snapshotGate.since)
+    }
     return snapshotGate
 }
 
@@ -409,10 +420,14 @@ struct ActivityPage: View {
                     color: OmiColors.warning
                 )
             }
+            // Issue #105: prefix the wait condition so the subtitle reads as
+            // "Resumes when on AC power" rather than the bare "AC power" the
+            // user reasonably mistook for a current-state assertion. Mirrors
+            // the `.deviceActive` copy convention right above.
             return BannerInfo(
                 icon: "battery.25",
                 title: "Waiting for AC power — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: detail,
+                detail: "Resumes when on \(detail) — or run now.",
                 color: OmiColors.warning
             )
         case .thermal:
@@ -918,6 +933,7 @@ struct ActivityPage: View {
         case .summarize: return "text.append"
         case .extractMemory: return "brain"
         case .extractActionItems: return "checklist"
+        case .extractKG: return "point.3.connected.trianglepath.dotted"
         }
     }
 
@@ -928,6 +944,7 @@ struct ActivityPage: View {
         case .summarize: return "Summarize"
         case .extractMemory: return "Extract memories"
         case .extractActionItems: return "Find action items"
+        case .extractKG: return "Build brain map"
         }
     }
 

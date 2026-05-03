@@ -759,6 +759,51 @@ async fn queue_depth_snapshot_reads_pending_work_not_loopback_cache() {
     assert_eq!(row_for("extract_memory")["failed"], json!(1));
     assert_eq!(row_for("extract_action_items")["queued"], json!(0));
     assert_eq!(row_for("extract_action_items")["failed"], json!(2));
+    // Issue #105: extractKG must be present in the snapshot's `kinds` so the
+    // Activity view's per-kind sum matches `BatteryAwareScheduler.pendingWorkCount`
+    // (which the menu-bar badge reads). Default is zero/zero when no rows exist.
+    assert_eq!(row_for("extract_kg")["queued"], json!(0));
+    assert_eq!(row_for("extract_kg")["failed"], json!(0));
+}
+
+/// Issue #105 regression: queued `extractKG` rows must surface in the
+/// Activity snapshot. Pre-#105 this kind was scheduler-internal only, so
+/// the menu-bar badge counted it but the Activity per-kind table didn't,
+/// producing the "8 items waiting (battery)" / "0 queued" disagreement.
+#[tokio::test]
+async fn queue_depth_snapshot_includes_extract_kg() {
+    let state = make_state(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    seed_pending_work(
+        &state.pool,
+        &[
+            ("queued", "extractKG"),
+            ("queued", "extractKG"),
+            ("queued", "extractKG"),
+            ("failed", "extractKG"),
+        ],
+    )
+    .await;
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.oneshot(snap_req).await.unwrap()).await;
+    let kinds = snap["kinds"].as_array().expect("kinds is an array");
+    let extract_kg = kinds
+        .iter()
+        .find(|r| r["kind"] == "extract_kg")
+        .expect("snapshot must include an `extract_kg` row (issue #105)");
+    assert_eq!(extract_kg["queued"], json!(3));
+    assert_eq!(extract_kg["failed"], json!(1));
 }
 
 /// Fresh installs may not have run the Swift `pending_work` migration yet.
@@ -830,6 +875,7 @@ async fn enum_round_trip_via_wire() {
         (t::WorkKind::Summarize, "summarize"),
         (t::WorkKind::ExtractMemory, "extract_memory"),
         (t::WorkKind::ExtractActionItems, "extract_action_items"),
+        (t::WorkKind::ExtractKg, "extract_kg"),
     ] {
         let s = serde_json::to_string(&kind).unwrap();
         assert_eq!(s, format!("\"{wire}\""));
@@ -870,6 +916,7 @@ async fn enum_round_trip_via_wire() {
         t::WorkKind::Summarize,
         t::WorkKind::ExtractMemory,
         t::WorkKind::ExtractActionItems,
+        t::WorkKind::ExtractKg,
     ] {
         let pt = t::PauseTargetId::Kind(kind);
         let s = serde_json::to_string(&pt).unwrap();
@@ -901,6 +948,7 @@ async fn pause_kind_round_trip_for_every_variant() {
         "summarize",
         "extract_memory",
         "extract_action_items",
+        "extract_kg",
     ] {
         let body = json!({"target":"kind","id":kind_str,"minutes":1});
         let req = Request::builder()

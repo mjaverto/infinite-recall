@@ -292,6 +292,7 @@ public final class ActivityMonitorService: ObservableObject {
         case .summarize: return PendingWork.Kind.summarize.rawValue
         case .extractMemory: return PendingWork.Kind.extractMemory.rawValue
         case .extractActionItems: return PendingWork.Kind.extractActionItems.rawValue
+        case .extractKG: return PendingWork.Kind.extractKG.rawValue
         }
     }
 
