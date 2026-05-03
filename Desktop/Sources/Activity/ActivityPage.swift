@@ -82,18 +82,31 @@ func activityCorrectedGate(
         return .blocked(reason: .onBattery, since: snapshotGate.since, waitingFor: .acPower)
     }
     // Issue #105: discard a stale `Blocked(.onBattery)` from the daemon
-    // snapshot when the live `ResourceSample` says we're actually on AC
-    // and not in Low Power Mode. Without this, the user can see
-    // "Waiting for AC power" while plugged in — the snapshot poll runs at
-    // 1 Hz and the gate-state reporter de-dupes posts, so a brief
-    // disagreement at the AC/battery transition window can otherwise stick
-    // until the next gate-state diff is observed.
+    // snapshot when the same snapshot's resource sample says we're actually
+    // on AC and not in Low Power Mode. Both `snapshotGate` and `resources`
+    // ride the same 1Hz Rust poll, but the gate-state reporter de-dupes
+    // posts — so the cached gate can lag the resource sample at the
+    // AC/battery transition window. Without this, the user sees
+    // "Waiting for AC power" while plugged in until the next gate-state
+    // diff is observed.
     if case .blocked(.onBattery, _, _) = snapshotGate,
        !resources.onBattery, !resources.lowPower {
+        activityCorrectedGateLog.debug(
+            "Downgrading stale .onBattery gate (since=\(snapshotGate.since.timeIntervalSince1970, privacy: .public)) to .allowed — resources report on-AC, not low-power."
+        )
         return .allowed(since: snapshotGate.since)
     }
     return snapshotGate
 }
+
+/// Subsystem-wide logger for the Activity-page gate-correction predicate.
+/// Pulled out so a user reporting "Activity says allowed but nothing runs"
+/// (or vice-versa) leaves a breadcrumb when the Issue #105 stale-gate
+/// downgrade fires.
+private let activityCorrectedGateLog = Logger(
+    subsystem: "me.omi.desktop",
+    category: "ActivityCorrectedGate"
+)
 
 func activityShouldShowRunNowButton(
     snapshotGate: GateState?,
@@ -420,14 +433,16 @@ struct ActivityPage: View {
                     color: OmiColors.warning
                 )
             }
-            // Issue #105: prefix the wait condition so the subtitle reads as
-            // "Resumes when on AC power" rather than the bare "AC power" the
-            // user reasonably mistook for a current-state assertion. Mirrors
-            // the `.deviceActive` copy convention right above.
+            // Issue #105: read as "Resumes when on AC power" rather than the
+            // bare "AC power" the user reasonably mistook for a current-state
+            // assertion. Hardcoded — for `.onBattery`, `waitingFor` is always
+            // `.acPower` (see `BatteryAwareScheduler`), but `WaitCondition`
+            // also includes `.manual` which would read "Resumes when on manual
+            // resume — or run now." Hardcoding avoids the awkward case.
             return BannerInfo(
                 icon: "battery.25",
                 title: "Waiting for AC power — \(queued) item\(queued == 1 ? "" : "s") queued",
-                detail: "Resumes when on \(detail) — or run now.",
+                detail: "Resumes when on AC power — or run now.",
                 color: OmiColors.warning
             )
         case .thermal:

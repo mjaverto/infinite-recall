@@ -806,6 +806,103 @@ async fn queue_depth_snapshot_includes_extract_kg() {
     assert_eq!(extract_kg["failed"], json!(1));
 }
 
+/// Issue #105 invariant: the Activity snapshot's per-kind `queued` sum must
+/// match `PendingWorkStorage.pendingCount()` (the menu-bar badge). The bug
+/// was a wire-shape drift — `extractKG` rows were counted by the
+/// `pendingCount()` query (`status='queued' AND workType=*`) but the
+/// snapshot's `ALL_KINDS` array dropped them, so the two surfaces
+/// disagreed (8 vs 0). This test seeds at least one `queued` row for every
+/// kind including `extractKG`, hits `/snapshot`, and asserts
+/// `sum(kinds[*].queued) == pendingCount()`. Future drift in
+/// `workkind_swift_raw_value` (or in `ALL_KINDS`) would regress here.
+#[tokio::test]
+async fn activity_snapshot_extract_kg_count_matches_pending_work_total() {
+    // One `queued` row per Swift `PendingWork.Kind.rawValue`. Counts vary
+    // by kind so an off-by-one in the assembly path would be detectable.
+    // Plus a `claimed` row (excluded from `pendingCount`) and a `failed`
+    // row (excluded from the queued sum but included in the kind's
+    // `failed` field) to confirm the assertion targets `queued` only.
+    let seed: &[(&str, &str)] = &[
+        ("queued", "transcribe"),
+        ("queued", "transcribe"),
+        ("queued", "ocr"),
+        ("queued", "summarize"),
+        ("queued", "summarize"),
+        ("queued", "summarize"),
+        ("queued", "extractMemory"),
+        ("queued", "extractActionItems"),
+        ("queued", "extractActionItems"),
+        ("queued", "extractKG"),
+        ("queued", "extractKG"),
+        ("queued", "extractKG"),
+        ("queued", "extractKG"),
+        // Non-queued rows must NOT count toward the sum.
+        ("claimed", "transcribe"),
+        ("failed", "ocr"),
+        ("dead", "summarize"),
+    ];
+    let state = make_state(
+        Arc::new(MemPauseStore::new()),
+        Arc::new(MemInflight::new()),
+        Arc::new(FakeSampler),
+        Arc::new(FakeGate::allow()),
+    );
+    seed_pending_work(&state.pool, seed).await;
+
+    // Mirror the `PendingWorkStorage.pendingCount()` query Swift uses for
+    // the menu-bar badge: `status = 'queued'` across every workType.
+    // Computed from the same seed list so any kind we add tomorrow auto-
+    // appears on both sides.
+    let pending_count: u32 = seed
+        .iter()
+        .filter(|(status, _)| *status == "queued")
+        .count()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        pending_count, 13,
+        "sanity: seed must produce 13 queued rows across all six kinds (incl. extractKG)"
+    );
+
+    let app = routes::router(state);
+    let (k, v) = auth_header();
+    let snap_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/activity/snapshot")
+        .header(k, v)
+        .body(Body::empty())
+        .unwrap();
+    let snap = json_body(app.oneshot(snap_req).await.unwrap()).await;
+    let kinds = snap["kinds"].as_array().expect("kinds is an array");
+
+    let snapshot_queued_sum: u32 = kinds
+        .iter()
+        .map(|row| {
+            row["queued"]
+                .as_u64()
+                .expect("queued is a non-negative integer") as u32
+        })
+        .sum();
+
+    assert_eq!(
+        snapshot_queued_sum, pending_count,
+        "Activity snapshot's per-kind queued sum ({snapshot_queued_sum}) must equal \
+         pendingCount() ({pending_count}) — the menu-bar badge and Activity table \
+         disagree if this drifts (issue #105)."
+    );
+
+    // Defense-in-depth: the extract_kg row specifically must contribute its
+    // four queued rows to the sum. A regression in `workkind_swift_raw_value`
+    // (e.g. mapping `ExtractKg` to `"extract_kg"` instead of `"extractKG"`)
+    // would silently drop these from the snapshot but keep them in
+    // pendingCount, surfacing as a sum mismatch above.
+    let extract_kg = kinds
+        .iter()
+        .find(|r| r["kind"] == "extract_kg")
+        .expect("snapshot must include an `extract_kg` row");
+    assert_eq!(extract_kg["queued"], json!(4));
+}
+
 /// Fresh installs may not have run the Swift `pending_work` migration yet.
 /// Snapshot should still be 200 with every queue/failure count at zero.
 #[tokio::test]
