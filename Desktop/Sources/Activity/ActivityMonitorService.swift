@@ -65,7 +65,14 @@ public final class ActivityMonitorService: ObservableObject {
     /// Begin polling. Idempotent. Wires up window-key observers so polling
     /// suspends when the IR window is hidden/inactive.
     public func start() {
+        // Reset cold-start grace on first start (or after a real `stop()`),
+        // but NOT on a re-entrant `start()` while we're already polling — the
+        // Activity tab can be hidden/shown rapidly and we don't want grace to
+        // re-arm every flip. The `!isStarted` guard below ensures the reset
+        // runs at most once per start/stop cycle.
         guard !isStarted else { return }
+        hasReceivedFirstSnapshot = false
+        coldStartFailureCount = 0
         isStarted = true
 
         keyObserver = NotificationCenter.default.addObserver(
@@ -107,10 +114,10 @@ public final class ActivityMonitorService: ObservableObject {
             NotificationCenter.default.removeObserver(resignObserver)
             self.resignObserver = nil
         }
-        // Reset cold-start grace so the next `start()` (e.g. after window
-        // tear-down + relaunch in tests) gets a fresh window.
-        hasReceivedFirstSnapshot = false
-        coldStartFailureCount = 0
+        // Note: cold-start grace is reset in `start()` (guarded by
+        // `!isStarted`), not here. Keeping reset out of `stop()` makes
+        // rapid hide/show flapping safe — grace re-arms only on a genuine
+        // restart of the polling loop.
     }
 
     // MARK: - Public actions
@@ -277,17 +284,25 @@ public final class ActivityMonitorService: ObservableObject {
         } catch {
             // Issue #104 — cold-start grace. If we haven't yet seen a
             // successful snapshot AND the error is a transient daemon-startup
-            // indicator (timeout, connection refused, 5xx), don't surface a
-            // banner yet — the 1 Hz timer will retry and almost always
-            // succeeds within the next few ticks. Only surface the error
-            // after `coldStartGraceAttempts` consecutive transient failures.
+            // indicator (timeout, connection refused, 5xx, 401 token rotation),
+            // don't surface a banner yet — the 1 Hz timer will retry and
+            // almost always succeeds within the next few ticks. Only surface
+            // the error after `coldStartGraceAttempts` consecutive transient
+            // failures. The first `coldStartGraceAttempts` are suppressed
+            // (tick 5 still suppressed, tick 6 surfaces) — see
+            // `testGraceWindowSuppressesFirst5TransientFailures`.
             if !hasReceivedFirstSnapshot,
                Self.isTransientStartupError(error) {
                 coldStartFailureCount += 1
-                if coldStartFailureCount < Self.coldStartGraceAttempts {
+                if coldStartFailureCount <= Self.coldStartGraceAttempts {
                     // Stay quiet during grace; preserve any prior error
                     // message so a stale banner doesn't get overwritten by
-                    // a transient one.
+                    // a transient one. Log to /private/tmp/omi-dev.log so
+                    // the suppression is observable when triaging "why is
+                    // the banner not showing" reports.
+                    NSLog(
+                        "[activity-monitor] suppressed cold-start \(error) (\(coldStartFailureCount)/\(Self.coldStartGraceAttempts))"
+                    )
                     return
                 }
             }
@@ -295,33 +310,56 @@ public final class ActivityMonitorService: ObservableObject {
         }
     }
 
-    /// Mirrors `InternalPostFailureTracker.isDaemonRestartIndicator` —
-    /// transient errors that almost always clear themselves within a few
-    /// 1 Hz polls during daemon launch.
-    nonisolated static func isTransientStartupError(_ error: Error) -> Bool {
-        if let api = error as? APIError {
-            switch api {
-            case .unauthorized:
+    // MARK: - Testability seam (Issue #104)
+    //
+    // `fetchOnce` calls `APIClient.shared` directly and there is no DI seam
+    // for the network client at this layer (introducing one is out of scope
+    // for this PR). The grace-window state machine is otherwise entirely
+    // local to this service, so we expose narrow internal hooks that drive
+    // the same state transitions from a test, without going through
+    // URLSession. These mirror the exact branches in `fetchOnce` above.
+
+    /// Drive the cold-start state machine as if a network error of `error`
+    /// just occurred. Returns `true` if the error was suppressed (no banner),
+    /// `false` if it was surfaced via `lastError`. Test-only.
+    @discardableResult
+    func _testHandleFetchError(_ error: Error) -> Bool {
+        if case APIError.daemonNotConfigured = error {
+            self.lastError = APIError.daemonNotConfigured.localizedDescription
+            return false
+        }
+        if !hasReceivedFirstSnapshot, Self.isTransientStartupError(error) {
+            coldStartFailureCount += 1
+            if coldStartFailureCount <= Self.coldStartGraceAttempts {
                 return true
-            case .httpError(let code) where code == 502 || code == 503 || code == 504:
-                return true
-            default:
-                break
             }
         }
-        let nsErr = error as NSError
-        if nsErr.domain == NSURLErrorDomain {
-            switch nsErr.code {
-            case NSURLErrorCannotConnectToHost,
-                 NSURLErrorNetworkConnectionLost,
-                 NSURLErrorNotConnectedToInternet,
-                 NSURLErrorTimedOut:
-                return true
-            default:
-                break
-            }
-        }
+        self.lastError = "snapshot failed: \(error.localizedDescription)"
         return false
+    }
+
+    /// Mark a successful snapshot as if `fetchOnce` succeeded. Test-only.
+    func _testHandleFetchSuccess() {
+        self.lastError = nil
+        self.hasReceivedFirstSnapshot = true
+        self.coldStartFailureCount = 0
+    }
+
+    /// Reset state as if `start()` ran from a not-started position. Test-only.
+    func _testResetStartGrace() {
+        hasReceivedFirstSnapshot = false
+        coldStartFailureCount = 0
+        self.lastError = nil
+    }
+
+    /// Transient errors that almost always clear themselves within a few
+    /// 1 Hz polls during daemon launch / restart. Delegates to the shared
+    /// `DaemonErrorClassifier` so this service, `InternalPostFailureTracker`,
+    /// and `ProcessingGateReporter` can never drift apart again. Kept as a
+    /// `static` here so existing tests can call
+    /// `ActivityMonitorService.isTransientStartupError(...)` unchanged.
+    nonisolated static func isTransientStartupError(_ error: Error) -> Bool {
+        DaemonErrorClassifier.isTransient(error)
     }
 
     private func snapshotWithAuthoritativeQueueDepth(_ snap: ActivitySnapshot) async -> ActivitySnapshot {
