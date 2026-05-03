@@ -3,6 +3,8 @@ import SwiftUI
 /// Full detail view for a single conversation
 struct ConversationDetailView: View {
     let conversation: ServerConversation
+    var autoOpenIdentifySpeakers = false
+    var onAutoOpenIdentifySpeakersHandled: (() -> Void)?
     let onBack: () -> Void
     var folders: [Folder] = []
     var onMoveToFolder: ((String, String?) async -> Void)?
@@ -40,6 +42,8 @@ struct ConversationDetailView: View {
 
     // Speaker naming state
     @State private var selectedSegmentForNaming: TranscriptSegment? = nil
+    @State private var showIdentifySpeakers = false
+    @State private var didAutoPromptIdentifySpeakers = false
 
     static func assignmentMetadata(
         for segmentIndices: [Int],
@@ -199,6 +203,7 @@ struct ConversationDetailView: View {
                         updatedConversation.transcriptSegments = segments
                         loadedConversation = updatedConversation
                         log("ConversationDetail: Loaded \(segments.count) segments from local database")
+                        autoPromptIdentifySpeakersIfNeeded(segments)
                     } else {
                         log("ConversationDetail: No local session for \(conversation.id) — leaving empty")
                     }
@@ -206,6 +211,8 @@ struct ConversationDetailView: View {
                     logError("ConversationDetail: Failed to load conversation segments", error: error)
                 }
                 isLoadingConversation = false
+            } else {
+                autoPromptIdentifySpeakersIfNeeded(conversation.transcriptSegments)
             }
         }
         .onReceive(
@@ -217,6 +224,10 @@ struct ConversationDetailView: View {
             withAnimation(.easeInOut(duration: 0.2)) {
                 showTranscriptDrawer = true
             }
+        }
+        .onChange(of: autoOpenIdentifySpeakers) { _, shouldAutoOpen in
+            guard shouldAutoOpen else { return }
+            autoPromptIdentifySpeakersIfNeeded(displayConversation.transcriptSegments)
         }
         .dismissableSheet(isPresented: $showAppSelector) {
             AppSelectorSheet(
@@ -267,6 +278,46 @@ struct ConversationDetailView: View {
                 },
                 onDismiss: {
                     selectedSegmentForNaming = nil
+                }
+            )
+        }
+        .dismissableSheet(isPresented: $showIdentifySpeakers) {
+            SpeakerIdentificationReviewSheet(
+                conversationId: conversation.id,
+                segments: displayConversation.transcriptSegments,
+                people: people,
+                onAssign: { segmentIndices, personId, isUser in
+                    let assignment = Self.assignmentMetadata(
+                        for: segmentIndices,
+                        in: displayConversation.transcriptSegments
+                    )
+                    let success = await onAssignSpeaker?(
+                        conversation.id,
+                        assignment.targets,
+                        personId,
+                        isUser
+                    ) ?? false
+                    if success {
+                        await persistSpeakerAssignment(
+                            conversationId: conversation.id,
+                            backendSegmentIds: assignment.backendIds,
+                            fallbackSegmentOrders: assignment.fallbackOrders,
+                            isUser: isUser,
+                            personId: personId
+                        )
+                        updateDisplayedConversation(
+                            segmentIndices: segmentIndices,
+                            isUser: isUser,
+                            personId: personId
+                        )
+                    }
+                    return success
+                },
+                onCreatePerson: { name in
+                    await onCreatePerson?(name)
+                },
+                onDismiss: {
+                    showIdentifySpeakers = false
                 }
             )
         }
@@ -679,6 +730,23 @@ struct ConversationDetailView: View {
 
                 Spacer()
 
+                if hasSpeakersNeedingReview {
+                    Button(action: { showIdentifySpeakers = true }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "person.wave.2")
+                                .scaledFont(size: 12)
+                            Text("Identify")
+                                .scaledFont(size: 12, weight: .medium)
+                        }
+                        .foregroundColor(OmiColors.purplePrimary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(OmiColors.purplePrimary.opacity(0.15)))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Identify speakers")
+                }
+
                 // Copy button
                 Button(action: copyTranscript) {
                     Image(systemName: "doc.on.doc")
@@ -765,12 +833,24 @@ struct ConversationDetailView: View {
                 segment: segment,
                 isUser: segment.isUser,
                 personName: segment.personId.flatMap { peopleDict[$0]?.name },
-                onSpeakerTapped: segment.isUser ? nil : {
+                onSpeakerTapped: {
                     selectedSegmentForNaming = segment
                 }
             )
             .padding(.horizontal, 16)
         }
+    }
+
+    private var hasSpeakersNeedingReview: Bool {
+        !SpeakerReviewQueueBuilder.makeQueue(from: displayConversation.transcriptSegments).isEmpty
+    }
+
+    private func autoPromptIdentifySpeakersIfNeeded(_ segments: [TranscriptSegment]) {
+        guard autoOpenIdentifySpeakers, !didAutoPromptIdentifySpeakers else { return }
+        didAutoPromptIdentifySpeakers = true
+        defer { onAutoOpenIdentifySpeakersHandled?() }
+        guard !SpeakerReviewQueueBuilder.makeQueue(from: segments).isEmpty else { return }
+        showIdentifySpeakers = true
     }
 
     @MainActor

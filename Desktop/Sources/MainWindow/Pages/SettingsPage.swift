@@ -1110,6 +1110,34 @@ struct SettingsContentView: View {
             .pickerStyle(.menu)
             .frame(width: 110)
           }
+
+          HStack {
+            Image(systemName: "waveform")
+              .scaledFont(size: 16)
+              .foregroundColor(OmiColors.purplePrimary)
+
+            VStack(alignment: .leading, spacing: 4) {
+              Text("Audio Review Retention")
+                .scaledFont(size: 15, weight: .medium)
+                .foregroundColor(OmiColors.textPrimary)
+
+              Text("How long to keep audio chunks for speaker review")
+                .scaledFont(size: 13)
+                .foregroundColor(OmiColors.textTertiary)
+            }
+
+            Spacer()
+
+            Picker("", selection: $rewindSettings.audioRetentionDays) {
+              Text("1 day").tag(1)
+              Text("3 days").tag(3)
+              Text("7 days").tag(7)
+              Text("14 days").tag(14)
+              Text("30 days").tag(30)
+            }
+            .pickerStyle(.menu)
+            .frame(width: 110)
+          }
         }
       }
     }

@@ -121,11 +121,15 @@ class AudioMixer {
             // When flushing, process whatever is available
             bytesToProcess = max(micBuffer.count, systemBuffer.count)
         } else {
-            // Normal operation: process when both have data
+            // Normal operation: process once audio is available. If one side is
+            // absent (system capture disabled/failed, or mic-only recording), pad
+            // that side with silence instead of stalling the stream.
             let minAvailable = min(micBuffer.count, systemBuffer.count)
-            guard minAvailable >= minBufferBytes else { return }
+            let maxAvailable = max(micBuffer.count, systemBuffer.count)
+            guard maxAvailable >= minBufferBytes else { return }
             // Align to sample boundary (2 bytes per Int16 sample)
-            bytesToProcess = (minAvailable / 2) * 2
+            let availableToProcess = minAvailable > 0 ? minAvailable : maxAvailable
+            bytesToProcess = (availableToProcess / 2) * 2
         }
 
         guard bytesToProcess >= 2 else { return }

@@ -46,20 +46,20 @@ struct SpeakerBubbleView: View {
             }
 
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
-                // Speaker label — clickable for non-user speakers
-                if !isUser, let onTap = onSpeakerTapped {
+                // Speaker label
+                if let onTap = onSpeakerTapped {
                     Button(action: onTap) {
                         HStack(spacing: 4) {
                             Text(speakerLabel)
                                 .scaledFont(size: 12, weight: .medium)
-                            if personName == nil {
+                            if personName == nil && !isUser {
                                 Image(systemName: "pencil")
                                     .scaledFont(size: 10)
                             }
                         }
                         .padding(.vertical, 2)
                         .contentShape(Rectangle())
-                        .foregroundColor(personName != nil ? OmiColors.purplePrimary : OmiColors.textTertiary)
+                        .foregroundColor(personName != nil || isUser ? OmiColors.purplePrimary : OmiColors.textTertiary)
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("transcript_speaker_button_\(segment.id)")
@@ -123,6 +123,28 @@ struct SpeakerBubbleView: View {
     }
 
     private var avatar: some View {
+        Group {
+            if let onSpeakerTapped {
+                Button(action: onSpeakerTapped) {
+                    avatarCircle
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("transcript_speaker_avatar_\(segment.id)")
+                .accessibilityLabel("Change speaker \(speakerLabel)")
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+            } else {
+                avatarCircle
+            }
+        }
+    }
+
+    private var avatarCircle: some View {
         Circle()
             .fill(isUser ? OmiColors.purplePrimary : (personName != nil ? OmiColors.purplePrimary.opacity(0.3) : OmiColors.backgroundQuaternary))
             .frame(width: 32, height: 32)

@@ -323,6 +323,7 @@ actor RewindDatabase {
         consecutiveQueryIOErrors = 0
 
         try migrate(activeQueue)
+        try await purgeExpiredAudioChunksOnLaunch(activeQueue)
 
         // After unclean shutdown, do a cheap schema sanity check (not a full DB scan).
         // PRAGMA quick_check scans the ENTIRE database regardless of the (N) argument
@@ -342,6 +343,25 @@ actor RewindDatabase {
         FileManager.default.createFile(atPath: flagPath, contents: nil)
 
         log("RewindDatabase: Initialized successfully")
+    }
+
+    private func purgeExpiredAudioChunksOnLaunch(_ queue: DatabasePool) async throws {
+        let retentionDays = max(
+            1,
+            UserDefaults.standard.object(forKey: AudioPersistenceService.retentionDaysKey) as? Int
+                ?? AudioPersistenceService.defaultRetentionDays
+        )
+        let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
+        let deleted = try await queue.write { db -> Int in
+            try db.execute(
+                sql: "DELETE FROM audio_chunks WHERE endedAt < ?",
+                arguments: [cutoff]
+            )
+            return db.changesCount
+        }
+        if deleted > 0 {
+            log("RewindDatabase: Purged \(deleted) expired audio chunk(s) on launch")
+        }
     }
 
     // MARK: - Legacy Migration

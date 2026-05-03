@@ -1,5 +1,28 @@
 import SwiftUI
 
+enum SpeakerAssignmentTarget: Equatable {
+    case you
+    case person(String)
+
+    var personId: String? {
+        switch self {
+        case .you:
+            return nil
+        case .person(let id):
+            return id
+        }
+    }
+
+    var isUser: Bool {
+        switch self {
+        case .you:
+            return true
+        case .person:
+            return false
+        }
+    }
+}
+
 /// Modal sheet for naming a speaker in a transcript
 struct NameSpeakerSheet: View {
     let segment: TranscriptSegment
@@ -9,7 +32,7 @@ struct NameSpeakerSheet: View {
     let onCreatePerson: (_ name: String) async -> Person?
     let onDismiss: () -> Void
 
-    @State private var selectedPersonId: String? = nil
+    @State private var selectedTarget: SpeakerAssignmentTarget? = nil
     @State private var isAddingNewPerson: Bool = false
     @State private var newPersonName: String = ""
     @State private var duplicateWarning: String? = nil
@@ -19,13 +42,13 @@ struct NameSpeakerSheet: View {
 
     /// Segments from the same speaker in this conversation
     private var sameSpeakerSegments: [TranscriptSegment] {
-        allSegments.filter { $0.speaker == segment.speaker && !$0.isUser }
+        allSegments.filter { $0.speaker == segment.speaker }
     }
 
     /// Segment indices (positional index in allSegments) for the same speaker
     private var sameSpeakerIndices: [Int] {
         allSegments.enumerated().compactMap { index, seg in
-            seg.speaker == segment.speaker && !seg.isUser ? index : nil
+            seg.speaker == segment.speaker ? index : nil
         }
     }
 
@@ -129,7 +152,7 @@ struct NameSpeakerSheet: View {
                             .scaledFont(size: 12, weight: .semibold)
                             .foregroundColor(OmiColors.textPrimary)
                     )
-                Text("Speaker \(segment.speakerId)")
+                Text(segment.isUser ? "You" : "Speaker \(segment.speakerId)")
                     .scaledFont(size: 14, weight: .medium)
                     .foregroundColor(OmiColors.textPrimary)
             }
@@ -157,10 +180,17 @@ struct NameSpeakerSheet: View {
                 .foregroundColor(OmiColors.textSecondary)
 
             FlowLayout(spacing: 8) {
+                personChip(label: "You", isSelected: selectedTarget == .you) {
+                    selectedTarget = .you
+                    isAddingNewPerson = false
+                    newPersonName = ""
+                    duplicateWarning = nil
+                }
+
                 // Existing people chips
                 ForEach(people) { person in
-                    personChip(label: person.name, isSelected: selectedPersonId == person.id) {
-                        selectedPersonId = person.id
+                    personChip(label: person.name, isSelected: selectedTarget == .person(person.id)) {
+                        selectedTarget = .person(person.id)
                         isAddingNewPerson = false
                         newPersonName = ""
                         duplicateWarning = nil
@@ -170,7 +200,7 @@ struct NameSpeakerSheet: View {
                 // "+ Add Person" chip
                 personChip(label: "+ Add Person", isSelected: isAddingNewPerson, isAction: true) {
                     isAddingNewPerson = true
-                    selectedPersonId = nil
+                    selectedTarget = nil
                     duplicateWarning = nil
                 }
             }
@@ -249,7 +279,7 @@ struct NameSpeakerSheet: View {
     // MARK: - Helpers
 
     private var canSave: Bool {
-        selectedPersonId != nil
+        selectedTarget != nil
     }
 
     private var canCreate: Bool {
@@ -272,7 +302,7 @@ struct NameSpeakerSheet: View {
 
         isCreating = true
         if let person = await onCreatePerson(trimmed) {
-            selectedPersonId = person.id
+            selectedTarget = .person(person.id)
             isAddingNewPerson = false
             newPersonName = ""
         }
@@ -280,9 +310,10 @@ struct NameSpeakerSheet: View {
     }
 
     private func save() {
+        guard let target = selectedTarget else { return }
         isSaving = true
         let segmentIndices = tagAllFromSpeaker ? sameSpeakerIndices : [tappedSegmentIndex]
-        onSave(selectedPersonId, false, segmentIndices)
+        onSave(target.personId, target.isUser, segmentIndices)
     }
 
     private func personChip(label: String, isSelected: Bool, isAction: Bool = false, action: @escaping () -> Void) -> some View {

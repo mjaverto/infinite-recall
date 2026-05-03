@@ -368,6 +368,12 @@ class RewindSettings: ObservableObject {
         }
     }
 
+    @Published var audioRetentionDays: Int {
+        didSet {
+            AudioPersistenceService.retentionDays = audioRetentionDays
+        }
+    }
+
     @Published var captureInterval: Double {
         didSet {
             defaults.set(captureInterval, forKey: "rewindCaptureInterval")
@@ -407,6 +413,7 @@ class RewindSettings: ObservableObject {
     private init() {
         // Load settings with defaults
         self.retentionDays = defaults.object(forKey: "rewindRetentionDays") as? Int ?? 7
+        self.audioRetentionDays = AudioPersistenceService.retentionDays
         self.captureInterval = defaults.object(forKey: "rewindCaptureInterval") as? Double ?? 3.0
         self.ocrRecognitionFast = defaults.object(forKey: "rewindOCRFast") as? Bool ?? true
         self.pauseOCROnBattery = defaults.object(forKey: "rewindPauseOCROnBattery") as? Bool ?? true
