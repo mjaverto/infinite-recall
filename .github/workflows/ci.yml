@@ -39,6 +39,31 @@ jobs:
       - name: swift build
         run: xcrun swift build -c debug --package-path Desktop
 
+  swift-test:
+    name: Swift tests (debug)
+    runs-on: macos-15
+    timeout-minutes: 30
+    needs: swift-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libwebp (pkg-config dep for CWebP system library)
+        run: brew install webp
+
+      - name: Cache SwiftPM artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            Desktop/.build
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData/SourcePackages
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('Desktop/Package.swift', 'Desktop/Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+
+      - name: swift test
+        run: xcrun swift test --package-path Desktop
+
   rust-test:
     name: Rust tests (api)
     runs-on: macos-15

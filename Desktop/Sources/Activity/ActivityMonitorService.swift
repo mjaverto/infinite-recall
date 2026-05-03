@@ -21,7 +21,7 @@ import Combine
 import Foundation
 
 @MainActor
-public final class ActivityMonitorService: ObservableObject {
+public final class ActivityMonitorService: ObservableObject, InternalPostFailureReporter {
     public static let shared = ActivityMonitorService()
 
     @Published public private(set) var snapshot: ActivitySnapshot?

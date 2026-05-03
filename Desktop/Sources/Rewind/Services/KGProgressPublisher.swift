@@ -119,6 +119,14 @@ actor KGProgressPublisher {
     /// Polls every `pollSeconds`; the 250ms emit throttle prevents flooding.
     private var pollTask: Task<Void, Never>?
     private let pollSeconds: TimeInterval = 5.0
+    /// Issue #98 — permanent kill switch tripped when the underlying schema is
+    /// missing the `kg_extraction_status` column (e.g. a test fixture that
+    /// opened a DB without running the full migrator). Without this, the
+    /// poller would log the same error every 5s indefinitely, blocking CI
+    /// for 30 minutes until the runner timeout. Once tripped, all sampling
+    /// becomes a no-op for the remainder of the process lifetime; the next
+    /// app launch will re-init the singleton with a fresh, migrated schema.
+    private var schemaUnavailable: Bool = false
 
     /// Last N drain durations, used to compute ETA.
     private var drainSamples: [TimeInterval] = []
@@ -171,6 +179,11 @@ actor KGProgressPublisher {
     // MARK: - Polling (Cluster E2)
 
     private func startPollerIfNeeded() {
+        // Issue #98: never start the poller after the schema kill switch
+        // tripped. If a new subscriber attaches mid-session we still replay
+        // `lastSnapshot` (or nothing) — but we don't resurrect a 5s ticker
+        // that we know is going to fail every iteration.
+        guard !schemaUnavailable else { return }
         guard pollTask == nil else { return }
         pollTask = Task { [weak self] in
             guard let self = self else { return }
@@ -210,6 +223,10 @@ actor KGProgressPublisher {
     /// would be indistinguishable from "backfill complete empty" and
     /// would silently corrupt the UI's state machine.
     func tick() async {
+        if schemaUnavailable {
+            logKillSwitchEarlyReturnIfNeeded(callsite: "tick")
+            return
+        }
         guard let snap = await sample() else { return }
         await emit(snap)
     }
@@ -218,10 +235,61 @@ actor KGProgressPublisher {
     /// (e.g. "model became ready") where the user is waiting for the pill to
     /// flip.
     func emitNow() async {
+        if schemaUnavailable {
+            logKillSwitchEarlyReturnIfNeeded(callsite: "emitNow")
+            return
+        }
         guard let snap = await sample() else { return }
         coalesceTask?.cancel()
         coalesceTask = nil
         deliver(snap)
+    }
+
+    /// Test/diagnostic seam: returns whether the publisher has tripped its
+    /// schema-unavailable kill switch. Production callers don't need this;
+    /// `KGProgressPublisherSchemaProbeTests` asserts the tripped state.
+    func _schemaUnavailableForTests() -> Bool { schemaUnavailable }
+
+    /// Test seam: drive the structural-error path without touching the
+    /// real database. Returns `true` if the error tripped the kill switch
+    /// and stopped the poller. Production code reaches the same logic via
+    /// `sample()` catching a thrown DB error; tests use this hook so they
+    /// can synthesize specific GRDB error shapes (no-such-column,
+    /// SQLITE_CORRUPT, SQLITE_BUSY, …) without standing up a real DB.
+    @discardableResult
+    func _handleSampleErrorForTests(_ error: Error) -> Bool {
+        return handleSampleError(error)
+    }
+
+    /// Test seam: clear the kill switch, mirroring what `resetForUserSwitch()`
+    /// does in production. Used so individual tests don't bleed state.
+    func _resetForTests() {
+        schemaUnavailable = false
+        killSwitchLoggedOnce = false
+        stopPoller()
+    }
+
+    /// Reset the schema kill switch when the underlying database is
+    /// re-opened (e.g. `RewindDatabase.switchUser`). The actor singleton
+    /// outlives DB reconnects, so without this hook a structural error
+    /// against user A's partially-migrated DB would permanently blind the
+    /// publisher to user B's healthy DB for the rest of the process. In
+    /// practice the auth strip removed multi-user switching, but the seam
+    /// keeps the design honest if it returns.
+    func resetForUserSwitch() {
+        schemaUnavailable = false
+        killSwitchLoggedOnce = false
+    }
+
+    /// Issue #98: log the first early-return after the kill switch trips
+    /// so debuggers spelunking through logs see a single explanatory
+    /// breadcrumb instead of silence. Subsequent early returns stay quiet
+    /// — we don't want to spam the log every 5s either.
+    private var killSwitchLoggedOnce = false
+    private func logKillSwitchEarlyReturnIfNeeded(callsite: String) {
+        guard !killSwitchLoggedOnce else { return }
+        killSwitchLoggedOnce = true
+        log("KGProgressPublisher: \(callsite)() short-circuited; schema kill switch tripped (further early returns will not log)")
     }
 
     // MARK: - Sampling
@@ -241,9 +309,13 @@ actor KGProgressPublisher {
             (processed, succeeded) = try await processedAsync
             totalNodes = try await totalNodesAsync
         } catch {
-            // Don't emit — a 0/0 snapshot here would render as
-            // "backfill complete empty" and lie to the user.
-            logError("KGProgressPublisher: sample DB read failed; skipping tick", error: error)
+            // Issue #98: detect structural schema errors that will never
+            // resolve by retrying. Pre-fix, the 5s poller logged the same
+            // "no such column: m.kg_extraction_status" every tick for the
+            // full 30-minute CI runner timeout. When we see one of these,
+            // trip the permanent kill switch and stop the poller — we'll
+            // never recover within this process lifetime.
+            _ = handleSampleError(error)
             return nil
         }
 
@@ -433,6 +505,67 @@ actor KGProgressPublisher {
         for (_, c) in continuations {
             c.yield(snapshot)
         }
+    }
+
+    // MARK: - Structural schema error classifier (issue #98)
+
+    /// Returns true for errors that indicate a permanent failure mode the
+    /// 5s poller cannot recover from on its own — schema mismatches
+    /// (missing column / table) and unrecoverable corruption
+    /// (`SQLITE_CORRUPT`, `SQLITE_NOTADB`). When this returns true,
+    /// `sample()` trips the kill switch instead of letting the poller log
+    /// the same error every tick until the CI runner timeout (30 min).
+    ///
+    /// Prefer the typed `DatabaseError` branch — substring-matching
+    /// `String(describing:)` is fragile to GRDB version bumps and could
+    /// false-positive on unrelated errors that quote SQL. The substring
+    /// fallback only fires for non-GRDB wrappers (e.g. layered storages
+    /// that re-throw the SQLite message inside another error type).
+    static func isStructuralSchemaError(_ error: Error) -> Bool {
+        if let dbErr = error as? DatabaseError {
+            switch dbErr.resultCode {
+            case .SQLITE_CORRUPT, .SQLITE_NOTADB:
+                // Unrecoverable: the file is structurally damaged or not a
+                // SQLite database. Retrying the same query forever just
+                // spams logs. RewindDatabase.reportQueryError already has
+                // its own consecutive-error close-and-recover path; here
+                // we just stop our own poller so we don't fight it.
+                return true
+            case .SQLITE_ERROR:
+                // SQLite collapses "no such column" / "no such table" into
+                // generic SQLITE_ERROR (rc=1) with the detail in the
+                // message string — there's no extended code we can match.
+                let msg = (dbErr.message ?? "").lowercased()
+                return msg.contains("no such column") || msg.contains("no such table")
+            default:
+                return false
+            }
+        }
+        // Non-GRDB wrapper (rare; layered storages etc.). Keep the
+        // substring matcher as a defensive last resort. We deliberately
+        // do NOT include "corrupt" / "not a database" here — only the
+        // typed branch is allowed to escalate those, since the substring
+        // form is far more prone to false positives.
+        let desc = String(describing: error).lowercased()
+        return desc.contains("no such column") || desc.contains("no such table")
+    }
+
+    /// Centralized error handler for `sample()` and the test injection
+    /// seam. Returns `true` if the kill switch tripped on this error.
+    private func handleSampleError(_ error: Error) -> Bool {
+        if Self.isStructuralSchemaError(error) {
+            logError(
+                "KGProgressPublisher: structural DB error — disabling publisher for process lifetime",
+                error: error
+            )
+            schemaUnavailable = true
+            stopPoller()
+            return true
+        }
+        // Don't emit — a 0/0 snapshot here would render as
+        // "backfill complete empty" and lie to the user.
+        logError("KGProgressPublisher: sample DB read failed; skipping tick", error: error)
+        return false
     }
 }
 
