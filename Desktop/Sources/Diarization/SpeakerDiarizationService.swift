@@ -39,6 +39,11 @@ struct DiarizationTurn {
     let speakerId: Int
     let personId: String?
     let similarity: Float?      // confidence of the personId match if any
+    // Suggested candidate identity metadata (NOT applied to transcript automatically).
+    let suggestedPersonId: String?
+    let suggestedSimilarity: Float?
+    let suggestedMargin: Float?
+    let suggestedSampleCount: Int?
     let start: Double           // seconds since session start
     let end: Double
     let embedding: [Float]      // L2-normalized
@@ -150,7 +155,14 @@ final class SpeakerDiarizationService: @unchecked Sendable {
     /// Best-effort lookup: which speaker was talking around `seconds` (since
     /// session start)? Returns the most recent turn that contains the time, or
     /// the closest preceding turn within 1.5s, or nil. Thread-safe.
-    func lookupSpeaker(at seconds: Double) -> (speakerId: Int, personId: String?)? {
+    func lookupSpeaker(at seconds: Double) -> (
+        speakerId: Int,
+        personId: String?,
+        suggestedPersonId: String?,
+        suggestedSimilarity: Float?,
+        suggestedMargin: Float?,
+        suggestedSampleCount: Int?
+    )? {
         stateLock.lock()
         defer { stateLock.unlock() }
         // Walk back-to-front since the latest turn is most likely the match.
@@ -158,7 +170,14 @@ final class SpeakerDiarizationService: @unchecked Sendable {
         var bestPreceding: DiarizationTurn?
         for turn in timeline.reversed() {
             if seconds >= turn.start && seconds <= turn.end {
-                return (turn.speakerId, turn.personId)
+                return (
+                    turn.speakerId,
+                    turn.personId,
+                    turn.suggestedPersonId,
+                    turn.suggestedSimilarity,
+                    turn.suggestedMargin,
+                    turn.suggestedSampleCount
+                )
             }
             if seconds > turn.end {
                 let delta = seconds - turn.end
@@ -169,7 +188,14 @@ final class SpeakerDiarizationService: @unchecked Sendable {
             }
         }
         if let t = bestPreceding, bestPrecedingDelta <= 1.5 {
-            return (t.speakerId, t.personId)
+            return (
+                t.speakerId,
+                t.personId,
+                t.suggestedPersonId,
+                t.suggestedSimilarity,
+                t.suggestedMargin,
+                t.suggestedSampleCount
+            )
         }
         return nil
     }
@@ -350,11 +376,24 @@ final class SpeakerDiarizationService: @unchecked Sendable {
         let handler = onTurn
 
         Task { [embedding, speakerId, startSec, endSec, sid, handler] in
-            let match = await SpeakerEmbeddingStore.shared.matchPerson(embedding: embedding)
+            let match = await SpeakerEmbeddingStore.shared.classifyPerson(
+                embedding: embedding,
+                duration: endSec - startSec
+            )
+            let suggested: (personId: String, similarity: Float, margin: Float, sampleCount: Int)?
+            if case .suggested(let pid, let sim, let margin, let count) = match {
+                suggested = (pid, sim, margin, count)
+            } else {
+                suggested = nil
+            }
             let turn = DiarizationTurn(
                 speakerId: speakerId,
-                personId: match?.personId,
-                similarity: match?.similarity,
+                personId: match.personIdForTranscript,
+                similarity: match.similarity,
+                suggestedPersonId: suggested?.personId,
+                suggestedSimilarity: suggested?.similarity,
+                suggestedMargin: suggested?.margin,
+                suggestedSampleCount: suggested?.sampleCount,
                 start: startSec,
                 end: endSec,
                 embedding: embedding
@@ -368,7 +407,10 @@ final class SpeakerDiarizationService: @unchecked Sendable {
                     startTime: startSec,
                     endTime: endSec,
                     speakerId: speakerId,
-                    personId: match?.personId
+                    personId: match.personIdForTranscript,
+                    assignmentSource: match.personIdForTranscript == nil ? nil : .autoHighConfidence,
+                    matchConfidence: match.personIdForTranscript == nil ? nil : match.similarity,
+                    isTrainingSample: false
                 )
             }
             if let handler = handler {
@@ -485,11 +527,26 @@ final class SpeakerDiarizationService: @unchecked Sendable {
             // Map pyannote's per-window speaker index to a session-stable cluster id.
             let localSpeakerId = assignSessionCluster(for: syntheticEmbedding)
 
-            let match = await SpeakerEmbeddingStore.shared.matchPerson(embedding: syntheticEmbedding)
+            let match = await SpeakerEmbeddingStore.shared.classifyPerson(
+                embedding: syntheticEmbedding,
+                duration: segEnd - segStart,
+                embeddingModel: "speakerkit-synthetic",
+                embeddingVersion: 1
+            )
+            let suggested: (personId: String, similarity: Float, margin: Float, sampleCount: Int)?
+            if case .suggested(let pid, let sim, let margin, let count) = match {
+                suggested = (pid, sim, margin, count)
+            } else {
+                suggested = nil
+            }
             let turn = DiarizationTurn(
                 speakerId: localSpeakerId,
-                personId: match?.personId,
-                similarity: match?.similarity,
+                personId: match.personIdForTranscript,
+                similarity: match.similarity,
+                suggestedPersonId: suggested?.personId,
+                suggestedSimilarity: suggested?.similarity,
+                suggestedMargin: suggested?.margin,
+                suggestedSampleCount: suggested?.sampleCount,
                 start: segStart,
                 end: segEnd,
                 embedding: syntheticEmbedding
@@ -503,7 +560,12 @@ final class SpeakerDiarizationService: @unchecked Sendable {
                     startTime: segStart,
                     endTime: segEnd,
                     speakerId: localSpeakerId,
-                    personId: match?.personId
+                    personId: match.personIdForTranscript,
+                    assignmentSource: match.personIdForTranscript == nil ? nil : .autoHighConfidence,
+                    matchConfidence: match.personIdForTranscript == nil ? nil : match.similarity,
+                    embeddingModel: "speakerkit-synthetic",
+                    embeddingVersion: 1,
+                    isTrainingSample: false
                 )
             }
             if let handler = handler {

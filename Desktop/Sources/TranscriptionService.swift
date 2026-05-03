@@ -40,6 +40,11 @@ class TranscriptionService: @unchecked Sendable {
         let speaker_id: Int?
         let is_user: Bool
         let person_id: String?
+        // Suggested candidate identity metadata (NOT applied automatically).
+        let suggested_person_id: String?
+        let suggested_similarity: Double?
+        let suggested_margin: Double?
+        let suggested_sample_count: Int?
         let start: Double
         let end: Double
         let translations: [BackendTranslation]?
@@ -416,6 +421,10 @@ class TranscriptionService: @unchecked Sendable {
                         speaker_id: speakerId,
                         is_user: speakerId == 0 && personId == nil,
                         person_id: personId,
+                        suggested_person_id: lookup?.suggestedPersonId,
+                        suggested_similarity: lookup?.suggestedSimilarity.map(Double.init),
+                        suggested_margin: lookup?.suggestedMargin.map(Double.init),
+                        suggested_sample_count: lookup?.suggestedSampleCount,
                         start: absStart,
                         end: absEnd,
                         translations: nil

@@ -10,7 +10,6 @@ struct NameSpeakerSheet: View {
     let onDismiss: () -> Void
 
     @State private var selectedPersonId: String? = nil
-    @State private var isUserSelected: Bool = false
     @State private var isAddingNewPerson: Bool = false
     @State private var newPersonName: String = ""
     @State private var duplicateWarning: String? = nil
@@ -158,20 +157,10 @@ struct NameSpeakerSheet: View {
                 .foregroundColor(OmiColors.textSecondary)
 
             FlowLayout(spacing: 8) {
-                // "You" chip
-                personChip(label: "You", isSelected: isUserSelected) {
-                    isUserSelected = true
-                    selectedPersonId = nil
-                    isAddingNewPerson = false
-                    newPersonName = ""
-                    duplicateWarning = nil
-                }
-
                 // Existing people chips
                 ForEach(people) { person in
                     personChip(label: person.name, isSelected: selectedPersonId == person.id) {
                         selectedPersonId = person.id
-                        isUserSelected = false
                         isAddingNewPerson = false
                         newPersonName = ""
                         duplicateWarning = nil
@@ -181,7 +170,6 @@ struct NameSpeakerSheet: View {
                 // "+ Add Person" chip
                 personChip(label: "+ Add Person", isSelected: isAddingNewPerson, isAction: true) {
                     isAddingNewPerson = true
-                    isUserSelected = false
                     selectedPersonId = nil
                     duplicateWarning = nil
                 }
@@ -261,7 +249,7 @@ struct NameSpeakerSheet: View {
     // MARK: - Helpers
 
     private var canSave: Bool {
-        isUserSelected || selectedPersonId != nil
+        selectedPersonId != nil
     }
 
     private var canCreate: Bool {
@@ -294,7 +282,7 @@ struct NameSpeakerSheet: View {
     private func save() {
         isSaving = true
         let segmentIndices = tagAllFromSpeaker ? sameSpeakerIndices : [tappedSegmentIndex]
-        onSave(selectedPersonId, isUserSelected, segmentIndices)
+        onSave(selectedPersonId, false, segmentIndices)
     }
 
     private func personChip(label: String, isSelected: Bool, isAction: Bool = false, action: @escaping () -> Void) -> some View {

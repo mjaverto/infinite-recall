@@ -977,6 +977,11 @@ struct TranscriptSegment: Codable, Identifiable {
   let speaker: String?
   let isUser: Bool
   let personId: String?
+  // Suggested candidate identity metadata (NOT applied automatically)
+  let suggestedPersonId: String?
+  let suggestedSimilarity: Double?
+  let suggestedMargin: Double?
+  let suggestedSampleCount: Int?
   let start: Double
   let end: Double
   let translations: [TranscriptTranslation]
@@ -994,6 +999,10 @@ struct TranscriptSegment: Codable, Identifiable {
     case id, text, speaker
     case isUser = "is_user"
     case personId = "person_id"
+    case suggestedPersonId = "suggested_person_id"
+    case suggestedSimilarity = "suggested_similarity"
+    case suggestedMargin = "suggested_margin"
+    case suggestedSampleCount = "suggested_sample_count"
     case start, end, translations
   }
 
@@ -1006,6 +1015,10 @@ struct TranscriptSegment: Codable, Identifiable {
     speaker = try container.decodeIfPresent(String.self, forKey: .speaker)
     isUser = try container.decodeIfPresent(Bool.self, forKey: .isUser) ?? false
     personId = try container.decodeIfPresent(String.self, forKey: .personId)
+    suggestedPersonId = try container.decodeIfPresent(String.self, forKey: .suggestedPersonId)
+    suggestedSimilarity = try container.decodeIfPresent(Double.self, forKey: .suggestedSimilarity)
+    suggestedMargin = try container.decodeIfPresent(Double.self, forKey: .suggestedMargin)
+    suggestedSampleCount = try container.decodeIfPresent(Int.self, forKey: .suggestedSampleCount)
     start = try container.decodeIfPresent(Double.self, forKey: .start) ?? 0
     end = try container.decodeIfPresent(Double.self, forKey: .end) ?? 0
     translations =
@@ -1020,6 +1033,10 @@ struct TranscriptSegment: Codable, Identifiable {
     speaker: String?,
     isUser: Bool,
     personId: String?,
+    suggestedPersonId: String? = nil,
+    suggestedSimilarity: Double? = nil,
+    suggestedMargin: Double? = nil,
+    suggestedSampleCount: Int? = nil,
     start: Double,
     end: Double,
     translations: [TranscriptTranslation] = []
@@ -1030,6 +1047,10 @@ struct TranscriptSegment: Codable, Identifiable {
     self.speaker = speaker
     self.isUser = isUser
     self.personId = personId
+    self.suggestedPersonId = suggestedPersonId
+    self.suggestedSimilarity = suggestedSimilarity
+    self.suggestedMargin = suggestedMargin
+    self.suggestedSampleCount = suggestedSampleCount
     self.start = start
     self.end = end
     self.translations = translations

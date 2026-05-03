@@ -208,6 +208,11 @@ struct TranscriptionSegmentRecord: Codable, FetchableRecord, PersistableRecord, 
     var speakerLabel: String?             // Speaker label (e.g., "SPEAKER_00")
     var isUser: Bool                      // Whether this segment is from the user
     var personId: String?                 // Associated person ID (if identified)
+    // Suggested candidate identity metadata (NOT applied to transcript automatically)
+    var suggestedPersonId: String?
+    var suggestedSimilarity: Double?
+    var suggestedMargin: Double?
+    var suggestedSampleCount: Int?
     var translationsJson: String?         // JSON-encoded [TranscriptTranslation]
 
     static let databaseTableName = "transcription_segments"
@@ -228,6 +233,10 @@ struct TranscriptionSegmentRecord: Codable, FetchableRecord, PersistableRecord, 
         speakerLabel: String? = nil,
         isUser: Bool = false,
         personId: String? = nil,
+        suggestedPersonId: String? = nil,
+        suggestedSimilarity: Double? = nil,
+        suggestedMargin: Double? = nil,
+        suggestedSampleCount: Int? = nil,
         translationsJson: String? = nil
     ) {
         self.id = id
@@ -243,6 +252,10 @@ struct TranscriptionSegmentRecord: Codable, FetchableRecord, PersistableRecord, 
         self.speakerLabel = speakerLabel
         self.isUser = isUser
         self.personId = personId
+        self.suggestedPersonId = suggestedPersonId
+        self.suggestedSimilarity = suggestedSimilarity
+        self.suggestedMargin = suggestedMargin
+        self.suggestedSampleCount = suggestedSampleCount
         self.translationsJson = translationsJson
     }
 
@@ -447,6 +460,10 @@ extension TranscriptionSegmentRecord {
             speakerLabel: segment.speaker,
             isUser: segment.isUser,
             personId: segment.personId,
+            suggestedPersonId: segment.suggestedPersonId,
+            suggestedSimilarity: segment.suggestedSimilarity,
+            suggestedMargin: segment.suggestedMargin,
+            suggestedSampleCount: segment.suggestedSampleCount,
             translationsJson: translationsJson
         )
     }
@@ -474,6 +491,10 @@ extension TranscriptionSegmentRecord {
             speaker: speakerLabel,
             isUser: isUser,
             personId: personId,
+            suggestedPersonId: suggestedPersonId,
+            suggestedSimilarity: suggestedSimilarity,
+            suggestedMargin: suggestedMargin,
+            suggestedSampleCount: suggestedSampleCount,
             start: startTime,
             end: endTime,
             translations: translations

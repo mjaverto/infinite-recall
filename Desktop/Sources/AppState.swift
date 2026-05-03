@@ -2349,32 +2349,66 @@ class AppState: ObservableObject {
     personId: String?,
     isUser: Bool
   ) async -> Bool {
+    let split = PeopleStore.splitAssignmentTargets(segmentIds)
+    let backendIds = split.backendIds
+    let fallbackOrders = split.fallbackOrders
+
     // Update in-memory conversations list so the prop is fresh on next open.
-    let idSet = Set(segmentIds)
     if let idx = conversations.firstIndex(where: { $0.id == conversationId }) {
-      for segIdx in conversations[idx].transcriptSegments.indices
-        where idSet.contains(conversations[idx].transcriptSegments[segIdx].id) {
-        let old = conversations[idx].transcriptSegments[segIdx]
-        conversations[idx].transcriptSegments[segIdx] = TranscriptSegment(
-          id: old.id,
-          backendId: old.backendId,
-          text: old.text,
-          speaker: old.speaker,
-          isUser: isUser,
-          personId: isUser ? nil : personId,
-          start: old.start,
-          end: old.end,
-          translations: old.translations
-        )
+      if !backendIds.isEmpty {
+        let backendSet = Set(backendIds)
+        for segIdx in conversations[idx].transcriptSegments.indices {
+          guard let bid = conversations[idx].transcriptSegments[segIdx].backendId,
+                backendSet.contains(bid) else { continue }
+          let old = conversations[idx].transcriptSegments[segIdx]
+          conversations[idx].transcriptSegments[segIdx] = TranscriptSegment(
+            id: old.id,
+            backendId: old.backendId,
+            text: old.text,
+            speaker: old.speaker,
+            isUser: isUser,
+            personId: isUser ? nil : personId,
+            suggestedPersonId: old.suggestedPersonId,
+            suggestedSimilarity: old.suggestedSimilarity,
+            suggestedMargin: old.suggestedMargin,
+            suggestedSampleCount: old.suggestedSampleCount,
+            start: old.start,
+            end: old.end,
+            translations: old.translations
+          )
+        }
+      }
+      if !fallbackOrders.isEmpty {
+        let orderSet = Set(fallbackOrders)
+        for segIdx in conversations[idx].transcriptSegments.indices where orderSet.contains(segIdx) {
+          let old = conversations[idx].transcriptSegments[segIdx]
+          conversations[idx].transcriptSegments[segIdx] = TranscriptSegment(
+            id: old.id,
+            backendId: old.backendId,
+            text: old.text,
+            speaker: old.speaker,
+            isUser: isUser,
+            personId: isUser ? nil : personId,
+            suggestedPersonId: old.suggestedPersonId,
+            suggestedSimilarity: old.suggestedSimilarity,
+            suggestedMargin: old.suggestedMargin,
+            suggestedSampleCount: old.suggestedSampleCount,
+            start: old.start,
+            end: old.end,
+            translations: old.translations
+          )
+        }
       }
     }
-    // Persist to local SQLite (transcription_segments + speaker_embeddings).
+
+    // Persist to local SQLite (transcription_segments).
     do {
-      try await TranscriptionStorage.shared.updateSegmentSpeakerAssignment(
-        backendConversationId: conversationId,
-        segmentIds: segmentIds,
-        personId: personId,
-        isUser: isUser
+      try await TranscriptionStorage.shared.updateSpeakerAssignmentByBackendId(
+        conversationId,
+        segmentIds: backendIds,
+        fallbackSegmentOrders: fallbackOrders,
+        isUser: isUser,
+        personId: isUser ? nil : personId
       )
     } catch {
       logError("People: Failed to update local segment cache", error: error)
@@ -2494,6 +2528,10 @@ class AppState: ObservableObject {
               endTime: segment.end,
               isUser: segment.is_user,
               personId: segment.person_id,
+              suggestedPersonId: segment.suggested_person_id,
+              suggestedSimilarity: segment.suggested_similarity,
+              suggestedMargin: segment.suggested_margin,
+              suggestedSampleCount: segment.suggested_sample_count,
               speakerLabel: segment.speaker,
               translationsJson: translationsJson
             )

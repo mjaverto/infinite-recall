@@ -63,7 +63,17 @@ actor TranscriptionStorage {
         )
 
         let record = try await db.write { database in
-            try session.inserted(database)
+            var inserted = try session.inserted(database)
+            // Local-first fork: ensure a stable conversation id even before any
+            // backend sync. Many code paths (speaker assignment, per-conversation
+            // caching) key off backendId.
+            if inserted.backendId == nil, let sid = inserted.id {
+                inserted.backendId = "local-\(sid)"
+                inserted.backendSynced = false
+                inserted.updatedAt = Date()
+                try inserted.update(database)
+            }
+            return inserted
         }
 
         log("TranscriptionStorage: Started session \(record.id ?? -1) (source: \(source), device: \(inputDeviceName ?? "unknown"))")
@@ -303,6 +313,10 @@ actor TranscriptionStorage {
         endTime: Double,
         isUser: Bool = false,
         personId: String? = nil,
+        suggestedPersonId: String? = nil,
+        suggestedSimilarity: Double? = nil,
+        suggestedMargin: Double? = nil,
+        suggestedSampleCount: Int? = nil,
         speakerLabel: String? = nil,
         translationsJson: String? = nil
     ) async throws -> Int64 {
@@ -312,14 +326,33 @@ actor TranscriptionStorage {
         if let segId = backendSegmentId {
             let updated = try await db.write { database -> Bool in
                 try database.execute(
-                    sql: """
-                        UPDATE transcription_segments
-                        SET text = ?, speaker = ?, startTime = ?, endTime = ?, isUser = ?, personId = ?,
-                            speakerLabel = COALESCE(?, speakerLabel),
-                            translationsJson = COALESCE(?, translationsJson)
-                        WHERE sessionId = ? AND segmentId = ?
-                        """,
-                    arguments: [text, speaker, startTime, endTime, isUser, personId, speakerLabel, translationsJson, sessionId, segId]
+                     sql: """
+                         UPDATE transcription_segments
+                         SET text = ?, speaker = ?, startTime = ?, endTime = ?, isUser = ?, personId = ?,
+                             suggestedPersonId = ?,
+                             suggestedSimilarity = ?,
+                             suggestedMargin = ?,
+                             suggestedSampleCount = ?,
+                             speakerLabel = COALESCE(?, speakerLabel),
+                             translationsJson = COALESCE(?, translationsJson)
+                         WHERE sessionId = ? AND segmentId = ?
+                         """,
+                    arguments: [
+                        text,
+                        speaker,
+                        startTime,
+                        endTime,
+                        isUser,
+                        personId,
+                        suggestedPersonId,
+                        suggestedSimilarity,
+                        suggestedMargin,
+                        suggestedSampleCount,
+                        speakerLabel,
+                        translationsJson,
+                        sessionId,
+                        segId
+                    ]
                 )
                 return database.changesCount > 0
             }
@@ -348,6 +381,10 @@ actor TranscriptionStorage {
             speakerLabel: speakerLabel,
             isUser: isUser,
             personId: personId,
+            suggestedPersonId: suggestedPersonId,
+            suggestedSimilarity: suggestedSimilarity,
+            suggestedMargin: suggestedMargin,
+            suggestedSampleCount: suggestedSampleCount,
             translationsJson: translationsJson
         )
 

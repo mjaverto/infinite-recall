@@ -257,7 +257,7 @@ struct ConversationDetailView: View {
                                 isUser: isUser,
                                 personId: personId
                             )
-                            await updateDisplayedConversation(segmentIndices: segmentIndices, isUser: isUser, personId: personId)
+                            updateDisplayedConversation(segmentIndices: segmentIndices, isUser: isUser, personId: personId)
                         }
                         selectedSegmentForNaming = nil
                     }
@@ -785,6 +785,10 @@ struct ConversationDetailView: View {
                 speaker: oldSegment.speaker,
                 isUser: isUser,
                 personId: isUser ? nil : personId,
+                suggestedPersonId: oldSegment.suggestedPersonId,
+                suggestedSimilarity: oldSegment.suggestedSimilarity,
+                suggestedMargin: oldSegment.suggestedMargin,
+                suggestedSampleCount: oldSegment.suggestedSampleCount,
                 start: oldSegment.start,
                 end: oldSegment.end,
                 translations: oldSegment.translations

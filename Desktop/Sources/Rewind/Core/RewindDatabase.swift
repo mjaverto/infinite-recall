@@ -350,6 +350,10 @@ actor RewindDatabase {
     /// (Omi/users/anonymous/) to the per-user path (Omi/users/{userId}/).
     /// Handles both first-time migration (DB move) and partial re-runs (directory merges).
     private func migrateFromLegacyPathIfNeeded(to userDir: URL) {
+        // Tests must never migrate or mutate a developer's real App Support database.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return
+        }
         let fileManager = FileManager.default
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let omiDir = appSupport.appendingPathComponent("Omi", isDirectory: true)
@@ -2219,6 +2223,18 @@ actor RewindDatabase {
             }
         }
 
+        // Local-first: persist a stable backendId for local-only conversations so
+        // assignment paths can resolve conversationId -> sessionId.
+        migrator.registerMigration("backfillLocalConversationBackendIds") { db in
+            try db.execute(
+                sql: """
+                    UPDATE transcription_sessions
+                       SET backendId = 'local-' || id
+                     WHERE backendId IS NULL;
+                    """
+            )
+        }
+
         // Visual activity index — VLM-derived 1-2 sentence summary + structured
         // UI state per sampled frame, joined back to `screenshots` via id.
         // Sampling policy lives in `VisualActivitySampler`; this table is the
@@ -2460,10 +2476,17 @@ actor RewindDatabase {
         }
 
         migrator.registerMigration("addSummaryStateColumn") { db in
-            try db.execute(sql: """
-                ALTER TABLE transcription_sessions
-                  ADD COLUMN summary_state TEXT NOT NULL DEFAULT 'pending'
-                """)
+            // Be idempotent: some forks already added summary_state in the base table.
+            let info = try Row.fetchAll(db, sql: "PRAGMA table_info(transcription_sessions)")
+            let hasSummaryState = info.contains { row in
+                (row["name"] as String?) == "summary_state"
+            }
+            if !hasSummaryState {
+                try db.execute(sql: """
+                    ALTER TABLE transcription_sessions
+                      ADD COLUMN summary_state TEXT NOT NULL DEFAULT 'pending'
+                    """)
+            }
             try db.execute(sql: """
                 UPDATE transcription_sessions
                   SET summary_state = CASE
@@ -2508,6 +2531,96 @@ actor RewindDatabase {
         migrator.registerMigration("addActionItemsExtractedAt") { db in
             try db.alter(table: "transcription_sessions") { t in
                 t.add(column: "action_items_extracted_at", .datetime)
+            }
+        }
+
+        migrator.registerMigration("addVoiceProfileMetadata") { db in
+            // Be idempotent: forks may have added some of these columns already.
+            let info = try Row.fetchAll(db, sql: "PRAGMA table_info(speaker_embeddings)")
+            let existingColumns = Set(info.compactMap { ($0["name"] as String?) })
+
+            if !existingColumns.contains("assignmentSource") {
+                try db.execute(sql: "ALTER TABLE speaker_embeddings ADD COLUMN assignmentSource TEXT")
+            }
+            if !existingColumns.contains("matchConfidence") {
+                try db.execute(sql: "ALTER TABLE speaker_embeddings ADD COLUMN matchConfidence DOUBLE")
+            }
+            if !existingColumns.contains("embeddingModel") {
+                try db.execute(sql: "ALTER TABLE speaker_embeddings ADD COLUMN embeddingModel TEXT NOT NULL DEFAULT 'mfcc'")
+            }
+            if !existingColumns.contains("embeddingVersion") {
+                try db.execute(sql: "ALTER TABLE speaker_embeddings ADD COLUMN embeddingVersion INTEGER NOT NULL DEFAULT 1")
+            }
+            if !existingColumns.contains("isTrainingSample") {
+                try db.execute(sql: "ALTER TABLE speaker_embeddings ADD COLUMN isTrainingSample BOOLEAN NOT NULL DEFAULT 0")
+            }
+
+            // Backfill legacy rows, but don't overwrite existing non-null metadata.
+            // This migration can run on DBs that already have some of these values.
+            try db.execute(sql: """
+                UPDATE speaker_embeddings
+                SET assignmentSource = CASE
+                        WHEN assignmentSource IS NOT NULL THEN assignmentSource
+                        WHEN personId IS NULL THEN NULL
+                        ELSE 'manual'
+                    END,
+                    isTrainingSample = CASE
+                        WHEN isTrainingSample IS NOT NULL THEN isTrainingSample
+                        WHEN personId IS NULL THEN 0
+                        ELSE 1
+                    END
+                """)
+
+            // Index creation must be robust against partial schema.
+            let idxRows = try Row.fetchAll(db, sql: "PRAGMA index_list(speaker_embeddings)")
+            let existingIdx = Set(idxRows.compactMap { ($0["name"] as String?) })
+            if !existingIdx.contains("idx_speaker_embeddings_profile_model") {
+                try db.execute(sql: """
+                    CREATE INDEX idx_speaker_embeddings_profile_model
+                    ON speaker_embeddings(personId, embeddingModel, embeddingVersion, isTrainingSample)
+                    """)
+            }
+        }
+
+        // Conservative correction: legacy rows that already had personId should
+        // NOT automatically become trusted training samples.
+        migrator.registerMigration("conservativeLegacyVoiceProfileSamples") { db in
+            try db.execute(
+                sql: """
+                    UPDATE speaker_embeddings
+                    SET isTrainingSample = 0
+                    WHERE assignmentSource = 'manual'
+                      AND matchConfidence IS NULL
+                    """
+            )
+        }
+
+        // Suggested match metadata for transcript segments (computed but not applied).
+        migrator.registerMigration("addSegmentSuggestedPerson") { db in
+            // Be idempotent: forks may have added suggested columns/index already.
+            let info = try Row.fetchAll(db, sql: "PRAGMA table_info(transcription_segments)")
+            let existingColumns = Set(info.compactMap { ($0["name"] as String?) })
+
+            if !existingColumns.contains("suggestedPersonId") {
+                try db.execute(sql: "ALTER TABLE transcription_segments ADD COLUMN suggestedPersonId TEXT")
+            }
+            if !existingColumns.contains("suggestedSimilarity") {
+                try db.execute(sql: "ALTER TABLE transcription_segments ADD COLUMN suggestedSimilarity DOUBLE")
+            }
+            if !existingColumns.contains("suggestedMargin") {
+                try db.execute(sql: "ALTER TABLE transcription_segments ADD COLUMN suggestedMargin DOUBLE")
+            }
+            if !existingColumns.contains("suggestedSampleCount") {
+                try db.execute(sql: "ALTER TABLE transcription_segments ADD COLUMN suggestedSampleCount INTEGER")
+            }
+
+            let idxRows = try Row.fetchAll(db, sql: "PRAGMA index_list(transcription_segments)")
+            let existingIdx = Set(idxRows.compactMap { ($0["name"] as String?) })
+            if !existingIdx.contains("idx_segments_suggested_person") {
+                try db.execute(sql: """
+                    CREATE INDEX idx_segments_suggested_person
+                    ON transcription_segments(suggestedPersonId)
+                    """)
             }
         }
 

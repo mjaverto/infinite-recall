@@ -37,6 +37,15 @@ actor PeopleStore {
 
     private init() {}
 
+    static func splitAssignmentTargets(_ segmentIds: [String]) -> (backendIds: [String], fallbackOrders: [Int]) {
+        let backendIds = segmentIds.filter { !$0.hasPrefix("#index:") }
+        let fallbackOrders = segmentIds.compactMap { token -> Int? in
+            guard token.hasPrefix("#index:") else { return nil }
+            return Int(token.dropFirst("#index:".count))
+        }
+        return (backendIds, fallbackOrders)
+    }
+
     // MARK: - Read
 
     /// Fetch all known people, ordered by display name.
@@ -110,45 +119,164 @@ actor PeopleStore {
     ) async -> Bool {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return false }
         do {
+            let splitTargets = Self.splitAssignmentTargets(segmentIds)
+            let backendIds = splitTargets.backendIds
+            let fallbackOrders = splitTargets.fallbackOrders
             // Update segment rows by their backend segment id (which is a UUID
             // generated locally for fork-mode segments — see TranscriptionService).
             let resolvedPerson = isUser ? nil : personId
             let resolvedIsUser = isUser
             try await dbQueue.write { db in
-                for segId in segmentIds {
+                if !backendIds.isEmpty {
+                    let encodedIds = String(
+                        decoding: try JSONEncoder().encode(backendIds),
+                        as: UTF8.self
+                    )
                     try db.execute(
                         sql: """
                             UPDATE transcription_segments
                             SET personId = ?, isUser = ?
-                            WHERE sessionId = ? AND segmentId = ?
+                            WHERE sessionId = ? AND segmentId IN (
+                                SELECT value FROM json_each(?)
+                            )
                             """,
-                        arguments: [resolvedPerson, resolvedIsUser, sessionId, segId]
+                        arguments: [resolvedPerson, resolvedIsUser, sessionId, encodedIds]
+                    )
+                }
+                if !fallbackOrders.isEmpty {
+                    let encodedOrders = String(
+                        decoding: try JSONEncoder().encode(fallbackOrders),
+                        as: UTF8.self
+                    )
+                    try db.execute(
+                        sql: """
+                            UPDATE transcription_segments
+                            SET personId = ?, isUser = ?
+                            WHERE sessionId = ? AND segmentOrder IN (
+                                SELECT value FROM json_each(?)
+                            )
+                            """,
+                        arguments: [resolvedPerson, resolvedIsUser, sessionId, encodedOrders]
                     )
                 }
             }
 
-            // Backfill embeddings for the speakerIds covered by these segments.
-            // We look up each segment's `speaker` column and call into the
-            // embedding store.
-            let speakerIds: [Int] = try await dbQueue.read { db in
-                let placeholders = segmentIds.map { _ in "?" }.joined(separator: ",")
+            // Backfill embeddings only for the time windows represented by the
+            // selected segments. This avoids contaminating a whole session-local
+            // speaker cluster when the user tags just one/few segments.
+            let rows: [Row] = try await dbQueue.read { db in
+                var clauses: [String] = []
+                var args: [DatabaseValueConvertible] = [sessionId]
+                if !backendIds.isEmpty {
+                    let placeholders = backendIds.map { _ in "?" }.joined(separator: ",")
+                    clauses.append("segmentId IN (\(placeholders))")
+                    args.append(contentsOf: backendIds)
+                }
+                if !fallbackOrders.isEmpty {
+                    let placeholders = fallbackOrders.map { _ in "?" }.joined(separator: ",")
+                    clauses.append("segmentOrder IN (\(placeholders))")
+                    args.append(contentsOf: fallbackOrders)
+                }
+                guard !clauses.isEmpty else { return [] }
                 let sql = """
-                    SELECT DISTINCT speaker FROM transcription_segments
-                    WHERE sessionId = ? AND segmentId IN (\(placeholders))
+                    SELECT speaker, startTime, endTime
+                    FROM transcription_segments
+                    WHERE sessionId = ? AND (\(clauses.joined(separator: " OR ")))
                     """
-                let args: [DatabaseValueConvertible] = [sessionId] + segmentIds
-                return try Int.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                return try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             }
-            for sid in speakerIds {
+            var bySpeaker: [Int: [(start: Double, end: Double)]] = [:]
+            for row in rows {
+                let speaker: Int = row["speaker"]
+                let start: Double = row["startTime"]
+                let end: Double = row["endTime"]
+                bySpeaker[speaker, default: []].append((start, end))
+            }
+            for (sid, ranges) in bySpeaker {
                 await SpeakerEmbeddingStore.shared.assignPersonToEmbeddings(
                     sessionId: sessionId,
                     speakerId: sid,
-                    personId: isUser ? nil : personId
+                    personId: resolvedPerson,
+                    overlapping: ranges
                 )
             }
             return true
         } catch {
             logError("PeopleStore: assignSegments failed", error: error)
+            await RewindDatabase.shared.reportQueryError(error)
+            return false
+        }
+    }
+
+    func resetVoiceProfile(personId: String) async {
+        await SpeakerEmbeddingStore.shared.resetVoiceProfile(personId: personId)
+    }
+
+    @discardableResult
+    func deletePerson(id: String) async -> Bool {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return false }
+        do {
+            try await dbQueue.write { db in
+                try db.execute(
+                    sql: "UPDATE transcription_segments SET personId = NULL WHERE personId = ?",
+                    arguments: [id]
+                )
+                try db.execute(
+                    sql: """
+                        UPDATE speaker_embeddings
+                        SET personId = NULL,
+                            assignmentSource = NULL,
+                            matchConfidence = NULL,
+                            isTrainingSample = 0
+                        WHERE personId = ?
+                        """,
+                    arguments: [id]
+                )
+                try db.execute(sql: "DELETE FROM people WHERE id = ?", arguments: [id])
+            }
+            await SpeakerEmbeddingStore.shared.reset()
+            return true
+        } catch {
+            logError("PeopleStore: deletePerson failed", error: error)
+            await RewindDatabase.shared.reportQueryError(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func mergePerson(sourcePersonId: String, into targetPersonId: String) async -> Bool {
+        guard sourcePersonId != targetPersonId else { return true }
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return false }
+        do {
+            // Atomic merge: transcripts + embeddings + person deletion in one write.
+            try await dbQueue.write { db in
+                try db.execute(
+                    sql: "UPDATE transcription_segments SET personId = ? WHERE personId = ?",
+                    arguments: [targetPersonId, sourcePersonId]
+                )
+                try db.execute(
+                    sql: """
+                        UPDATE speaker_embeddings
+                        SET personId = ?,
+                            isTrainingSample = CASE
+                                WHEN embeddingModel = ? AND embeddingVersion = ? THEN isTrainingSample
+                                ELSE 0
+                            END
+                        WHERE personId = ?
+                        """,
+                    arguments: [
+                        targetPersonId,
+                        SpeakerEmbeddingStore.defaultEmbeddingModel,
+                        SpeakerEmbeddingStore.defaultEmbeddingVersion,
+                        sourcePersonId
+                    ]
+                )
+                try db.execute(sql: "DELETE FROM people WHERE id = ?", arguments: [sourcePersonId])
+            }
+            await SpeakerEmbeddingStore.shared.reset()
+            return true
+        } catch {
+            logError("PeopleStore: mergePerson failed", error: error)
             await RewindDatabase.shared.reportQueryError(error)
             return false
         }

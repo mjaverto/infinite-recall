@@ -1,8 +1,8 @@
 // Infinite Recall fork: on-device speaker diarization. No cloud calls.
 //
-// Persists per-segment speaker embeddings to GRDB and answers nearest-neighbor
-// queries used by `SpeakerDiarizationService` to map a fresh embedding to an
-// existing person (cosine threshold ~0.65).
+// Persists per-segment speaker embeddings to GRDB and answers conservative
+// nearest-neighbor queries used by `SpeakerDiarizationService` to map a fresh
+// embedding to an existing person.
 
 import Foundation
 import GRDB
@@ -18,6 +18,11 @@ struct SpeakerEmbeddingRecord: Codable, FetchableRecord, PersistableRecord, Iden
     var endTime: Double
     var speakerId: Int?        // local cluster id within the session (0, 1, 2…)
     var personId: String?      // FK to people.id once user names this voice
+    var assignmentSource: String?
+    var matchConfidence: Double?
+    var embeddingModel: String?
+    var embeddingVersion: Int?
+    var isTrainingSample: Bool?
     var createdAt: Date
 
     static let databaseTableName = "speaker_embeddings"
@@ -45,21 +50,69 @@ struct SpeakerEmbeddingRecord: Codable, FetchableRecord, PersistableRecord, Iden
     }
 }
 
+enum VoiceProfileAssignmentSource: String {
+    case manual
+    case autoHighConfidence = "auto_high_confidence"
+    case suggestedConfirmed = "suggested_confirmed"
+}
+
+enum VoiceMatchDecision: Equatable {
+    case known(personId: String, similarity: Float, margin: Float, sampleCount: Int)
+    case suggested(personId: String, similarity: Float, margin: Float, sampleCount: Int)
+    case unknown(bestSimilarity: Float?)
+
+    var personIdForTranscript: String? {
+        if case .known(let personId, _, _, _) = self { return personId }
+        return nil
+    }
+
+    var similarity: Float? {
+        switch self {
+        case .known(_, let similarity, _, _), .suggested(_, let similarity, _, _):
+            return similarity
+        case .unknown(let bestSimilarity):
+            return bestSimilarity
+        }
+    }
+}
+
 /// Actor that owns DB I/O for speaker embeddings + the in-memory match index.
 actor SpeakerEmbeddingStore {
     static let shared = SpeakerEmbeddingStore()
 
-    /// Cosine-similarity threshold for matching a new embedding to an existing
-    /// person. v1 default is intentionally a touch loose so the user gets useful
-    /// auto-tagging on day one; tightens once we have a neural embedding.
-    static let defaultMatchThreshold: Float = 0.65
+    static let defaultEmbeddingModel = "mfcc"
+    static let defaultEmbeddingVersion = 1
+    static let knownMatchThreshold: Float = 0.82
+    static let suggestedMatchThreshold: Float = 0.70
+    static let knownMatchMargin: Float = 0.08
+    static let suggestedMatchMargin: Float = 0.04
+    static let minimumKnownSampleCount = 3
+    static let minimumSuggestedSampleCount = 1
+    static let minimumMatchDuration: Double = 0.8
+
+    private struct PersonVoiceProfile {
+        var centroid: [Float]
+        var sampleCount: Int
+        var totalDuration: Double
+    }
 
     /// Cached centroid embedding per person (mean of their stored embeddings).
     /// Recomputed lazily on first match call after a new embedding is recorded.
-    private var personCentroids: [String: [Float]] = [:]
+    private var personProfiles: [String: PersonVoiceProfile] = [:]
     private var centroidsLoaded: Bool = false
 
     private init() {}
+
+    private static func canUseAsTrainingSample(
+        embeddingModel: String,
+        embeddingVersion: Int,
+        startTime: Double,
+        endTime: Double
+    ) -> Bool {
+        embeddingModel == defaultEmbeddingModel
+            && embeddingVersion == defaultEmbeddingVersion
+            && max(0, endTime - startTime) >= minimumMatchDuration
+    }
 
     // MARK: - Insertion
 
@@ -71,13 +124,29 @@ actor SpeakerEmbeddingStore {
         startTime: Double,
         endTime: Double,
         speakerId: Int?,
-        personId: String?
+        personId: String?,
+        assignmentSource: VoiceProfileAssignmentSource? = nil,
+        matchConfidence: Float? = nil,
+        embeddingModel: String = SpeakerEmbeddingStore.defaultEmbeddingModel,
+        embeddingVersion: Int = SpeakerEmbeddingStore.defaultEmbeddingVersion,
+        isTrainingSample: Bool? = nil
     ) async -> Int64? {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             log("SpeakerEmbeddingStore: DB not initialized — dropping embedding")
             return nil
         }
-        var record = SpeakerEmbeddingRecord(
+        let canTrainThisSample = Self.canUseAsTrainingSample(
+            embeddingModel: embeddingModel,
+            embeddingVersion: embeddingVersion,
+            startTime: startTime,
+            endTime: endTime
+        )
+        let inferredTrainingSample = (personId != nil
+                                      && canTrainThisSample
+                                      && assignmentSource != .autoHighConfidence)
+        let requestedTrainingSample = isTrainingSample ?? inferredTrainingSample
+        let storedMatchConfidence = personId == nil ? nil : matchConfidence
+        let record = SpeakerEmbeddingRecord(
             id: nil,
             sessionId: sessionId,
             chunkId: chunkId,
@@ -87,17 +156,25 @@ actor SpeakerEmbeddingStore {
             endTime: endTime,
             speakerId: speakerId,
             personId: personId,
+            assignmentSource: assignmentSource?.rawValue,
+            matchConfidence: storedMatchConfidence.map(Double.init),
+            embeddingModel: embeddingModel,
+            embeddingVersion: embeddingVersion,
+            // Never treat short/noisy or non-default-model embeddings as MFCC training samples.
+            isTrainingSample: requestedTrainingSample && canTrainThisSample,
             createdAt: Date()
         )
         do {
-            try await dbQueue.write { db in
+            let insertedId = try await dbQueue.write { db -> Int64 in
                 try record.insert(db)
+                return db.lastInsertedRowID
             }
             // If this embedding is associated with a person, invalidate the centroid.
             if let pid = personId {
-                personCentroids.removeValue(forKey: pid)
+                personProfiles.removeValue(forKey: pid)
+                centroidsLoaded = false
             }
-            return record.id
+            return insertedId
         } catch {
             logError("SpeakerEmbeddingStore: insert failed", error: error)
             await RewindDatabase.shared.reportQueryError(error)
@@ -118,50 +195,240 @@ actor SpeakerEmbeddingStore {
                 try db.execute(
                     sql: """
                         UPDATE speaker_embeddings
-                        SET personId = ?
+                        SET personId = ?,
+                            assignmentSource = ?,
+                            matchConfidence = NULL,
+                            isTrainingSample = CASE
+                                WHEN ? IS NULL THEN 0
+                                WHEN embeddingModel = ?
+                                  AND embeddingVersion = ?
+                                  AND (endTime - startTime) >= ? THEN 1
+                                ELSE 0
+                            END
                         WHERE sessionId = ? AND speakerId = ?
                         """,
-                    arguments: [personId, sessionId, speakerId]
+                    arguments: [
+                        personId,
+                        personId == nil ? nil : VoiceProfileAssignmentSource.manual.rawValue,
+                        personId,
+                        SpeakerEmbeddingStore.defaultEmbeddingModel,
+                        SpeakerEmbeddingStore.defaultEmbeddingVersion,
+                        SpeakerEmbeddingStore.minimumMatchDuration,
+                        sessionId,
+                        speakerId
+                    ]
                 )
             }
             // Invalidate cached centroid so next match call rebuilds it.
-            if let pid = personId {
-                personCentroids.removeValue(forKey: pid)
-            } else {
-                personCentroids.removeAll()
-            }
+            if let pid = personId { personProfiles.removeValue(forKey: pid) }
+            centroidsLoaded = false
         } catch {
             logError("SpeakerEmbeddingStore: backfill failed", error: error)
             await RewindDatabase.shared.reportQueryError(error)
         }
     }
 
+    /// Assign a person only for embeddings overlapping the provided time ranges.
+    /// Used to avoid contaminating an entire session-local speaker cluster when
+    /// the user tags only a subset of segments.
+    func assignPersonToEmbeddings(
+        sessionId: Int64,
+        speakerId: Int,
+        personId: String?,
+        overlapping ranges: [(start: Double, end: Double)]
+    ) async {
+        guard !ranges.isEmpty else { return }
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+        do {
+            try await dbQueue.write { db in
+                for r in ranges {
+                    // Overlap test: [startTime, endTime] intersects [r.start, r.end].
+                    try db.execute(
+                        sql: """
+                            UPDATE speaker_embeddings
+                            SET personId = ?,
+                                assignmentSource = ?,
+                                matchConfidence = NULL,
+                                isTrainingSample = 0
+                            WHERE sessionId = ?
+                              AND speakerId = ?
+                              AND NOT (endTime <= ? OR startTime >= ?)
+                            """,
+                        arguments: [
+                            personId,
+                            personId == nil ? nil : VoiceProfileAssignmentSource.manual.rawValue,
+                            sessionId,
+                            speakerId,
+                            r.start,
+                            r.end
+                        ]
+                    )
+                }
+                if personId != nil {
+                    for r in ranges {
+                        try db.execute(
+                            sql: """
+                                UPDATE speaker_embeddings
+                                SET isTrainingSample = 1
+                                WHERE sessionId = ?
+                                  AND speakerId = ?
+                                  AND personId = ?
+                                  AND embeddingModel = ?
+                                  AND embeddingVersion = ?
+                                  AND NOT (endTime <= ? OR startTime >= ?)
+                                  AND (MIN(endTime, ?) - MAX(startTime, ?)) >= ?
+                                """,
+                            arguments: [
+                                sessionId,
+                                speakerId,
+                                personId,
+                                SpeakerEmbeddingStore.defaultEmbeddingModel,
+                                SpeakerEmbeddingStore.defaultEmbeddingVersion,
+                                r.start,
+                                r.end,
+                                r.end,
+                                r.start,
+                                SpeakerEmbeddingStore.minimumMatchDuration
+                            ]
+                        )
+                    }
+                }
+            }
+            if let pid = personId { personProfiles.removeValue(forKey: pid) }
+            centroidsLoaded = false
+        } catch {
+            logError("SpeakerEmbeddingStore: ranged backfill failed", error: error)
+            await RewindDatabase.shared.reportQueryError(error)
+        }
+    }
+
     // MARK: - Matching
 
-    /// Find the most similar known person to the given embedding, returning
-    /// `(personId, similarity)` if any match crosses `threshold`.
-    func matchPerson(
+    /// Classify a fresh speaker embedding as a known person, a suggested person,
+    /// or unknown. Silent labels require stronger confidence than suggestions.
+    func classifyPerson(
         embedding: [Float],
-        threshold: Float = SpeakerEmbeddingStore.defaultMatchThreshold
-    ) async -> (personId: String, similarity: Float)? {
-        await ensureCentroidsLoaded()
-        var bestId: String?
-        var bestSim: Float = -.infinity
-        for (pid, centroid) in personCentroids {
-            guard centroid.count == embedding.count else { continue }
-            let sim = cosineSimilarity(embedding, centroid)
-            if sim > bestSim {
-                bestSim = sim
-                bestId = pid
-            }
+        duration: Double? = nil,
+        embeddingModel: String = SpeakerEmbeddingStore.defaultEmbeddingModel,
+        embeddingVersion: Int = SpeakerEmbeddingStore.defaultEmbeddingVersion
+    ) async -> VoiceMatchDecision {
+        guard embeddingModel == Self.defaultEmbeddingModel,
+              embeddingVersion == Self.defaultEmbeddingVersion else {
+            return .unknown(bestSimilarity: nil)
         }
-        guard let pid = bestId, bestSim >= threshold else { return nil }
-        return (pid, bestSim)
+        guard duration.map({ $0 >= Self.minimumMatchDuration }) ?? true else {
+            return .unknown(bestSimilarity: nil)
+        }
+        await ensureCentroidsLoaded()
+        var ranked: [(personId: String, similarity: Float, profile: PersonVoiceProfile)] = []
+        for (pid, profile) in personProfiles {
+            guard profile.centroid.count == embedding.count else { continue }
+            let sim = cosineSimilarity(embedding, profile.centroid)
+            ranked.append((pid, sim, profile))
+        }
+        ranked.sort { $0.similarity > $1.similarity }
+        guard let best = ranked.first else { return .unknown(bestSimilarity: nil) }
+        let runnerUp = ranked.dropFirst().first?.similarity ?? -.infinity
+        let margin = best.similarity - runnerUp
+
+        if best.profile.sampleCount >= Self.minimumKnownSampleCount,
+           best.similarity >= Self.knownMatchThreshold,
+           margin >= Self.knownMatchMargin {
+            return .known(
+                personId: best.personId,
+                similarity: best.similarity,
+                margin: margin,
+                sampleCount: best.profile.sampleCount
+            )
+        }
+
+        if best.profile.sampleCount >= Self.minimumSuggestedSampleCount,
+           best.similarity >= Self.suggestedMatchThreshold,
+           margin >= Self.suggestedMatchMargin {
+            return .suggested(
+                personId: best.personId,
+                similarity: best.similarity,
+                margin: margin,
+                sampleCount: best.profile.sampleCount
+            )
+        }
+
+        return .unknown(bestSimilarity: best.similarity)
+    }
+
+    /// Backward-compatible helper for callers that only need silent known labels.
+    func matchPerson(embedding: [Float], duration: Double? = nil) async -> (personId: String, similarity: Float)? {
+        switch await classifyPerson(embedding: embedding, duration: duration) {
+        case .known(let personId, let similarity, _, _):
+            return (personId, similarity)
+        case .suggested, .unknown:
+            return nil
+        }
+    }
+
+    func resetVoiceProfile(personId: String) async {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+        do {
+            try await dbQueue.write { db in
+                try db.execute(
+                    sql: """
+                        UPDATE speaker_embeddings
+                        SET personId = NULL,
+                            assignmentSource = NULL,
+                            matchConfidence = NULL,
+                            isTrainingSample = 0
+                        WHERE personId = ?
+                        """,
+                    arguments: [personId]
+                )
+            }
+            personProfiles.removeValue(forKey: personId)
+            centroidsLoaded = false
+        } catch {
+            logError("SpeakerEmbeddingStore: reset voice profile failed", error: error)
+            await RewindDatabase.shared.reportQueryError(error)
+        }
+    }
+
+    func mergeVoiceProfile(from sourcePersonId: String, into targetPersonId: String) async {
+        guard sourcePersonId != targetPersonId else { return }
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
+        do {
+            try await dbQueue.write { db in
+                try db.execute(
+                    sql: """
+                        UPDATE speaker_embeddings
+                        SET personId = ?,
+                            assignmentSource = ?,
+                            isTrainingSample = CASE
+                                WHEN embeddingModel = ?
+                                  AND embeddingVersion = ?
+                                  AND (endTime - startTime) >= ? THEN 1
+                                ELSE 0
+                            END
+                        WHERE personId = ?
+                        """,
+                    arguments: [
+                        targetPersonId,
+                        VoiceProfileAssignmentSource.manual.rawValue,
+                        SpeakerEmbeddingStore.defaultEmbeddingModel,
+                        SpeakerEmbeddingStore.defaultEmbeddingVersion,
+                        SpeakerEmbeddingStore.minimumMatchDuration,
+                        sourcePersonId
+                    ]
+                )
+            }
+            personProfiles.removeAll()
+            centroidsLoaded = false
+        } catch {
+            logError("SpeakerEmbeddingStore: merge voice profile failed", error: error)
+            await RewindDatabase.shared.reportQueryError(error)
+        }
     }
 
     /// Drop all in-memory caches — call on user/session switch.
     func reset() {
-        personCentroids.removeAll()
+        personProfiles.removeAll()
         centroidsLoaded = false
     }
 
@@ -172,29 +439,41 @@ actor SpeakerEmbeddingStore {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else { return }
         do {
             let rows: [SpeakerEmbeddingRecord] = try await dbQueue.read { db in
-                try SpeakerEmbeddingRecord
-                    .filter(Column("personId") != nil)
-                    .fetchAll(db)
+                try SpeakerEmbeddingRecord.fetchAll(
+                    db,
+                    sql: """
+                        SELECT * FROM speaker_embeddings
+                        WHERE personId IS NOT NULL AND isTrainingSample = 1
+                        """
+                )
             }
             // Group by personId and average.
-            var grouped: [String: [[Float]]] = [:]
+            var grouped: [String: [(vector: [Float], duration: Double)]] = [:]
             for row in rows {
                 guard let pid = row.personId else { continue }
+                let model = row.embeddingModel ?? Self.defaultEmbeddingModel
+                let version = row.embeddingVersion ?? Self.defaultEmbeddingVersion
+                guard model == Self.defaultEmbeddingModel, version == Self.defaultEmbeddingVersion else { continue }
                 let v = row.vector
                 guard !v.isEmpty else { continue }
-                grouped[pid, default: []].append(v)
+                grouped[pid, default: []].append((v, max(0, row.endTime - row.startTime)))
             }
-            var centroids: [String: [Float]] = [:]
+            var profiles: [String: PersonVoiceProfile] = [:]
             for (pid, vectors) in grouped {
                 guard let first = vectors.first else { continue }
-                var mean = [Float](repeating: 0, count: first.count)
-                for v in vectors {
-                    guard v.count == first.count else { continue }
-                    for i in 0..<first.count {
-                        mean[i] += v[i]
+                var mean = [Float](repeating: 0, count: first.vector.count)
+                var sampleCount = 0
+                var totalDuration = 0.0
+                for item in vectors {
+                    guard item.vector.count == first.vector.count else { continue }
+                    for i in 0..<first.vector.count {
+                        mean[i] += item.vector[i]
                     }
+                    sampleCount += 1
+                    totalDuration += item.duration
                 }
-                let n = Float(vectors.count)
+                guard sampleCount > 0 else { continue }
+                let n = Float(sampleCount)
                 for i in 0..<mean.count {
                     mean[i] /= n
                 }
@@ -206,12 +485,16 @@ actor SpeakerEmbeddingStore {
                     for i in 0..<mean.count {
                         mean[i] /= norm
                     }
-                    centroids[pid] = mean
+                    profiles[pid] = PersonVoiceProfile(
+                        centroid: mean,
+                        sampleCount: sampleCount,
+                        totalDuration: totalDuration
+                    )
                 }
             }
-            personCentroids = centroids
+            personProfiles = profiles
             centroidsLoaded = true
-            log("SpeakerEmbeddingStore: Loaded centroids for \(centroids.count) people")
+            log("SpeakerEmbeddingStore: Loaded voice profiles for \(profiles.count) people")
         } catch {
             logError("SpeakerEmbeddingStore: centroid load failed", error: error)
             await RewindDatabase.shared.reportQueryError(error)

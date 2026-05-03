@@ -1,4 +1,5 @@
 import XCTest
+import GRDB
 
 @testable import Omi_Computer
 
@@ -234,6 +235,10 @@ final class TranscriptSpeakerAssignmentTests: XCTestCase {
       speaker: "SPEAKER_00",
       isUser: false,
       personId: nil,
+      suggestedPersonId: "person_suggested",
+      suggestedSimilarity: 0.91,
+      suggestedMargin: 0.07,
+      suggestedSampleCount: 4,
       start: 0,
       end: 1,
       translations: [
@@ -250,6 +255,10 @@ final class TranscriptSpeakerAssignmentTests: XCTestCase {
       speaker: original.speaker,
       isUser: true,
       personId: nil,
+      suggestedPersonId: original.suggestedPersonId,
+      suggestedSimilarity: original.suggestedSimilarity,
+      suggestedMargin: original.suggestedMargin,
+      suggestedSampleCount: original.suggestedSampleCount,
       start: original.start,
       end: original.end,
       translations: original.translations
@@ -260,6 +269,147 @@ final class TranscriptSpeakerAssignmentTests: XCTestCase {
     XCTAssertEqual(reassigned.translations[0].text, "Hello")
     XCTAssertEqual(reassigned.backendId, "backend_seg1", "backendId must survive reassignment")
     XCTAssertTrue(reassigned.isUser)
+
+    XCTAssertEqual(reassigned.suggestedPersonId, "person_suggested")
+    XCTAssertEqual(reassigned.suggestedSimilarity, 0.91)
+    XCTAssertEqual(reassigned.suggestedMargin, 0.07)
+    XCTAssertEqual(reassigned.suggestedSampleCount, 4)
+  }
+
+  func testUpsertSegmentClearsSuggestedMetadataWhenNilPassed() async throws {
+    let testUserId = "test-upsert-suggested-clear-\(UUID().uuidString)"
+    await RewindDatabase.shared.configure(userId: testUserId)
+    try await RewindDatabase.shared.initialize()
+    defer {
+      Task { await RewindDatabase.shared.close() }
+    }
+
+    guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+      throw XCTSkip("database queue unavailable")
+    }
+
+    let now = Date()
+    let sessionId: Int64 = try await dbQueue.write { db in
+      try db.execute(
+        sql: """
+          INSERT INTO transcription_sessions(startedAt, source, language, timezone, status, retryCount, backendSynced, createdAt, updatedAt, summary_state)
+          VALUES(?, 'desktop', 'en', 'UTC', 'completed', 0, 0, ?, ?, 'pending')
+          """,
+        arguments: [now, now, now]
+      )
+      return db.lastInsertedRowID
+    }
+
+    _ = try await TranscriptionStorage.shared.upsertSegment(
+      sessionId: sessionId,
+      backendSegmentId: "seg0",
+      speaker: 0,
+      text: "hello",
+      startTime: 0,
+      endTime: 1,
+      suggestedPersonId: "p1",
+      suggestedSimilarity: 0.5,
+      suggestedMargin: 0.1,
+      suggestedSampleCount: 2
+    )
+
+    _ = try await TranscriptionStorage.shared.upsertSegment(
+      sessionId: sessionId,
+      backendSegmentId: "seg0",
+      speaker: 0,
+      text: "hello2",
+      startTime: 0,
+      endTime: 1,
+      suggestedPersonId: nil,
+      suggestedSimilarity: nil,
+      suggestedMargin: nil,
+      suggestedSampleCount: nil
+    )
+
+    let row: (String?, Double?, Double?, Int?) = try await dbQueue.read { db in
+      let r = try Row.fetchOne(
+        db,
+        sql: """
+          SELECT suggestedPersonId, suggestedSimilarity, suggestedMargin, suggestedSampleCount
+          FROM transcription_segments
+          WHERE sessionId = ? AND segmentId = ?
+          """,
+        arguments: [sessionId, "seg0"]
+      )
+      return (
+        r?["suggestedPersonId"],
+        r?["suggestedSimilarity"],
+        r?["suggestedMargin"],
+        r?["suggestedSampleCount"]
+      )
+    }
+
+    XCTAssertNil(row.0)
+    XCTAssertNil(row.1)
+    XCTAssertNil(row.2)
+    XCTAssertNil(row.3)
+  }
+
+  func testAssignmentMetadataUsesBackendIdsAndFallbackOrders() {
+    let segments = [
+      TranscriptSegment(
+        id: "seg1",
+        backendId: "backend_seg1",
+        text: "Hello",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 0,
+        end: 1
+      ),
+      TranscriptSegment(
+        id: "local-only",
+        backendId: nil,
+        text: "No backend id yet",
+        speaker: "SPEAKER_01",
+        isUser: false,
+        personId: nil,
+        start: 1,
+        end: 2
+      )
+    ]
+
+    let metadata = ConversationDetailView.assignmentMetadata(for: [0, 1], in: segments)
+
+    XCTAssertEqual(metadata.targets, ["backend_seg1", "#index:1"])
+    XCTAssertEqual(metadata.backendIds, ["backend_seg1"])
+    XCTAssertEqual(metadata.fallbackOrders, [1])
+  }
+
+  func testPeopleStoreSplitsAssignmentTargetsForEmbeddingBackfill() {
+    let split = PeopleStore.splitAssignmentTargets([
+      "backend_seg1",
+      "#index:2",
+      "backend_seg3",
+      "#index:not-a-number"
+    ])
+
+    XCTAssertEqual(split.backendIds, ["backend_seg1", "backend_seg3"])
+    XCTAssertEqual(split.fallbackOrders, [2])
+  }
+
+  func testVoiceMatchDecisionOnlyKnownLabelsTranscript() {
+    let known = VoiceMatchDecision.known(
+      personId: "person-sarah",
+      similarity: 0.91,
+      margin: 0.12,
+      sampleCount: 4
+    )
+    let suggested = VoiceMatchDecision.suggested(
+      personId: "person-sarah",
+      similarity: 0.74,
+      margin: 0.05,
+      sampleCount: 1
+    )
+
+    XCTAssertEqual(known.personIdForTranscript, "person-sarah")
+    XCTAssertNil(suggested.personIdForTranscript)
+    XCTAssertEqual(suggested.similarity, 0.74)
   }
 
   func testBackendSegmentDecodesTranslations() throws {
@@ -504,5 +654,29 @@ final class TranscriptSpeakerAssignmentTests: XCTestCase {
       ["seg_backend_123", "seg_backend_456"]
     )
     XCTAssertEqual(assignment.fallbackOrders, [0])
+  }
+
+  func testTranscriptSegmentDecodesSuggestedCandidateMetadata() throws {
+    let json = """
+      {
+        "id": "seg_suggested_1",
+        "text": "Hello",
+        "speaker": "SPEAKER_01",
+        "is_user": false,
+        "start": 1.0,
+        "end": 2.0,
+        "suggested_person_id": "person_candidate",
+        "suggested_similarity": 0.74,
+        "suggested_margin": 0.05,
+        "suggested_sample_count": 2
+      }
+      """.data(using: .utf8)!
+
+    let segment = try JSONDecoder().decode(TranscriptSegment.self, from: json)
+
+    XCTAssertNil(segment.personId, "Suggested metadata must not imply a named transcript")
+    XCTAssertEqual(segment.suggestedPersonId, "person_candidate")
+    XCTAssertEqual(segment.suggestedSampleCount, 2)
+    XCTAssertEqual(segment.suggestedSimilarity, 0.74)
   }
 }
