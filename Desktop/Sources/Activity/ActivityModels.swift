@@ -18,6 +18,13 @@ public enum WorkKind: String, Codable, CaseIterable, Hashable {
     case summarize
     case extractMemory = "extract_memory"
     case extractActionItems = "extract_action_items"
+    /// Issue #105: brain-map / knowledge-graph extraction. Mirrored on the
+    /// wire so the Activity snapshot's per-kind table accounts for the same
+    /// `pending_work` rows that `BatteryAwareScheduler.pendingWorkCount`
+    /// (which feeds the menu-bar badge) already counts. Pre-#105 this
+    /// kind was scheduler-internal only, producing the count mismatch
+    /// reported in the bug.
+    case extractKG = "extract_kg"
 }
 
 public enum CaptureKind: String, Codable, CaseIterable, Hashable {

@@ -32,12 +32,18 @@ use crate::state::{AppState, PauseChange};
 /// All `WorkKind`s, in display order. Used to assemble the `kinds` array
 /// in the snapshot — every kind gets a row even if there's no in-flight
 /// item or pause, so the UI can render a stable table.
-const ALL_KINDS: [WorkKind; 5] = [
+const ALL_KINDS: [WorkKind; 6] = [
     WorkKind::Transcribe,
     WorkKind::Ocr,
     WorkKind::Summarize,
     WorkKind::ExtractMemory,
     WorkKind::ExtractActionItems,
+    // Issue #105: keep the Activity snapshot's queue accounting in sync
+    // with `PendingWorkStorage.pendingCount()` (which the menu-bar badge
+    // reads). Pre-#105, `extractKG` rows were counted by the badge but
+    // absent here, producing the "8 items waiting (battery)" / "0 queued"
+    // disagreement reported in the bug.
+    WorkKind::ExtractKg,
 ];
 
 const ALL_CAPTURES: [CaptureKind; 2] = [CaptureKind::Audio, CaptureKind::Screen];
@@ -139,6 +145,9 @@ fn workkind_swift_raw_value(k: WorkKind) -> &'static str {
         WorkKind::Summarize => "summarize",
         WorkKind::ExtractMemory => "extractMemory",
         WorkKind::ExtractActionItems => "extractActionItems",
+        // Swift's `PendingWork.Kind.extractKG` rawValue is camelCase
+        // ("extractKG"), matching the other camelCase entries above.
+        WorkKind::ExtractKg => "extractKG",
     }
 }
 

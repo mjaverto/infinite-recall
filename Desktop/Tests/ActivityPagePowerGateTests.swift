@@ -183,4 +183,127 @@ final class ActivityPagePowerGateTests: XCTestCase {
             isRunOnceActive: false
         ), "Run now must hide for .thermal via disablesRunNowOverride alone, independent of the isThermalBlocked flag.")
     }
+
+    /// Issue #105: A snapshot gate of `.blocked(.onBattery, …)` can be stale
+    /// (e.g. cached from before the user plugged in). When `resources` reports
+    /// the device is on AC and not in low-power, the corrected gate must
+    /// downgrade to `.allowed` so the Activity banner doesn't read
+    /// "Waiting for AC power" while the user is already on AC.
+    func test_correctedGateDowngradesStaleOnBatteryWhenResourcesSayOnAC() {
+        let res = resources(onBattery: false, lowPower: false)
+        let staleSnapshotGate = GateState.blocked(
+            reason: .onBattery,
+            since: now,
+            waitingFor: .acPower
+        )
+
+        let corrected = activityCorrectedGate(
+            snapshotGate: staleSnapshotGate,
+            resources: res,
+            queued: 5,
+            thermalState: .nominal,
+            isRunOnceActive: false,
+            runOnceStartedAt: nil,
+            now: now
+        )
+
+        XCTAssertTrue(
+            corrected.isAllowed,
+            "Stale snapshot .onBattery must be downgraded to .allowed when resources report on-AC and not low-power."
+        )
+        // The downgrade preserves the original `since` so the UI's
+        // "blocked-for" timer doesn't reset across the transition.
+        XCTAssertEqual(
+            corrected.since,
+            staleSnapshotGate.since,
+            "Downgrade must preserve the snapshot's `since` so the elapsed-state timer is continuous."
+        )
+    }
+
+    /// Issue #105 negative case: snapshot gate is `.onBattery` AND
+    /// resources confirm Low Power Mode is on. The downgrade predicate
+    /// must NOT fire — the user still needs to know LPM is the blocker.
+    func test_correctedGateDoesNotDowngradeWhenLowPowerMode() {
+        let res = resources(onBattery: false, lowPower: true)
+        let snapshotGate = GateState.blocked(
+            reason: .onBattery,
+            since: now,
+            waitingFor: .acPower
+        )
+
+        let corrected = activityCorrectedGate(
+            snapshotGate: snapshotGate,
+            resources: res,
+            queued: 4,
+            thermalState: .nominal,
+            isRunOnceActive: false,
+            runOnceStartedAt: nil,
+            now: now
+        )
+
+        XCTAssertEqual(
+            corrected.blockReason,
+            .onBattery,
+            "Low Power Mode must keep the .onBattery block; the downgrade only fires for AC + non-LPM."
+        )
+    }
+
+    /// Issue #105 negative case: snapshot gate is `.onBattery` and resources
+    /// agree we're genuinely on battery. The downgrade must NOT fire — the
+    /// snapshot is correct, not stale.
+    func test_correctedGateDoesNotDowngradeWhenGenuinelyOnBattery() {
+        let res = resources(onBattery: true, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .onBattery,
+            since: now,
+            waitingFor: .acPower
+        )
+
+        let corrected = activityCorrectedGate(
+            snapshotGate: snapshotGate,
+            resources: res,
+            queued: 4,
+            thermalState: .nominal,
+            isRunOnceActive: false,
+            runOnceStartedAt: nil,
+            now: now
+        )
+
+        XCTAssertEqual(
+            corrected.blockReason,
+            .onBattery,
+            "Genuine on-battery state must keep the .onBattery block; the downgrade only fires when resources contradict the snapshot."
+        )
+    }
+
+    /// Issue #105 guard: the downgrade `if case` matches `.onBattery`
+    /// exclusively. Other block reasons (e.g. `.thermal`) must pass through
+    /// unchanged even when resources report on-AC and not low-power.
+    /// Guards against accidentally widening the predicate later.
+    func test_correctedGateLeavesNonOnBatteryBlocksAlone() {
+        let res = resources(onBattery: false, lowPower: false)
+        let snapshotGate = GateState.blocked(
+            reason: .thermal,
+            since: now,
+            waitingFor: .thermalCooldown
+        )
+
+        let corrected = activityCorrectedGate(
+            snapshotGate: snapshotGate,
+            resources: res,
+            queued: 4,
+            // Thermal-state arg is `.nominal` so the early-return thermal
+            // override doesn't fire — we want to exercise the late branches.
+            thermalState: .nominal,
+            isRunOnceActive: false,
+            runOnceStartedAt: nil,
+            now: now
+        )
+
+        XCTAssertEqual(
+            corrected.blockReason,
+            .thermal,
+            "Non-onBattery snapshot blocks must pass through unchanged regardless of resources."
+        )
+    }
 }

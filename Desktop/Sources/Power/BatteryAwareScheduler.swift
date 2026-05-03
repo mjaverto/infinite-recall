@@ -612,7 +612,9 @@ public final class BatteryAwareScheduler: ObservableObject {
     case .summarize: return .summarize
     case .extractMemory: return .extractMemory
     case .extractActionItems: return .extractActionItems
-    case .extractKG: return nil  // not represented in the daemon's WorkKind wire enum
+    // Issue #105: extractKG is now a first-class wire kind so the Activity
+    // snapshot's per-kind table sees the same rows the menu-bar badge does.
+    case .extractKG: return .extractKG
     }
   }
 
