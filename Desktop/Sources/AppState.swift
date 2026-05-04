@@ -92,6 +92,17 @@ class AppState: ObservableObject {
   @Published var showStarredOnly: Bool = false
   @Published var selectedDateFilter: Date? = nil
   @Published var selectedFolderId: String? = nil
+  /// When true, the Conversations list shows ONLY discarded conversations
+  /// (the "Discarded" filter chip). Reload is triggered explicitly by the
+  /// chip toggle (`toggleDiscardedFilter`) rather than via a Combine
+  /// subscriber — the existing star/date/folder filters use the same
+  /// "set value, then reload" call-site pattern, and a separate observer
+  /// would race against those reloads.
+  @Published var showDiscardedOnly: Bool = false
+  /// Passive count of discarded conversations available, surfaced as a
+  /// "(N hidden)" hint near the Conversations header. Refreshed on each
+  /// `loadConversations()` so it stays in sync without its own timer.
+  @Published var discardedConversationsCount: Int = 0
 
   // Folders
   @Published var folders: [Folder] = []
@@ -2065,7 +2076,8 @@ class AppState: ObservableObject {
           try await TranscriptionStorage.shared.getLocalConversations(
             limit: 50,
             starredOnly: self.showStarredOnly,
-            folderId: self.selectedFolderId
+            folderId: self.selectedFolderId,
+            discardedOnly: self.showDiscardedOnly
           )
         }
         group.addTask {
@@ -2106,10 +2118,25 @@ class AppState: ObservableObject {
           }
         }
 
-        // Get local count
+        // Get local count (matches the active filter so the header total
+        // reflects what the user is currently looking at).
         let localCount = try await TranscriptionStorage.shared.getLocalConversationsCount(
-          starredOnly: showStarredOnly)
+          starredOnly: showStarredOnly,
+          discardedOnly: showDiscardedOnly)
         totalConversationsCount = localCount
+
+        // Passive "(N hidden)" hint: count discarded rows separately so the
+        // Conversations header can offer a way to reach them via the chip.
+        // When the chip is ON the primary count above already counts the
+        // discarded rows, so skip the redundant query.
+        if !showDiscardedOnly {
+          do {
+            discardedConversationsCount = try await TranscriptionStorage.shared
+              .getLocalConversationsCount(discardedOnly: true)
+          } catch {
+            logError("Conversations: Failed to load discarded count", error: error)
+          }
+        }
 
         // Stop loading state so UI shows cached data immediately
         isLoadingConversations = false
@@ -2288,6 +2315,18 @@ class AppState: ObservableObject {
     await loadConversations()
   }
 
+  /// Toggle the "Discarded only" filter and reload conversations.
+  ///
+  /// Mutually exclusive with `showStarredOnly` at the SQL layer (both are
+  /// single-flag predicates), but we don't enforce that here — the chip UI
+  /// is the source of truth for which is on. If both flags are set, the
+  /// SQL `discarded = true AND starred = true` produces a valid (likely
+  /// empty) result.
+  func toggleDiscardedFilter() async {
+    showDiscardedOnly.toggle()
+    await loadConversations()
+  }
+
   /// Set date filter and reload conversations
   func setDateFilter(_ date: Date?) async {
     selectedDateFilter = date
@@ -2299,6 +2338,7 @@ class AppState: ObservableObject {
     showStarredOnly = false
     selectedDateFilter = nil
     selectedFolderId = nil
+    showDiscardedOnly = false
     await loadConversations()
   }
 

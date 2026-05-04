@@ -68,7 +68,17 @@ enum LocalDaemonToken {
   /// Read the daemon token from disk (cached in memory after first read).
   /// Throws a typed `TokenError` so callers can render a useful message
   /// rather than silently 401-looping.
+  ///
+  /// Synchronous, non-waiting variant: throws immediately if the file is
+  /// missing. Prefer `read(waitFor:)` on the initial fetch path so that a
+  /// fresh app launch — where the Rust daemon may still be writing the
+  /// token file — doesn't surface a "daemon token unavailable" error
+  /// banner that resolves itself a few hundred ms later.
   static func read() throws -> String {
+    return try readOnce()
+  }
+
+  private static func readOnce() throws -> String {
     let url = tokenFileURL
     let path = url.path
 
@@ -96,6 +106,36 @@ enum LocalDaemonToken {
     cachedToken = trimmed
     cachedFromPath = path
     return trimmed
+  }
+
+  /// Read the daemon token, polling for the file every 500 ms up to
+  /// `waitFor` seconds before throwing `TokenError.fileMissing`. All other
+  /// errors (`unreadable`, `empty`) are terminal — they throw immediately
+  /// since polling won't fix a permission or corruption problem.
+  ///
+  /// Use this on the *initial* token fetch (e.g. the first activity
+  /// snapshot after app launch) so we don't race a daemon that's still
+  /// writing the token file. Subsequent calls hit the in-memory cache and
+  /// are effectively free.
+  static func read(waitFor timeout: TimeInterval) async throws -> String {
+    let pollInterval: TimeInterval = 0.5
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+      try Task.checkCancellation()
+      do {
+        return try readOnce()
+      } catch TokenError.fileMissing(let url) {
+        if Date() >= deadline {
+          throw TokenError.fileMissing(url)
+        }
+        do {
+          try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+        } catch {
+          // Propagate cancellation; don't keep polling on a discarded request.
+          throw CancellationError()
+        }
+      }
+    }
   }
 
   /// Test/diagnostic hook: clear the in-memory cache.

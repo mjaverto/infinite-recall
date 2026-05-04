@@ -5013,7 +5013,7 @@ extension APIClient {
   /// Throws `LocalDaemonToken.TokenError` if the daemon hasn't written
   /// its token yet. The Activity service catches this and surfaces it via
   /// `ActivityMonitorService.lastError` instead of silently 401-looping.
-  fileprivate func activityHeaders() throws -> [String: String] {
+  fileprivate func activityHeaders() async throws -> [String: String] {
     var headers: [String: String] = [
       "Content-Type": "application/json",
       "X-App-Platform": "macos",
@@ -5021,7 +5021,11 @@ extension APIClient {
     if let testHeader = testAuthHeader {
       headers["Authorization"] = testHeader
     } else {
-      let token = try LocalDaemonToken.read()
+      // Poll for up to 10 s on the initial fetch so a freshly-launched
+      // daemon that's still writing api-token.txt doesn't surface a
+      // spurious "daemon token unavailable" banner. Subsequent calls hit
+      // the in-memory cache in `LocalDaemonToken` and are free.
+      let token = try await LocalDaemonToken.read(waitFor: 10)
       headers["Authorization"] = "Bearer \(token)"
     }
     return headers
@@ -5074,7 +5078,7 @@ extension APIClient {
     }
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
-    request.allHTTPHeaderFields = try activityHeaders()
+    request.allHTTPHeaderFields = try await activityHeaders()
     request.timeoutInterval = 5
 
     let (data, response) = try await session.data(for: request)
@@ -5103,7 +5107,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = try activityHeaders()
+    request.allHTTPHeaderFields = try await activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(body)
     request.timeoutInterval = 5
 
@@ -5136,7 +5140,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = try activityHeaders()
+    request.allHTTPHeaderFields = try await activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(body)
     request.timeoutInterval = 5
 
@@ -5162,7 +5166,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = try activityHeaders()
+    request.allHTTPHeaderFields = try await activityHeaders()
     request.timeoutInterval = 10  // 5s server-side grace + SIGKILL + margin
 
     let (data, response) = try await session.data(for: request)
@@ -5208,7 +5212,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = try activityHeaders()
+    request.allHTTPHeaderFields = try await activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(body)
     request.timeoutInterval = 5
 
@@ -5236,7 +5240,7 @@ extension APIClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.allHTTPHeaderFields = try activityHeaders()
+    request.allHTTPHeaderFields = try await activityHeaders()
     request.httpBody = try Self.makeActivityEncoder().encode(gateState)
     request.timeoutInterval = 5
 

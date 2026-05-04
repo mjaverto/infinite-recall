@@ -89,10 +89,13 @@ struct RewindPage: View {
             // Background
             Color.black.ignoresSafeArea()
 
-            if viewModel.isLoading && viewModel.screenshots.isEmpty && viewModel.activeSearchQuery == nil {
-                loadingView
-            } else if let error = viewModel.errorMessage {
+            if let error = viewModel.errorMessage, viewModel.activeSearchQuery == nil {
+                // Error/retry takes precedence over the loading spinner so a
+                // failed init (or watchdog timeout) can never leave the user
+                // staring at "Loading screenshots…" forever.
                 errorView(error)
+            } else if viewModel.isLoading && viewModel.screenshots.isEmpty && viewModel.activeSearchQuery == nil {
+                loadingView
             } else {
                 // Main content with persistent search field
                 VStack(spacing: 0) {

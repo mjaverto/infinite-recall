@@ -57,10 +57,23 @@ class RewindViewModel: ObservableObject {
     // MARK: - Private State
 
     private var searchTask: Task<Void, Never>?
+    private var loadWatchdogTask: Task<Void, Never>?
+    private var loadStatsTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
-    /// Whether initial data has been loaded (prevents race condition with debounced search)
+    /// Whether initial data has been loaded (prevents race condition with
+    /// debounced search). Also used by the watchdog re-check guard so a
+    /// successful load can never trip the "Loading timed out" banner after
+    /// the fact (see `loadInitialData`).
     private var isInitialized = false
+
+    // TODO: testing seam needed — `loadInitialData` reaches into
+    // `RewindDatabase.shared` and `RewindIndexer.shared` directly. Adding a
+    // `RewindViewModelTests` covering the watchdog/defer interaction (per
+    // the second-pass review) requires injecting a database-and-indexer pair
+    // into `RewindViewModel` (e.g. struct of closures with `.live` /
+    // `.testing` cases, or a protocol-typed dependency). Out of scope for
+    // this batch fix — flagged here as the follow-up.
 
     /// Set by RewindPage when the transcript/notes panel is expanded.
     /// Auto-refresh skips when true so the view tree stays stable and @State is preserved.
@@ -129,6 +142,42 @@ class RewindViewModel: ObservableObject {
         isLoading = true
         errorMessage = nil
 
+        // `defer` runs on every exit path so the spinner can never get stuck
+        // "Loading screenshots…" forever — even if the await chain throws or
+        // is cancelled.
+        defer {
+            isLoading = false
+            loadWatchdogTask?.cancel()
+            loadWatchdogTask = nil
+
+            log("RewindViewModel: Posting rewindPageDidLoad notification")
+            NotificationCenter.default.post(name: .rewindPageDidLoad, object: nil)
+        }
+
+        // Watchdog: surfaces a visible error/retry if work hasn't completed in
+        // 30s. First-launch DB init on a cold APFS cache can legitimately take
+        // longer than the previous 15s. The Task inherits MainActor isolation
+        // from the surrounding @MainActor context, so direct property writes
+        // are safe — no nested `MainActor.run` hop needed.
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            // Re-check `isInitialized`: if `loadInitialData` already finished
+            // (success OR error path), `defer` may not yet have flipped
+            // `isLoading` to false in this MainActor turn. Without this guard
+            // the watchdog spuriously sets "Loading timed out" right after a
+            // legitimate load — including the error path, where
+            // `errorMessage` is set but `isLoading` is still `true`.
+            guard self.isLoading
+                && self.errorMessage == nil
+                && !self.isInitialized
+            else { return }
+            self.errorMessage = "Loading timed out. Tap retry."
+            self.isLoading = false
+            logError("RewindViewModel: loadInitialData watchdog fired after 30s")
+        }
+
         do {
             // Configure database for the current user BEFORE anything touches the DB.
             // Without this, RewindIndexer.initialize() opens the DB for "anonymous",
@@ -156,8 +205,10 @@ class RewindViewModel: ObservableObject {
                 log("RewindViewModel: Database was recovered from corruption, \(recoveredCount) records salvaged")
             }
 
-            // Load today's screenshots (date filter is always active)
-            await loadScreenshotsForDate(selectedDate)
+            // Load today's screenshots (date filter is always active).
+            // Propagates DB errors so the catch below surfaces them to the UI
+            // instead of silently leaving the spinner running.
+            try await loadScreenshotsForDate(selectedDate)
 
             // Load available apps for filtering
             availableApps = try await RewindDatabase.shared.getUniqueAppNames()
@@ -165,22 +216,25 @@ class RewindViewModel: ObservableObject {
             // Mark as initialized after successful load
             isInitialized = true
 
-        } catch {
-            errorMessage = error.localizedDescription
-            logError("RewindViewModel: Failed to load initial data: \(error)")
-        }
+            // Flash-of-timeout fix: if the 30s watchdog fired moments before
+            // we got here, clear the stale banner so the user sees the loaded
+            // data, not a misleading timeout message.
+            errorMessage = nil
 
-        isLoading = false
-
-        // Notify that Rewind page finished loading (for sidebar loading indicator)
-        log("RewindViewModel: Posting rewindPageDidLoad notification")
-        NotificationCenter.default.post(name: .rewindPageDidLoad, object: nil)
-
-        // Load stats asynchronously (includes storage size calculation which can be slow)
-        Task {
-            if let indexerStats = await RewindIndexer.shared.getStats() {
-                stats = indexerStats
+            // Stats fetch only on success — previously this was in the defer
+            // and fired on watchdog timeouts and errors too. Cancel any prior
+            // stats task so a slow earlier fetch can't clobber a fresh one.
+            loadStatsTask?.cancel()
+            loadStatsTask = Task { [weak self] in
+                guard let self, !Task.isCancelled else { return }
+                if let indexerStats = await RewindIndexer.shared.getStats() {
+                    guard !Task.isCancelled else { return }
+                    self.stats = indexerStats
+                }
             }
+        } catch {
+            errorMessage = "Couldn't open Rewind database: \(error.localizedDescription)"
+            logError("RewindViewModel: Failed to load initial data: \(error)")
         }
     }
 
@@ -206,10 +260,12 @@ class RewindViewModel: ObservableObject {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if trimmedQuery.isEmpty {
-            // Reset to date-filtered view (date filter is always active)
+            // Reset to date-filtered view (date filter is always active).
+            // Silent reload: a transient DB error here should log and move on,
+            // not block the search-clear UX.
             isSearching = false
             activeSearchQuery = nil
-            await loadScreenshotsForDate(selectedDate)
+            await reloadScreenshotsSilently(selectedDate)
             return
         }
 
@@ -277,7 +333,8 @@ class RewindViewModel: ObservableObject {
         if !searchQuery.isEmpty {
             await performSearch(query: searchQuery)
         } else {
-            await loadScreenshotsForDate(selectedDate)
+            // Silent: post-init filter change, transient DB error should not stick.
+            await reloadScreenshotsSilently(selectedDate)
         }
     }
 
@@ -287,42 +344,59 @@ class RewindViewModel: ObservableObject {
         if !searchQuery.isEmpty {
             await performSearch(query: searchQuery)
         } else {
-            await loadScreenshotsForDate(date)
+            // Silent: post-init date change, transient DB error should not stick.
+            await reloadScreenshotsSilently(date)
         }
     }
 
-    private func loadScreenshotsForDate(_ date: Date) async {
-        isLoading = true
-
+    /// Loads screenshots for a date and propagates any DB error.
+    /// Callers that need to surface failures to the user (init / retry path)
+    /// should `try` this. Callers that prefer fire-and-forget should use
+    /// `reloadScreenshotsSilently(_:)` instead — silent-swallow is intentional
+    /// there but must NOT leak back into init paths.
+    ///
+    /// Note: this does NOT touch `isLoading`. The caller owns that state — see
+    /// `loadInitialData` (manages isLoading via top-level defer) and
+    /// `reloadScreenshotsSilently` (sets it around the call for filter/search).
+    private func loadScreenshotsForDate(_ date: Date) async throws {
         let calendar = Calendar.current
         let startOfDay = calendar.startOfDay(for: date)
         let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!
 
-        do {
-            var results = try await RewindDatabase.shared.getScreenshotsSampled(
-                from: startOfDay,
-                to: endOfDay,
-                targetCount: 500
-            )
+        var results = try await RewindDatabase.shared.getScreenshotsSampled(
+            from: startOfDay,
+            to: endOfDay,
+            targetCount: 500
+        )
 
-            // Filter out frames from the active (unfinalized) video chunk — they can't be displayed yet
-            let activeChunk = await VideoChunkEncoder.shared.currentChunkPath
-            if let activeChunk = activeChunk {
-                results = results.filter { $0.videoChunkPath != activeChunk }
-            }
-
-            // Apply app filter if set
-            if let app = selectedApp {
-                results = results.filter { $0.appName == app }
-            }
-
-            screenshots = results
-
-        } catch {
-            logError("RewindViewModel: Failed to load screenshots for date: \(error)")
+        // Filter out frames from the active (unfinalized) video chunk — they can't be displayed yet
+        let activeChunk = await VideoChunkEncoder.shared.currentChunkPath
+        if let activeChunk = activeChunk {
+            results = results.filter { $0.videoChunkPath != activeChunk }
         }
 
-        isLoading = false
+        // Apply app filter if set
+        if let app = selectedApp {
+            results = results.filter { $0.appName == app }
+        }
+
+        screenshots = results
+    }
+
+    /// Silent variant: swallows DB errors and just logs them. Use only for
+    /// background/user-driven reloads (filter change, date change, search
+    /// clear) where a transient failure should not block the UI. Never use
+    /// this on the init path — it would re-introduce the "spinner forever"
+    /// bug. Manages `isLoading` so the spinner shows during the reload but
+    /// always clears, even on thrown error.
+    private func reloadScreenshotsSilently(_ date: Date) async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            try await loadScreenshotsForDate(date)
+        } catch {
+            logError("RewindViewModel: Failed to reload screenshots for date: \(error)")
+        }
     }
 
     /// Silent variant for auto-refresh: never touches isLoading, and only

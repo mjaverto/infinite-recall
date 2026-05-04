@@ -53,6 +53,7 @@ struct ConversationsPage: View {
   // Filter loading states (to show loading on the clicked button)
   @State private var isFilteringStarred: Bool = false
   @State private var isFilteringDate: Bool = false
+  @State private var isFilteringDiscarded: Bool = false
 
   // Multi-select state for merging
   @State private var isMultiSelectMode: Bool = false
@@ -531,6 +532,46 @@ struct ConversationsPage: View {
       .buttonStyle(.plain)
       .disabled(isFilteringStarred)
 
+      // Discarded filter chip — toggles `appState.showDiscardedOnly`.
+      // Semantics: "All" (default) shows active conversations only;
+      // "Discarded" ON shows only soft-discarded rows. This is a binary
+      // toggle (not a 3-mode segmented control) to stay consistent with
+      // the surrounding Starred / Date chips.
+      Button(action: {
+        Task {
+          isFilteringDiscarded = true
+          await appState.toggleDiscardedFilter()
+          isFilteringDiscarded = false
+        }
+      }) {
+        HStack(spacing: 6) {
+          if isFilteringDiscarded {
+            ProgressView()
+              .scaleEffect(0.5)
+              .frame(width: 12, height: 12)
+          } else {
+            Image(systemName: appState.showDiscardedOnly ? "trash.fill" : "trash")
+              .scaledFont(size: 12)
+          }
+          Text("Discarded")
+            .scaledFont(size: 12, weight: .medium)
+        }
+        .foregroundColor(
+          appState.showDiscardedOnly ? OmiColors.textPrimary : OmiColors.textSecondary
+        )
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .omiControlSurface(
+          fill: appState.showDiscardedOnly
+            ? OmiColors.textPrimary.opacity(0.16) : OmiColors.backgroundSecondary,
+          radius: 16,
+          stroke: appState.showDiscardedOnly
+            ? OmiColors.border.opacity(0.36) : OmiColors.border.opacity(0.14)
+        )
+      }
+      .buttonStyle(.plain)
+      .disabled(isFilteringDiscarded)
+
       // Date filter button
       Button(action: {
         showDatePicker.toggle()
@@ -583,7 +624,7 @@ struct ConversationsPage: View {
 
       // Clear all filters button (only show if any filter is active)
       if appState.showStarredOnly || appState.selectedDateFilter != nil
-        || appState.selectedFolderId != nil
+        || appState.selectedFolderId != nil || appState.showDiscardedOnly
       {
         Button(action: {
           Task {
@@ -595,6 +636,27 @@ struct ConversationsPage: View {
             .foregroundColor(OmiColors.textTertiary)
         }
         .buttonStyle(.plain)
+      }
+
+      Spacer(minLength: 0)
+
+      // Passive hint: when there are discarded conversations the user can't
+      // currently see (chip OFF), show a small "(N hidden)" so they know the
+      // Discarded chip will surface them. Tapping it activates the chip.
+      if !appState.showDiscardedOnly && appState.discardedConversationsCount > 0 {
+        Button(action: {
+          Task {
+            isFilteringDiscarded = true
+            await appState.toggleDiscardedFilter()
+            isFilteringDiscarded = false
+          }
+        }) {
+          Text("(\(appState.discardedConversationsCount) hidden)")
+            .scaledFont(size: 11)
+            .foregroundColor(OmiColors.textTertiary)
+        }
+        .buttonStyle(.plain)
+        .help("Show discarded conversations")
       }
     }
   }

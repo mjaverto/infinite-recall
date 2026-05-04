@@ -156,6 +156,13 @@ public final class ActivityMonitorService: ObservableObject, InternalPostFailure
         self.lastError = nil
     }
 
+    /// Surface a user-visible error from outside the service (e.g. UI-side
+    /// recovery actions like the Restart Daemon button). Routed through the
+    /// same `lastError` channel so the existing banner picks it up.
+    public func setLastError(_ message: String) {
+        self.lastError = message
+    }
+
     /// POST /v1/activity/processes/:pid/terminate — ask the Rust daemon to
     /// SIGTERM the LocalModel worker child for `pid` so its memory is
     /// reclaimed. launchd `KeepAlive=true` will respawn it on the next
