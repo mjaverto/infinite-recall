@@ -5,7 +5,7 @@ The Apps page is how you connect Infinite Recall to other data sources on your M
 ## What you see
 
 - A search bar at the top for filtering by name or category.
-- A **Featured apps** section. In local-first builds the remote catalog is empty by design — most users will see this section blank. It is a placeholder for a future marketplace.
+- A **Featured apps** section. The remote catalogue is empty in this build by design — Infinite Recall is local-first and does not talk to a remote app marketplace. The section is a placeholder for a future catalogue.
 - A **My Apps** section listing connectors you have already configured locally.
 - Category filters and infinite scroll for browsing available apps.
 - Tapping any app opens its detail view: a full description, configuration controls, and any active toggles.

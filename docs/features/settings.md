@@ -47,9 +47,9 @@ Rewind controls how much screen-capture history is stored, which apps are exclud
 | Setting | Type | What it does | Default | Notes |
 |---|---|---|---|---|
 | Storage | Informational | Displays the total number of captured frames and the disk space used by Rewind data. | — | Read-only. Use Data Retention to reduce disk usage. |
-| Excluded Apps | List (add / remove / Reset to Defaults) | Screen capture pauses automatically whenever an app from this list is the frontmost window. No frames are taken; no OCR runs. | 1Password, Keychain Access, common banking apps, FaceTime, incognito browser windows, and other sensitive-context apps | Click Reset to Defaults to restore the built-in list if you have removed entries. Changes take effect immediately. |
+| Excluded Apps | List (add / remove / Reset to Defaults) | Screen capture pauses automatically whenever an app from this list is the frontmost window. No frames are taken; no OCR runs. | Omi's own builds (Omi, Omi Beta, Omi Dev, Omi Computer), common password managers (1Password, 1Password 7, Bitwarden, LastPass, Dashlane, Keeper, Enpass, KeePassXC, macOS Passwords), and Keychain Access | Click Reset to Defaults to restore the built-in list if you have removed entries. Changes take effect immediately. Banking apps, FaceTime, browser incognito windows, and other sensitive contexts are NOT excluded by default — add them yourself if you want them paused. |
 | Battery Optimization | Toggle | When your Mac is running on battery or in Low Power Mode, OCR processing pauses and frames are queued. The queue drains when you reconnect to AC power. | ON | Disabling this runs OCR continuously regardless of power source, which shortens battery life. |
-| Data Retention | Picker (1 / 3 / 7 / 14 / 30 days) | Screenshots and `visual_activity` database rows older than this threshold are pruned each time the app launches. | 7 days | Shorter retention reduces disk usage. Pruned data cannot be recovered. |
+| Data Retention | Picker (3 / 7 / 14 / 30 days) | Screenshots and `visual_activity` database rows older than this threshold are pruned each time the app launches. | 7 days | Shorter retention reduces disk usage. Pruned data cannot be recovered. |
 | Audio Review Retention | Picker | How long raw audio chunks are kept for purposes such as speaker identification review. | 7 days | Independent of Data Retention; audio and screen captures can have different lifetimes. |
 
 Internally, retention works alongside a 30,000-row soft cap on the `visual_activity` table. When either the age threshold or the row cap is exceeded, the oldest rows are removed and their corresponding image files on disk are deleted at the same time, keeping the database and filesystem consistent.
@@ -82,9 +82,9 @@ Notifications lets you choose which events surface as system alerts and how freq
 | Notifications | Toggle | Master switch. When off, no alerts are delivered regardless of per-type toggles. | ON (subject to system permission) | If macOS has denied notification permission, this toggle has no effect until you re-enable it in System Settings. |
 | Frequency | Picker (Off / Minimal / Low / Balanced / High / Maximum) | Global throttle applied across all notification types. Lower settings collapse multiple alerts into fewer, less frequent deliveries. | Balanced | Setting this to Off is equivalent to toggling the master Notifications switch off. |
 | Focus Notifications | Toggle | Alert when the AI detects a shift in your focus or distraction state. | ON | Fired by `FocusAssistant` when it classifies a state change with sufficient confidence. |
-| Task Notifications | Toggle | Alert when an action item is extracted from a conversation or screen capture. | ON | Fired by `TaskAssistant`. The notification includes the extracted task text. |
+| Task Notifications | Toggle | Alert when an action item is extracted from a conversation or screen capture. | OFF | Fired by `TaskAssistant`. The notification includes the extracted task text. Off by default because action-item extraction is frequent enough to be noisy. |
 | Insight Notifications | Toggle | Alert when an insight is generated from your activity. | ON | Insights are broader observations about patterns, not tied to a single task. |
-| Memory Notifications | Toggle | Alert when a memory is extracted and saved. | ON | Fired by `MemoryAssistant`. Useful for confirming what the app is remembering about you. |
+| Memory Notifications | Toggle | Alert when a memory is extracted and saved. | OFF | Fired by `MemoryAssistant`. Off by default; turn on if you want to audit what the app is remembering about you. |
 | Daily Summary | Toggle | Deliver an end-of-day summary notification. | ON | Content includes conversations, tasks completed, focus time, and notable memories from the day. |
 | Summary Time | Time picker (0–23) | Hour at which the daily summary notification is delivered. | 22 (10 PM) | Uses 24-hour input. The summary is generated locally just before delivery. |
 
@@ -100,8 +100,10 @@ Privacy is an informational section. There are no toggles here — it describes 
 
 | Setting | Type | What it does | Default | Notes |
 |---|---|---|---|---|
-| Local-First by Design | Informational | All captured data — screenshots, audio, transcripts, memories, tasks, conversations — is stored on this Mac at `~/Library/Application Support/InfiniteRecall/`. There is no account, no sync service, and no telemetry. | Always on | Moving or deleting that directory removes all app data. |
+| Local-First by Design | Informational | All captured data is stored on this Mac. There is no account, no sync service, and no telemetry. | Always on | See "Where the data lives" below for the exact paths. |
 | Encryption | Informational | Files stored by the app inherit macOS FileVault disk encryption if FileVault is enabled on your Mac. The app itself does not apply an additional encryption layer in v1. | Depends on your FileVault status | To verify FileVault status: System Settings > Privacy & Security > FileVault. |
+
+**Where the data lives.** Captured user data — screenshots, audio chunks, transcripts, memories, tasks, conversations — is stored under `~/Library/Application Support/Omi/users/{userId}/` (the legacy directory name is kept intentionally to preserve compatibility with the upstream Omi fork; in single-user mode `{userId}` is `anonymous`). System-managed files — the MCP API token, bundled scripts, logs — live under `~/Library/Application Support/InfiniteRecall/`. To wipe everything, remove both directories.
 
 ---
 
@@ -122,16 +124,16 @@ AI / Models is the most complex section. It governs where inference runs (locall
 | API Keys — Anthropic | Secure text input + Save to Keychain | Your Anthropic API key. Stored in macOS Keychain, never in plain text on disk. | Empty | Required only when the Anthropic API provider is selected. |
 | API Keys — OpenAI | Secure text input + Save to Keychain | Your OpenAI API key. Same storage mechanism as the Anthropic key. | Empty | Required only when the OpenAI API provider is selected. |
 | Local Model | Card (model name, installed size, model picker, server status) | Shows the active text model (e.g., `mlx-community/Llama-3.2-3B-Instruct-4bit`), its installed size, and whether the local server is running. "Show all models" opens a picker to switch models. | Preset at install time | Model downloads happen in-app. Larger models use more RAM and load more slowly. |
-| Autonomous Work Mode | Toggle + timeout picker | When enabled, queued background tasks (memory extraction, KG updates, summarisation) run while your Mac is idle and plugged in. The timeout controls how long the Mac must be idle before work begins. | OFF | Status reads "Ready to work while idle." when configured correctly. |
+| Autonomous Work Mode | Toggle + timeout picker | When enabled, queued background tasks (summarisation, knowledge-graph extraction) run while your Mac is idle and plugged in. The timeout (Memory saver timeout) controls how long the Mac must be idle before work begins, and after which models can be unloaded from RAM. | ON, 10 minutes | Status reads "Ready to work while idle." when configured correctly. Disable if you don't want background LLM work to run while you're away. |
 | Vision Model | Card (model name, installed size, model picker, server status) | Shows the active vision model (e.g., Qwen3-VL-8B), its size, a picker to change it, and server running status. The vision model handles screen-capture understanding and visual question-answering. | Qwen3-VL-8B (preset) | Vision model and text model run on separate ports and can be stopped independently. |
-| MCP API | Card (endpoint, token path, install/start/stop/test controls) | A local read-only HTTP API that exposes your conversations and memories to MCP-compatible clients such as Claude Code and Cursor. Endpoint: `http://127.0.0.1:7331`. Token stored at `~/Library/Application Support/InfiniteRecall/api-token.txt` (permissions 0600). | Stopped until you click Install / Start | Provides Install MCP API, Start, Stop, Test connection, and a "Copy `claude mcp add` command" button for one-command client setup. |
+| MCP API | Card (endpoint, token path, install/start/stop/test controls) | A local HTTP API that exposes your data to MCP-compatible clients such as Claude Code and Cursor. Conversations, memories, and metadata are read-only; action items are full read+write (create, update, complete, delete). Endpoint: `http://127.0.0.1:7331`. Token stored at `~/Library/Application Support/InfiniteRecall/api-token.txt` (permissions 0600). | Stopped until you click Install / Start | Provides Install MCP API, Start, Stop, Test connection, and a "Copy `claude mcp add` command" button for one-command client setup. |
 | Visual Activity | Informational counter | Shows how many `visual_activity` entries were indexed today and in total. | — | Read-only. Useful for confirming that screen capture and OCR are running. |
 
-**How local inference works.** The Local MLX provider starts `mlx-lm.server` on `127.0.0.1:8080` for text and a vision inference server on `:8081` (Qwen3-VL by default). Both processes are managed by `MLXLifecycleManager` via launchd, so they restart automatically if they crash. When you switch providers, all subsequent calls — chat, memory extraction, task extraction, focus detection, summarisation, knowledge-graph extraction — are routed through the newly selected client. Cloud providers stream over HTTPS; the Local MLX client uses the OpenAI-compatible `/v1/chat/completions` API.
+**How local inference works.** The Local MLX provider starts `mlx-lm.server` on `127.0.0.1:8080` for text inference and a separate vision inference server on `:8081` (Qwen3-VL by default). The text process is managed by `MLXLifecycleManager` and the vision process by `VLMLifecycleManager`, both via launchd, so they restart automatically if they crash. When you switch providers, all subsequent calls — chat, memory extraction, task extraction, focus detection, summarisation, knowledge-graph extraction — are routed through the newly selected client. Cloud providers stream over HTTPS; the Local MLX client uses the OpenAI-compatible `/v1/chat/completions` API.
 
 **Autonomous Work Mode and memory management.** Autonomous Work Mode is paired with `IdleAIController`. When your idle time and time-since-last-inference call both exceed the configured timeout, the controller may unload the text and vision models from RAM (freeing roughly 13–17 GB combined) and queue the deferred work. The next user interaction or scheduled trigger auto-restarts the servers. This prevents the models from holding RAM while you are active.
 
-**The MCP API.** The daemon behind the MCP API is `infinite-recall-api`, a small Rust binary. It exposes read-only tools and resources: external clients can search your conversations, retrieve memories, and query metadata, but cannot write, delete, or modify anything. The bearer token in `api-token.txt` is the only credential; rotating it (via Stop + Start) invalidates all existing client connections.
+**The MCP API.** The daemon behind the MCP API is `infinite-recall-api`, a small Rust binary. Conversations, memories, transcripts, and metadata are read-only — clients can search and retrieve but cannot modify. Action items are the exception: clients can `POST /v1/action-items` (create), `PATCH /v1/action-items/:id` (update), `POST /v1/action-items/:id/complete` (toggle done), and `DELETE /v1/action-items/:id` (soft delete). The bearer token in `api-token.txt` is the only credential; rotating it (via Stop + Start) invalidates all existing client connections.
 
 ---
 
@@ -161,8 +163,8 @@ Shortcuts configures the global keyboard hotkeys that control the Floating Bar a
 
 | Setting | Type | What it does | Default | Notes |
 |---|---|---|---|---|
-| Ask Infinite Recall Shortcut | Preset chips (⌘↩ / ⇧⌘↩ / ⌘J / ⌘O / Custom / Disable) | Global hotkey to summon or dismiss the Floating Bar from any app. | ⌘J | Choose Custom to record any combination not listed. Disable removes the hotkey entirely. Conflicts with other apps' global shortcuts must be resolved manually. |
-| Push to Talk | Preset chips (⌥ / Right ⌘ / fn / Custom / Disable) | Hold this key to capture your voice; release to send the question. | Right ⌘ | The Right ⌘ key is chosen by default because it is rarely used by other apps on macOS. fn is a good alternative on smaller keyboards. |
+| Ask Infinite Recall Shortcut | Preset chips (⌘↩ / ⇧⌘↩ / ⌘J / ⌘O / Custom / Disable) | Global hotkey to summon or dismiss the Floating Bar from any app. | ⌘↩ | Choose Custom to record any combination not listed. Disable removes the hotkey entirely. Conflicts with other apps' global shortcuts must be resolved manually. |
+| Push to Talk | Preset chips (⌥ / Right ⌘ / fn / Custom / Disable) | Hold this key to capture your voice; release to send the question. | ⌥ (Option) | Option is a good default because it rarely conflicts with other macOS shortcuts. Right ⌘ and fn are alternatives if you find yourself triggering Option in normal typing. |
 | Double-tap for Locked Mode | Toggle | Double-tapping the PTT key starts continuous listening without needing to hold the key. A single additional tap sends the question. | ON | Useful for longer dictated questions where holding a key is impractical. |
 | Push-to-Talk Sounds | Toggle | Plays a short audio cue when voice capture starts and when it ends. | OFF | Enable to get tactile confirmation that the mic opened and closed, especially helpful in noisy environments. |
 
@@ -174,7 +176,7 @@ Shortcuts configures the global keyboard hotkeys that control the Floating Bar a
 
 <img src="images/settings-advanced-2.jpg" alt="Advanced settings — part 2" width="720">
 
-Advanced contains power-user options split into five sub-groups: AI Setup, Profile & Stats, Goals, Preferences, Troubleshooting, and Dev Tools. Most users will not need to touch these.
+Advanced contains power-user options split into six sub-groups: AI Setup, Profile & Stats, Goals, Preferences, Troubleshooting, and Dev Tools. Most users will not need to touch these.
 
 ### AI Setup
 
@@ -182,7 +184,7 @@ Advanced contains power-user options split into five sub-groups: AI Setup, Profi
 |---|---|---|---|---|
 | AI Provider | Picker | The backend used by the desktop chat panel specifically. Currently shows "Infinite Recall AI built with pi.dev." | Infinite Recall AI | Separate from the AI Provider in the main AI / Models section, which controls all background extraction and push-to-talk inference. |
 | Workspace | Folder picker | The project directory the desktop chat panel uses as context when answering questions about code or files. | Unset | Optional. Set this if you want the AI to answer questions about a specific codebase or folder. |
-| Browser Extension | Toggle + Set Up button | Allows the AI to use your Chrome browser with your existing logged-in sessions, enabling it to retrieve information from authenticated websites. | OFF | Requires installing the companion browser extension. The Set Up button opens installation instructions. |
+| Browser Extension | Toggle + Set Up button | Allows the AI to use your Chrome browser with your existing logged-in sessions, enabling it to retrieve information from authenticated websites. | ON | Requires installing the companion browser extension. The Set Up button opens installation instructions. Toggle off if you don't want the AI to drive your browser. |
 | Dev Mode | Toggle | Allows the AI to read and modify the app's own source code, trigger rebuilds, and add custom features. | OFF | Intended for contributors and power users who want to extend the app. Do not enable unless you understand the implications. |
 
 ### Profile & Stats

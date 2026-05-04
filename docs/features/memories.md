@@ -11,7 +11,7 @@ Above the list:
 - A **search bar** for keyword lookup across all memory text.
 - **Filter controls** to narrow by tag, focus sub-status, or memory source (system-generated, manually added, or AI tip).
 
-Tap any memory to open a detail sheet showing the full text, all tags, the creation date, and — when available — a link to the source conversation that triggered the extraction.
+Click any memory to open a detail sheet showing the full text, all tags, the creation date, and — when available — a link to the source conversation that triggered the extraction.
 
 ## What you can do
 
@@ -47,7 +47,7 @@ Confidence scores are applied after inference; extractions that fall below the t
 
 **Manual memories.** Memories you write yourself are tagged `Manual` and are otherwise identical to auto-extracted ones — fully searchable, filterable, and editable.
 
-**Gating.** Auto-extraction is LLM-driven and runs only when the processing gate is open (device on AC power). The Memories UI remains fully functional on battery; only new background extractions pause. The gate model is described in the Activity doc.
+**Gating.** Auto-extraction runs whenever the assistant is enabled and the per-frame extraction interval (default ~10 minutes) has elapsed — it does **not** require the Mac to be idle. Memory extraction is in the lightweight tier alongside transcription and OCR, so it runs while you are actively using the machine. It does pause on battery / Low Power Mode along with the rest of the AC-only pipeline; only the heavier conversation-summarisation and knowledge-graph passes wait for idle as well. The full gate model is in the Activity doc. The Memories UI itself remains fully functional regardless of capture state — only new background extractions pause.
 
 ## Source
 

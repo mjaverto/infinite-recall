@@ -16,7 +16,7 @@ Selecting a conversation opens the detail view on the right. It shows the full t
 - Filter by starred status. Star any conversation from the detail view or the list row's context menu.
 - Merge conversations. Useful when a single session was split by a recording gap — select two or more rows and merge them into one continuous transcript.
 - Jump to any date or range using the date picker filter chip.
-- Open a conversation to read the full transcript, see per-segment speaker labels, and tap any timestamp to navigate within the session.
+- Open a conversation to read the full transcript, see per-segment speaker labels, and click any timestamp to navigate within the session.
 - Identify speakers. Assign real names to speaker IDs, correct mis-attributed segments, and save voice profiles so future sessions auto-identify the same speakers.
 - Toggle between compact and expanded list view. The preference persists across launches.
 - Delete conversations locally. Deletion is permanent; there is no cloud backup to recover from.
@@ -46,7 +46,7 @@ Transcription is lightweight enough to run while you are actively using the Mac,
 
 ### Speaker diarisation
 
-In parallel with transcription, a separate service determines who is speaking in each segment. The default backend is a lightweight voice-activity detector based on MFCC features with cosine-similarity clustering — fast, low power, no extra model download required. For higher accuracy, an optional pyannote-community-1 model (packaged as SpeakerKit and accelerated on the Apple Neural Engine) can be enabled in settings; it requires a one-time ~100 MB download.
+In parallel with transcription, a separate service determines who is speaking in each segment. The default backend is a lightweight speaker-embedding extractor that averages MFCC features per segment and clusters them with cosine similarity (threshold ~0.65) — fast, low power, no extra model download required. For higher accuracy, an optional pyannote-community-1 model (packaged as SpeakerKit) can be enabled; it requires a one-time model download.
 
 Each transcript segment is tagged with a speaker ID. When a speaker ID matches a saved voice profile or a name you have assigned manually, the label resolves to that name automatically. Corrections made in the detail view are persisted back to the embedding store and influence future sessions. Relevant files: `Diarization/SpeakerDiarizationService.swift`, `SpeakerEmbeddingStore.swift`, `MFCCExtractor.swift`, `PyannoteLifecycleManager.swift`.
 
