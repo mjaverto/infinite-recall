@@ -2534,6 +2534,10 @@ actor RewindDatabase {
         // so user data survives the summarize/transcribe race and a future
         // recovery UI can list + restore auto-discarded rows. No backfill —
         // pre-existing rows keep null reason/timestamp.
+        //
+        // TODO(PR B / recovery UI): add indexes on `discarded` and
+        // `discarded_at` once the "Recently auto-deleted" page lands and
+        // becomes a hot reader — see #114 plan.
         migrator.registerMigration("addDiscardMetadataColumns") { db in
             // Be idempotent: a fork or partial migration may have added
             // either column already.
