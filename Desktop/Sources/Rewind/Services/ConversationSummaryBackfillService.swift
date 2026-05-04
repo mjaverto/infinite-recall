@@ -229,10 +229,10 @@ actor ConversationSummaryBackfillService {
              WHERE deleted = 0
                AND discarded = 0
                AND summary_state = 'unavailable'
-               AND (
-                   SELECT COUNT(*) FROM transcription_segments seg
+               AND NOT EXISTS (
+                   SELECT 1 FROM transcription_segments seg
                     WHERE seg.sessionId = transcription_sessions.id
-               ) = 0
+               )
             """
 
         let ids: [Int64]

@@ -706,6 +706,7 @@ actor TranscriptionStorage {
 
         log("TranscriptionStorage: Soft-discarding session \(id) — reason=\(reason)")
 
+        let now = Date()
         try await db.write { database in
             try database.execute(
                 sql: """
@@ -713,10 +714,11 @@ actor TranscriptionStorage {
                        SET discarded = 1,
                            discard_reason = ?,
                            discarded_at = ?,
-                           summary_state = 'unavailable'
+                           summary_state = 'unavailable',
+                           updatedAt = ?
                      WHERE id = ?
                     """,
-                arguments: [reason, Date(), id]
+                arguments: [reason, now, now, id]
             )
         }
     }
@@ -735,21 +737,25 @@ actor TranscriptionStorage {
     /// awaiting backoff/retry and the transcribe attempt can still recover.
     ///
     /// Dedup key matches `ConversationTranscribeBackfillService.dedupKey(for:)`
-    /// — kept inline rather than imported to avoid a circular dep.
+    /// — kept inline rather than imported to avoid a circular dep on the
+    /// backfill service. `PendingWork.Kind` itself lives in `Core` and is
+    /// safely shared across the module, so we use its rawValue constant
+    /// instead of a literal string.
     func transcribeIsTerminal(sessionId: Int64) async throws -> Bool {
         let db = try await ensureInitialized()
-        let dedupKey = "transcribe:\(sessionId)"
+        let workType = PendingWork.Kind.transcribe.rawValue
+        let dedupKey = "\(workType):\(sessionId)"
 
         let activeCount: Int = try await db.read { database in
             try Int.fetchOne(
                 database,
                 sql: """
                     SELECT COUNT(*) FROM pending_work
-                     WHERE workType = 'transcribe'
+                     WHERE workType = ?
                        AND dedupKey = ?
                        AND status IN ('queued', 'claimed', 'failed')
                     """,
-                arguments: [dedupKey]
+                arguments: [workType, dedupKey]
             ) ?? 0
         }
         return activeCount == 0
