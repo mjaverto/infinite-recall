@@ -251,4 +251,67 @@ mod retry_tests {
     // — those pin `is_transient_open_error` directly without needing to
     // drive a real SQLite handle through the full retry loop, which is
     // non-deterministic to set up across macOS/Linux test environments.
+    //
+    // The test below complements those by driving the FULL retry loop with a
+    // real terminal failure: 16 bytes of garbage bytes at the path, so
+    // `metadata()` succeeds (file exists) but SQLite open fails with
+    // SQLITE_NOTADB / similar. If the loop ever drops the
+    // `is_transient_open_error` classifier, this test's elapsed-time guard
+    // and the lack of meaningful retry budget would expose it.
+
+    /// Regression guard for the terminal fast-fail path: a non-transient
+    /// open error MUST cause `open_read_only_pool_with_retry` to return an
+    /// `Err` without burning the full 5-attempt × 1s retry budget.
+    ///
+    /// We trigger a deterministic terminal failure by pointing the open at a
+    /// path inside a directory that `metadata()` cannot stat: a regular file
+    /// used as a parent. `std::fs::metadata("/some/file/child")` returns
+    /// `ErrorKind::NotADirectory` (`io_err.kind()` is non-NotFound), which
+    /// `open_read_only_pool` propagates with full io::Error context, which
+    /// `is_transient_open_error` then classifies as terminal (the
+    /// "Other io kinds (PermissionDenied, etc.) are terminal" branch in
+    /// db.rs:48). The classifier is the same gate the loop's bail uses, so a
+    /// bug there also fails this test.
+    ///
+    /// The cheapest observable signal that the loop respected the
+    /// classification is wall-clock: a terminal bail returns in
+    /// milliseconds; a buggy loop ignoring the classifier would burn the
+    /// full ~4s retry budget (4 × 1s sleeps).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_failure_does_not_retry() {
+        use tokio::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Create a regular file…
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"i am a file").expect("create blocker");
+        // …and ask metadata() about a child inside it. Linux returns ENOTDIR;
+        // macOS returns the same. Either surfaces as a non-NotFound io::Error,
+        // which `is_transient_open_error` classifies as terminal.
+        let path: PathBuf = blocker.join("child.db");
+
+        let path_for_open = path.clone();
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            open_read_only_pool_with_retry(&path_for_open)
+        })
+        .await
+        .expect("join blocking");
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected terminal io error to surface as Err, got Ok"
+        );
+        // Tight upper bound: terminal classification should bail on the first
+        // attempt (no sleep). Allow 1s of slack for slow CI runners and
+        // tokio scheduling jitter, but a buggy loop ignoring the classifier
+        // would take ~4s minimum.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1000),
+            "terminal failure path took {:?} — loop appears to be retrying. \
+             Expected <1s; full retry budget would be ~4s.",
+            elapsed,
+        );
+    }
 }

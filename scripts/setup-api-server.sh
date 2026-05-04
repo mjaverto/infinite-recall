@@ -13,7 +13,14 @@ set -euo pipefail
 
 # Emit a `failed` step on any early exit so the calling Swift LocalAIInstaller
 # stops waiting for a "done" message and surfaces the error to the user.
-trap 'rc=$?; if [ $rc -ne 0 ]; then printf "PROGRESS:STEP=failed\n"; fi' EXIT
+#
+# Guard with `_failure_step_emitted` so structured exits (e.g. `needs_sudo`)
+# can publish their own step name and bail without the trap clobbering it
+# with `STEP=failed`. The Swift installer reads the LAST progress line, so
+# unconditionally emitting `failed` on every nonzero exit was overriding
+# `needs_sudo` and other meaningful structured-failure signals.
+_failure_step_emitted=0
+trap 'rc=$?; if [ $rc -ne 0 ] && [ "$_failure_step_emitted" = "0" ]; then printf "PROGRESS:STEP=failed\n"; fi' EXIT
 
 BIN_NAME="infinite-recall-api"
 CLI_BIN_NAME="recall"
@@ -43,6 +50,7 @@ progress() { printf "PROGRESS:%s\n" "$1"; }
 if [ "$AUTO_CONFIRM" = "1" ] && [ ! -w "$INSTALL_DIR" ] && ! sudo -n true 2>/dev/null; then
     progress "STEP=needs_sudo"
     echo "ERROR: $INSTALL_DIR not writable and sudo would prompt — re-run with passwordless sudo arranged" >&2
+    _failure_step_emitted=1
     exit 2
 fi
 

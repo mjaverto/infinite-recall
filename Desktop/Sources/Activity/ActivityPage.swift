@@ -348,7 +348,21 @@ struct ActivityPage: View {
 
         try? await Task.sleep(nanoseconds: 2_000_000_000)
 
-        service.clearLastError()
+        // Only clear `lastError` if the surfaced banner is one of the failure
+        // modes a daemon kickstart actually fixes:
+        //   - `daemon token unavailable …` from `LocalDaemonToken.TokenError.fileMissing`
+        //   - `snapshot failed: …` from a transient daemon-snapshot RPC failure
+        //
+        // Without this gate, an unrelated banner (e.g. a process-terminate
+        // failure surfaced via `setLastError`) is silently wiped the moment
+        // the user clicks "Restart daemon", masking errors that have nothing
+        // to do with the daemon. `service.refreshNow()` below will overwrite
+        // a daemon-related error organically on its next snapshot anyway.
+        if let current = service.lastError,
+           current.contains("daemon token unavailable")
+            || current.hasPrefix("snapshot failed:") {
+            service.clearLastError()
+        }
         await service.refreshNow()
     }
     // === /activity:C3 ===

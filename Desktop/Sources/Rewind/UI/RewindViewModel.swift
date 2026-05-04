@@ -61,8 +61,19 @@ class RewindViewModel: ObservableObject {
     private var loadStatsTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
-    /// Whether initial data has been loaded (prevents race condition with debounced search)
+    /// Whether initial data has been loaded (prevents race condition with
+    /// debounced search). Also used by the watchdog re-check guard so a
+    /// successful load can never trip the "Loading timed out" banner after
+    /// the fact (see `loadInitialData`).
     private var isInitialized = false
+
+    // TODO: testing seam needed — `loadInitialData` reaches into
+    // `RewindDatabase.shared` and `RewindIndexer.shared` directly. Adding a
+    // `RewindViewModelTests` covering the watchdog/defer interaction (per
+    // the second-pass review) requires injecting a database-and-indexer pair
+    // into `RewindViewModel` (e.g. struct of closures with `.live` /
+    // `.testing` cases, or a protocol-typed dependency). Out of scope for
+    // this batch fix — flagged here as the follow-up.
 
     /// Set by RewindPage when the transcript/notes panel is expanded.
     /// Auto-refresh skips when true so the view tree stays stable and @State is preserved.
@@ -152,11 +163,19 @@ class RewindViewModel: ObservableObject {
         loadWatchdogTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
             guard let self, !Task.isCancelled else { return }
-            if self.isLoading && self.errorMessage == nil {
-                self.errorMessage = "Loading timed out. Tap retry."
-                self.isLoading = false
-                logError("RewindViewModel: loadInitialData watchdog fired after 30s")
-            }
+            // Re-check `isInitialized`: if `loadInitialData` already finished
+            // (success OR error path), `defer` may not yet have flipped
+            // `isLoading` to false in this MainActor turn. Without this guard
+            // the watchdog spuriously sets "Loading timed out" right after a
+            // legitimate load — including the error path, where
+            // `errorMessage` is set but `isLoading` is still `true`.
+            guard self.isLoading
+                && self.errorMessage == nil
+                && !self.isInitialized
+            else { return }
+            self.errorMessage = "Loading timed out. Tap retry."
+            self.isLoading = false
+            logError("RewindViewModel: loadInitialData watchdog fired after 30s")
         }
 
         do {

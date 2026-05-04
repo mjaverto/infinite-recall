@@ -1,19 +1,18 @@
 import XCTest
 @testable import Omi_Computer
 
-/// Coverage for the daemon-health gate used by
-/// `ConversationSummaryBackfillService.backfillDiscardEmptyShortRecordingsOnce`.
+/// `LocalDaemonToken.read()` semantics — file presence, empty-file detection,
+/// and round-trip of a valid token.
 ///
-/// The gate's contract: when the daemon token file is missing,
-/// `LocalDaemonToken.read()` throws `TokenError.fileMissing`, which the
-/// sweep treats as a transient skip (return without setting the V2 flag).
-/// All other token errors are surfaced and the sweep proceeds.
-///
-/// Driving the full backfill function requires `RewindDatabase` to be set
-/// up, which is out of scope for a unit test. Instead we pin the load-bearing
-/// behavior the gate depends on: the token reader emits the right typed
-/// error, and pattern-matching on `TokenError.fileMissing` works.
-final class LocalDaemonTokenHealthGateTests: XCTestCase {
+/// Renamed from `LocalDaemonTokenHealthGateTests` (Reviewer 3 follow-up):
+/// the previous name overstated coverage. The actual health gate inside
+/// `ConversationSummaryBackfillService.backfillDiscardEmptyShortRecordingsOnce`
+/// is not exercised here — driving it requires a `RewindDatabase` setup and
+/// a DI seam for the token reader, neither of which exists today. What the
+/// tests in this file DO pin is the typed-error contract the gate keys off
+/// (`TokenError.fileMissing` vs `.empty` vs success), so a regression in
+/// `LocalDaemonToken` itself can't silently break the gate.
+final class LocalDaemonTokenReadTests: XCTestCase {
 
     private var originalEnv: String?
 
