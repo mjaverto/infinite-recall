@@ -221,6 +221,23 @@ actor ConversationSummaryBackfillService {
             return
         }
 
+        // Daemon-health gate: only `.fileMissing` is genuinely transient
+        // (daemon not yet started). On `.unreadable` / `.empty` the daemon is
+        // broken in a way that won't self-heal across launches — looping
+        // forever on it accomplishes nothing, and `segment_count = 0` is a
+        // structural check that doesn't actually need daemon liveness to be
+        // safe. Log loudly on those and proceed with the sweep.
+        do {
+            let syncRead: () throws -> String = LocalDaemonToken.read  // sync overload, not waitFor:
+            _ = try syncRead()
+        } catch LocalDaemonToken.TokenError.fileMissing {
+            log("ConversationSummaryBackfillService: skipping discard sweep — daemon not yet started, will retry next cycle")
+            return
+        } catch {
+            logError("ConversationSummaryBackfillService: daemon token unreadable/empty during discard sweep — proceeding without health gate", error: error)
+            // fall through to the sweep
+        }
+
         // Only rows that are genuinely empty (no segments) AND already marked
         // unavailable. Drops the V1 title='Short Recording' criterion — that
         // was over-aggressive — and replaces it with a hard structural check.

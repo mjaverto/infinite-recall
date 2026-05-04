@@ -1087,7 +1087,9 @@ actor TranscriptionStorage {
         limit: Int = 50,
         offset: Int = 0,
         starredOnly: Bool = false,
-        folderId: String? = nil
+        folderId: String? = nil,
+        includeDiscarded: Bool = false,
+        discardedOnly: Bool = false
     ) async throws -> [ServerConversation] {
         let db = try await ensureInitialized()
 
@@ -1097,7 +1099,18 @@ actor TranscriptionStorage {
             // so the original filter wiped the entire conversation list.
             var query = TranscriptionSessionRecord
                 .filter(Column("deleted") == false)
-                .filter(Column("discarded") == false)
+
+            // Discarded handling:
+            //   - default (`includeDiscarded == false`, `discardedOnly == false`):
+            //     hide discarded rows (current behavior).
+            //   - `discardedOnly == true`: show ONLY discarded rows (Discarded chip).
+            //   - `includeDiscarded == true` (and not discardedOnly): include both
+            //     active and discarded rows together.
+            if discardedOnly {
+                query = query.filter(Column("discarded") == true)
+            } else if !includeDiscarded {
+                query = query.filter(Column("discarded") == false)
+            }
 
             if starredOnly {
                 query = query.filter(Column("starred") == true)
@@ -1122,7 +1135,11 @@ actor TranscriptionStorage {
     }
 
     /// Get count of local conversations
-    func getLocalConversationsCount(starredOnly: Bool = false) async throws -> Int {
+    func getLocalConversationsCount(
+        starredOnly: Bool = false,
+        includeDiscarded: Bool = false,
+        discardedOnly: Bool = false
+    ) async throws -> Int {
         let db = try await ensureInitialized()
 
         return try await db.read { database in
@@ -1131,7 +1148,12 @@ actor TranscriptionStorage {
             // so the original filter wiped the entire conversation list.
             var query = TranscriptionSessionRecord
                 .filter(Column("deleted") == false)
-                .filter(Column("discarded") == false)
+
+            if discardedOnly {
+                query = query.filter(Column("discarded") == true)
+            } else if !includeDiscarded {
+                query = query.filter(Column("discarded") == false)
+            }
 
             if starredOnly {
                 query = query.filter(Column("starred") == true)

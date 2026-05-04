@@ -25,12 +25,78 @@ use rusqlite::OpenFlags;
 pub type SqlitePool = Pool<SqliteConnectionManager>;
 pub type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
+/// Classify whether a startup DB-open failure is worth retrying.
+///
+/// Transient: file-missing (Swift app may still be creating it), SQLITE_BUSY
+/// / SQLITE_LOCKED (active writer), SQLITE_IOERR family (filesystem hiccup,
+/// often clears on a brief retry), SQLITE_CANTOPEN (shared-state file race
+/// during boot), SQLITE_PROTOCOL (transient WAL handshake).
+///
+/// Terminal: permission denied, SQLITE_NOTADB (real corruption), schema
+/// mismatch — retrying will not change the outcome and the caller should
+/// bail immediately.
+pub fn is_transient_open_error(err: &anyhow::Error) -> bool {
+    // Walk the full error chain. Anyhow contexts wrap io::Error / rusqlite
+    // errors, and r2d2::Error wraps rusqlite::Error inside its own type —
+    // both should be reachable via `source()` (which `anyhow::Chain` walks
+    // for us) so a single chain walk handles every wrapping layer.
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(io_err.kind(), std::io::ErrorKind::NotFound) {
+                return true;
+            }
+            // Other io kinds (PermissionDenied, etc.) are terminal.
+            return false;
+        }
+        if let Some(rs_err) = cause.downcast_ref::<rusqlite::Error>() {
+            if let rusqlite::Error::SqliteFailure(ffi, _) = rs_err {
+                use rusqlite::ErrorCode::*;
+                // rusqlite collapses extended codes to a primary-code enum:
+                // SQLITE_IOERR family -> SystemIoFailure, SQLITE_CANTOPEN ->
+                // CannotOpen, SQLITE_PROTOCOL -> FileLockingProtocolFailed.
+                match ffi.code {
+                    DatabaseBusy
+                    | DatabaseLocked
+                    | SystemIoFailure
+                    | CannotOpen
+                    | FileLockingProtocolFailed => return true,
+                    NotADatabase => return false,  // real corruption
+                    _ => {}
+                }
+            }
+        }
+        // r2d2::Error wraps the inner rusqlite::Error and exposes it via
+        // `source()`, which the anyhow chain walks automatically. Nothing
+        // extra needed here — covered by the next iteration of the loop.
+    }
+    // Unknown — treat as terminal so we surface the error fast rather
+    // than spin in a retry loop.
+    false
+}
+
 pub fn open_read_only_pool(path: &Path) -> Result<SqlitePool> {
-    if !path.exists() {
-        anyhow::bail!(
-            "database not found at {} — start the Swift app at least once to create it",
-            path.display()
-        );
+    // Three distinct error paths so callers (and humans reading logs) can
+    // tell why the open failed:
+    //   1. file missing  — Swift app hasn't started yet
+    //   2. file unreadable — wrong permissions / sandbox / FS error
+    //   3. file present but SQLite refuses to open it — corruption,
+    //      schema, or a transient lock
+    match std::fs::metadata(path) {
+        Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            // Preserve the io::Error in the anyhow chain so
+            // `is_transient_open_error` can classify NotFound -> retry.
+            return Err(anyhow::Error::from(io_err).context(format!(
+                "database not found at {} — start the Swift app at least once to create it",
+                path.display()
+            )));
+        }
+        Err(io_err) => {
+            return Err(anyhow::Error::from(io_err).context(format!(
+                "database at {} is not readable",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
     }
     let manager = SqliteConnectionManager::file(path).with_flags(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -38,11 +104,13 @@ pub fn open_read_only_pool(path: &Path) -> Result<SqlitePool> {
     let pool = Pool::builder()
         .max_size(8)
         .build(manager)
-        .context("building r2d2 read pool")?;
+        .with_context(|| format!("database at {} could not be opened", path.display()))?;
     // Sanity check: open once.
-    let conn = pool.get().context("checking out initial read connection")?;
+    let conn = pool
+        .get()
+        .with_context(|| format!("database at {} could not be opened", path.display()))?;
     conn.query_row("SELECT 1", [], |_| Ok(()))
-        .context("smoke-testing read-only connection")?;
+        .with_context(|| format!("database at {} could not be opened", path.display()))?;
     Ok(pool)
 }
 
@@ -116,4 +184,93 @@ where
     })
     .await
     .context("join blocking task")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_open_error;
+    #[allow(unused_imports)]
+    use anyhow::Context as _;
+
+    fn rusqlite_err_with_code(code: rusqlite::ErrorCode) -> rusqlite::Error {
+        // Synthesize a `SqliteFailure` with the given primary code. The
+        // extended_code value is irrelevant for `is_transient_open_error`
+        // since rusqlite collapses to the primary `ErrorCode` enum.
+        let ffi = rusqlite::ffi::Error {
+            code,
+            extended_code: 0,
+        };
+        rusqlite::Error::SqliteFailure(ffi, None)
+    }
+
+    #[test]
+    fn io_not_found_is_transient() {
+        let io = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let err: anyhow::Error = anyhow::Error::from(io);
+        assert!(is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn io_permission_denied_is_terminal() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err: anyhow::Error = anyhow::Error::from(io);
+        assert!(!is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn sqlite_busy_is_transient() {
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::DatabaseBusy);
+        let err: anyhow::Error = anyhow::Error::from(rs);
+        assert!(is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn sqlite_locked_is_transient() {
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::DatabaseLocked);
+        let err: anyhow::Error = anyhow::Error::from(rs);
+        assert!(is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn sqlite_ioerr_is_transient() {
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::SystemIoFailure);
+        let err: anyhow::Error = anyhow::Error::from(rs);
+        assert!(is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn sqlite_cantopen_is_transient() {
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::CannotOpen);
+        let err: anyhow::Error = anyhow::Error::from(rs);
+        assert!(is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn sqlite_protocol_is_transient() {
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::FileLockingProtocolFailed);
+        let err: anyhow::Error = anyhow::Error::from(rs);
+        assert!(is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn sqlite_notadb_is_terminal() {
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::NotADatabase);
+        let err: anyhow::Error = anyhow::Error::from(rs);
+        assert!(!is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn nested_under_anyhow_context_still_classifies() {
+        let io = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let err: anyhow::Error = anyhow::Error::from(io)
+            .context("opening sqlite read pool")
+            .context("starting daemon");
+        assert!(is_transient_open_error(&err));
+
+        let rs = rusqlite_err_with_code(rusqlite::ErrorCode::DatabaseBusy);
+        let err: anyhow::Error = anyhow::Error::from(rs)
+            .context("opening connection")
+            .context("startup");
+        assert!(is_transient_open_error(&err));
+    }
 }

@@ -1,4 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Infinite Recall — local Rust daemon launchd agent.
+
+    IMPORTANT: The binary path below MUST live OUTSIDE
+    ~/Library/Application Support/InfiniteRecall/. That directory is reset
+    on schema migrations and any wipe of app state will delete the binary,
+    leaving launchd unable to start the daemon. Keep the binary in
+    /usr/local/bin/ (or another stable, non-state location).
+-->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
         "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

@@ -141,6 +141,8 @@ struct ActivityPage: View {
     @State private var pendingUnload: PendingUnload? = nil
     @State private var unloadErrorMessage: String? = nil
 
+    @State private var isRestartingDaemon: Bool = false
+
     /// Drives the per-row "elapsed timer" updates without polling the service.
     @State private var tick = Date()
     private let tickTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -173,7 +175,14 @@ struct ActivityPage: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                gateBanner
+                // When we have a service error AND no snapshot yet, the
+                // gateBanner would otherwise display a spurious
+                // "Loading activity…" header right next to the error
+                // banner. Hide the gate banner in that case so the error
+                // is the only thing the user has to act on.
+                if !(service.lastError != nil && snapshot == nil) {
+                    gateBanner
+                }
                 if let err = service.lastError {
                     errorBanner(err)
                 }
@@ -245,6 +254,34 @@ struct ActivityPage: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer()
             Button {
+                Task { await restartDaemon() }
+            } label: {
+                HStack(spacing: 4) {
+                    if isRestartingDaemon {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.6)
+                        Text("Restarting…")
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .scaledFont(size: 11)
+                        Text("Restart daemon")
+                    }
+                }
+                .scaledFont(size: 11, weight: .medium)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(.borderless)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(OmiColors.backgroundPrimary.opacity(0.7))
+            )
+            .disabled(isRestartingDaemon)
+            .accessibilityLabel("Restart daemon")
+            .accessibilityIdentifier("activity_error_restart_button")
+
+            Button {
                 service.clearLastError()
             } label: {
                 Image(systemName: "xmark")
@@ -264,6 +301,55 @@ struct ActivityPage: View {
                 )
         )
         .accessibilityIdentifier("activity_error_banner")
+    }
+
+    /// Kickstart the launchd-managed Rust daemon, hold the "Restarting…"
+    /// state for ~2 s so the button isn't pummelled in tight clicks, then
+    /// re-fetch the snapshot. The token-file poll inside `activityHeaders`
+    /// (LocalDaemonToken.read(waitFor:)) covers the brief window between
+    /// the daemon restarting and api-token.txt being rewritten.
+    private func restartDaemon() async {
+        guard !isRestartingDaemon else { return }
+        isRestartingDaemon = true
+        defer { isRestartingDaemon = false }
+
+        let uid = String(getuid())
+
+        // Run launchctl off the MainActor so the spinner doesn't freeze
+        // while we wait on the subprocess.
+        let result: (exitCode: Int32, stderr: String) = await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            process.arguments = [
+                "kickstart", "-k", "gui/\(uid)/com.infiniterecall.api",
+            ]
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                let text = String(data: data, encoding: .utf8) ?? ""
+                return (process.terminationStatus, text)
+            } catch {
+                return (-1, error.localizedDescription)
+            }
+        }.value
+
+        if result.exitCode != 0 {
+            Self.log.error(
+                "launchctl kickstart failed: code=\(result.exitCode, privacy: .public) stderr=\(result.stderr, privacy: .public)"
+            )
+            service.setLastError(
+                "Restart failed: launchctl exited \(result.exitCode). Try ./setup-api-server.sh from a Terminal."
+            )
+            return
+        }
+
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+
+        service.clearLastError()
+        await service.refreshNow()
     }
     // === /activity:C3 ===
 

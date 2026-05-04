@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Build & install the local Infinite Recall REST API as a launchd agent.
 #
-# Mirrors the mlx-lm sidecar pattern. Idempotent: re-run after rebuilds to
-# bounce the agent.
+# Mirrors the mlx-lm sidecar pattern. Idempotent: re-run after rebuilds.
 #
 # When invoked by the in-app installer (Swift LocalAIInstaller), the script
-# emits structured `PROGRESS:` lines on stdout. In that mode the binary is
-# installed into `~/Library/Application Support/InfiniteRecall/bin/` to avoid
-# sudo prompts. Pass --yes / set INFINITE_RECALL_AUTO_CONFIRM=1 to opt in.
+# emits structured `PROGRESS:` lines on stdout. The binary always installs
+# to `/usr/local/bin/` — never inside ~/Library/Application Support/ — so a
+# wipe of app state (schema migration, manual reset, etc.) does not delete
+# the daemon binary out from under launchd. Pass --yes /
+# INFINITE_RECALL_AUTO_CONFIRM=1 to skip the sudo prompt confirmation.
 set -euo pipefail
+
+# Emit a `failed` step on any early exit so the calling Swift LocalAIInstaller
+# stops waiting for a "done" message and surfaces the error to the user.
+trap 'rc=$?; if [ $rc -ne 0 ]; then printf "PROGRESS:STEP=failed\n"; fi' EXIT
 
 BIN_NAME="infinite-recall-api"
 CLI_BIN_NAME="recall"
@@ -28,14 +33,18 @@ for arg in "$@"; do
   esac
 done
 
-# When running headless from the app, install to user dir (no sudo).
-if [ "${AUTO_CONFIRM}" = "1" ]; then
-    INSTALL_DIR="$HOME/Library/Application Support/InfiniteRecall/bin"
-else
-    INSTALL_DIR="/usr/local/bin"
-fi
+INSTALL_DIR="/usr/local/bin"
 
 progress() { printf "PROGRESS:%s\n" "$1"; }
+
+# Headless safety: if AUTO_CONFIRM=1 and we'd need sudo but sudo would
+# prompt, fail loudly instead of hanging the in-app installer on a TTY
+# password prompt that nobody can see.
+if [ "$AUTO_CONFIRM" = "1" ] && [ ! -w "$INSTALL_DIR" ] && ! sudo -n true 2>/dev/null; then
+    progress "STEP=needs_sudo"
+    echo "ERROR: $INSTALL_DIR not writable and sudo would prompt — re-run with passwordless sudo arranged" >&2
+    exit 2
+fi
 
 progress "STEP=checking_prereqs"
 if ! command -v cargo >/dev/null 2>&1; then
@@ -61,21 +70,19 @@ fi
 
 progress "STEP=installing_launchd"
 echo "==> Installing $BIN_NAME to $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
-if [ "${AUTO_CONFIRM}" = "1" ]; then
-    install -m 0755 "$BUILT" "$INSTALL_DIR/$BIN_NAME"
-    install -m 0755 "$BUILT_CLI" "$INSTALL_DIR/$CLI_BIN_NAME"
+if [ -w "$INSTALL_DIR" ]; then
+    INSTALL="install"
 else
-    sudo install -m 0755 "$BUILT" "$INSTALL_DIR/$BIN_NAME"
-    sudo install -m 0755 "$BUILT_CLI" "$INSTALL_DIR/$CLI_BIN_NAME"
+    INSTALL="sudo install"
 fi
+$INSTALL -d -m 0755 "$INSTALL_DIR"
+$INSTALL -m 0755 "$BUILT" "$INSTALL_DIR/$BIN_NAME"
+$INSTALL -m 0755 "$BUILT_CLI" "$INSTALL_DIR/$CLI_BIN_NAME"
 echo "==> Installed $CLI_BIN_NAME to $INSTALL_DIR/$CLI_BIN_NAME"
 
 echo "==> Installing launchd plist to $TARGET_PLIST"
 mkdir -p "$LAUNCH_DIR"
-# Render the plist with the actual binary path (so user-dir installs work).
-sed -e "s|/usr/local/bin/${BIN_NAME}|${INSTALL_DIR}/${BIN_NAME}|g" \
-    "$SOURCE_PLIST" > "$TARGET_PLIST"
+install -m 0644 "$SOURCE_PLIST" "$TARGET_PLIST"
 
 # Reload (unload if present, then load). Tolerate missing.
 progress "STEP=starting_service"
