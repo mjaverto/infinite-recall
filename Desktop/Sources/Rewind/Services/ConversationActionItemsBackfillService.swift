@@ -179,6 +179,7 @@ actor ConversationActionItemsBackfillService {
             SELECT s.id FROM transcription_sessions AS s
              WHERE s.finishedAt IS NOT NULL
                AND s.deleted = 0
+               AND s.discarded = 0
                AND s.action_items_extracted_at IS NULL
                AND EXISTS (
                    SELECT 1 FROM transcription_segments seg

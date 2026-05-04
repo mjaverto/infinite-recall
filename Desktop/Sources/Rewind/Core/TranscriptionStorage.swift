@@ -688,38 +688,77 @@ actor TranscriptionStorage {
         }
     }
 
-    /// Hard-delete a single empty Short Recording conversation (and its
-    /// segments + audio chunks) atomically. Used by the auto-delete path for
-    /// `summary_state='unavailable'` rows that are local-only and never sync.
+    /// Soft-discard a single empty conversation by flipping `discarded=1` and
+    /// recording the reason + timestamp. Replaces the previous hard-DELETE
+    /// implementation, which destroyed user data when summarize raced ahead
+    /// of the now-async transcribe job (PR #79 + #86 regression).
     ///
-    /// All mutations run inside a single GRDB transaction so we never end up
-    /// with orphaned segments or chunks if the process dies mid-delete.
-    ///
-    /// Note: `audio_chunks` stores raw PCM directly as a blob (`pcm` column);
-    /// there is no separate on-disk audio file path to unlink. Deleting the
-    /// row is sufficient to remove the audio bytes.
+    /// The conversation list, RAG, and chat tools all already filter on
+    /// `discarded`, so a soft-discarded row disappears from the user's view
+    /// the same way a hard-deleted one did — but the audio_chunks + segments
+    /// stay intact so a future recovery UI can restore the row.
     ///
     /// - Parameters:
     ///   - id: session id to discard
-    ///   - reason: short tag included in the log line for traceability
+    ///   - reason: short tag persisted in `discard_reason` and the log line
     func discardEmptySession(id: Int64, reason: String) async throws {
         let db = try await ensureInitialized()
 
-        log("TranscriptionStorage: Discarding empty session \(id) — reason=\(reason)")
+        log("TranscriptionStorage: Soft-discarding session \(id) — reason=\(reason)")
 
+        let now = Date()
         try await db.write { database in
             try database.execute(
-                sql: "DELETE FROM audio_chunks WHERE transcriptionSessionId = ?",
-                arguments: [id]
-            )
-            // transcription_segments rows cascade via FK on transcription_sessions delete.
-            try database.execute(
-                sql: "DELETE FROM transcription_sessions WHERE id = ?",
-                arguments: [id]
+                sql: """
+                    UPDATE transcription_sessions
+                       SET discarded = 1,
+                           discard_reason = ?,
+                           discarded_at = ?,
+                           summary_state = 'unavailable',
+                           updatedAt = ?
+                     WHERE id = ?
+                    """,
+                arguments: [reason, now, now, id]
             )
         }
+    }
 
-        log("Auto-deleted empty conversation \(id) — reason=\(reason)")
+    /// Returns true when the `.transcribe` work for `sessionId` has reached
+    /// a terminal state — i.e. there is no `queued`, `claimed`, or `failed`
+    /// pending_work row for that session's transcribe dedup key.
+    ///
+    /// Used by the summarize path to defer auto-discarding empty transcripts
+    /// while transcribe is still in-flight. `done`/`dead` rows count as
+    /// terminal; missing rows also count as terminal (the transcribe job
+    /// either drained, was never enqueued, or was hand-cleaned). `failed`
+    /// rows are explicitly NOT terminal — `PendingWorkStorage` claims work
+    /// with `status IN ('queued', 'failed')` and the dedup partial unique
+    /// index treats `failed` as part of the active set, so a `failed` row is
+    /// awaiting backoff/retry and the transcribe attempt can still recover.
+    ///
+    /// Dedup key matches `ConversationTranscribeBackfillService.dedupKey(for:)`
+    /// — kept inline rather than imported to avoid a circular dep on the
+    /// backfill service. `PendingWork.Kind` itself lives in `Core` and is
+    /// safely shared across the module, so we use its rawValue constant
+    /// instead of a literal string.
+    func transcribeIsTerminal(sessionId: Int64) async throws -> Bool {
+        let db = try await ensureInitialized()
+        let workType = PendingWork.Kind.transcribe.rawValue
+        let dedupKey = "\(workType):\(sessionId)"
+
+        let activeCount: Int = try await db.read { database in
+            try Int.fetchOne(
+                database,
+                sql: """
+                    SELECT COUNT(*) FROM pending_work
+                     WHERE workType = ?
+                       AND dedupKey = ?
+                       AND status IN ('queued', 'claimed', 'failed')
+                    """,
+                arguments: [workType, dedupKey]
+            ) ?? 0
+        }
+        return activeCount == 0
     }
 
     /// Fetch the first segment's text per session in a single SQL pass.

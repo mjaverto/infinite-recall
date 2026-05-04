@@ -119,6 +119,7 @@ actor ConversationTranscribeBackfillService {
             SELECT s.id FROM transcription_sessions AS s
              WHERE s.finishedAt IS NOT NULL
                AND s.deleted = 0
+               AND s.discarded = 0
                AND NOT EXISTS (
                    SELECT 1 FROM transcription_segments seg
                     WHERE seg.sessionId = s.id
