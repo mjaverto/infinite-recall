@@ -198,13 +198,20 @@ actor ConversationSummaryBackfillService {
         log("ConversationSummaryBackfillService: marked backfill needed (\(reason))")
     }
 
-    /// One-time sweep: convert pre-existing "Short Recording" placeholder
-    /// sessions into discarded/empty rows so the conversations list stops
-    /// showing legacy noise from the old short-transcript path. Idempotent
-    /// via the `irEmptyShortRecordingBackfillCompletedV1` UserDefaults flag —
-    /// safe to call on every launch.
+    /// One-time sweep: soft-discard pre-existing rows that are genuinely
+    /// empty (no transcription segments) and were marked unavailable by the
+    /// summary-state migration. Soft-discard via the rewritten
+    /// `discardEmptySession`, so rows land in the recovery panel and stay
+    /// recoverable.
+    ///
+    /// V2 supersedes V1, which keyed off `title = 'Short Recording'` — that
+    /// title was a catch-all placeholder that ate sessions far longer than
+    /// 2-second blips. V2 only sweeps rows with zero segments, so a session
+    /// with real transcript content but an unfortunate title is left alone.
+    /// We bump the flag so machines that completed V1 re-run with the
+    /// safer V2 rules. Idempotent — safe to call on every launch.
     func backfillDiscardEmptyShortRecordingsOnce() async {
-        let flagKey = "irEmptyShortRecordingBackfillCompletedV1"
+        let flagKey = "irEmptyShortRecordingBackfillCompletedV2"
         guard !UserDefaults.standard.bool(forKey: flagKey) else {
             return
         }
@@ -214,11 +221,18 @@ actor ConversationSummaryBackfillService {
             return
         }
 
+        // Only rows that are genuinely empty (no segments) AND already marked
+        // unavailable. Drops the V1 title='Short Recording' criterion — that
+        // was over-aggressive — and replaces it with a hard structural check.
         let sql = """
             SELECT id FROM transcription_sessions
              WHERE deleted = 0
+               AND discarded = 0
                AND summary_state = 'unavailable'
-               AND title = 'Short Recording'
+               AND (
+                   SELECT COUNT(*) FROM transcription_segments seg
+                    WHERE seg.sessionId = transcription_sessions.id
+               ) = 0
             """
 
         let ids: [Int64]
@@ -245,6 +259,9 @@ actor ConversationSummaryBackfillService {
 
         if failures == 0 {
             UserDefaults.standard.set(true, forKey: flagKey)
+            // V1 flag is obsolete after V2 sweep — clear it to avoid stale
+            // keys accumulating across future Vn bumps.
+            UserDefaults.standard.removeObject(forKey: "irEmptyShortRecordingBackfillCompletedV1")
             log("ConversationSummaryBackfillService: discard-empty backfill complete — processed \(ids.count) row(s)")
         } else {
             log("ConversationSummaryBackfillService: discard-empty backfill partial — \(ids.count - failures) ok, \(failures) failed; will retry next launch")
@@ -339,10 +356,20 @@ actor ConversationSummaryBackfillService {
         let sessionId = row.id
         let transcript = row.transcript
 
-        // Short transcript → discard the empty session entirely instead of
+        // Short transcript → soft-discard the empty session instead of
         // writing a "Short Recording" placeholder. Empty short recordings
-        // are noise in the conversations list; surface them as deleted.
+        // are noise in the conversations list; surface them as discarded.
+        //
+        // BUT: PR #79 made transcribe an enqueued job, so summarize can fire
+        // before any segments exist on a freshly-finished recording. Defer
+        // when transcribe is still queued/claimed — otherwise we'd discard
+        // every recording that takes longer to transcribe than to summarize.
         guard transcript.count >= Self.minTranscriptLength else {
+            let isTerminal = try await TranscriptionStorage.shared.transcribeIsTerminal(sessionId: sessionId)
+            guard isTerminal else {
+                log("ConversationSummaryBackfillService: session \(sessionId) transcript empty but transcribe not terminal — deferring (\(mode))")
+                return .deferred
+            }
             log("ConversationSummaryBackfillService: session \(sessionId) transcript too short (\(transcript.count) chars), discarding empty session (\(mode))")
             try await TranscriptionStorage.shared.discardEmptySession(id: sessionId, reason: "short_transcript")
             await notifyConversationListNeedsRefresh()

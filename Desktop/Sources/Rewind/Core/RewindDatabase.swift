@@ -2530,6 +2530,30 @@ actor RewindDatabase {
                 """)
         }
 
+        // Soft-discard metadata: replaces hard-DELETE in `discardEmptySession`
+        // so user data survives the summarize/transcribe race and a future
+        // recovery UI can list + restore auto-discarded rows. No backfill —
+        // pre-existing rows keep null reason/timestamp.
+        migrator.registerMigration("addDiscardMetadataColumns") { db in
+            // Be idempotent: a fork or partial migration may have added
+            // either column already.
+            let info = try Row.fetchAll(db, sql: "PRAGMA table_info(transcription_sessions)")
+            let existingColumns = Set(info.compactMap { ($0["name"] as String?) })
+
+            if !existingColumns.contains("discard_reason") {
+                try db.execute(sql: """
+                    ALTER TABLE transcription_sessions
+                      ADD COLUMN discard_reason TEXT
+                    """)
+            }
+            if !existingColumns.contains("discarded_at") {
+                try db.execute(sql: """
+                    ALTER TABLE transcription_sessions
+                      ADD COLUMN discarded_at DATETIME
+                    """)
+            }
+        }
+
         migrator.registerMigration("createKGProvenanceAndExtractionStatus") { db in
             try db.create(table: "local_kg_node_sources") { t in
                 t.column("memoryId", .integer).notNull()
