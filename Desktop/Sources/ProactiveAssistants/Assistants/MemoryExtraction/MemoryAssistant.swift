@@ -21,6 +21,11 @@ actor MemoryAssistant: ProactiveAssistant {
     private var lastAnalysisTime: Date = .distantPast
     private var previousMemories: [ExtractedMemory] = [] // Last 20 extracted memories for deduplication
     private let maxPreviousMemories = 20
+    /// Tracks whether `previousMemories` has been seeded from SQLite for the
+    /// current process. Without this, the dedup buffer starts empty on every
+    /// app launch, causing already-stored memories to be re-extracted until
+    /// 20 fresh extractions accumulate (issue #121).
+    private var didSeedPreviousMemories = false
     private var currentApp: String?
     private var pendingFrame: CapturedFrame?
     private var processingTask: Task<Void, Never>?
@@ -340,6 +345,12 @@ actor MemoryAssistant: ProactiveAssistant {
             return
         }
 
+        // Seed dedup buffer from SQLite on first analysis after launch (#121).
+        // The in-memory `previousMemories` list is otherwise empty after every
+        // restart, allowing the LLM to re-extract memories that already exist
+        // until 20 fresh extractions naturally accumulate.
+        await seedPreviousMemoriesIfNeeded()
+
         log("Memory: Analyzing frame from \(frame.appName)...")
         do {
             guard let result = try await extractMemories(from: frame.jpegData, appName: frame.appName) else {
@@ -357,6 +368,48 @@ actor MemoryAssistant: ProactiveAssistant {
             }
         } catch {
             logError("Memory extraction error", error: error)
+        }
+    }
+
+    /// Hydrate the dedup buffer from SQLite the first time we run after
+    /// launch. Pulls the most recent `maxPreviousMemories` non-deleted /
+    /// non-dismissed memories from the local store and projects them into
+    /// `ExtractedMemory` shape so the prompt-formatting code stays unchanged.
+    /// Idempotent — guarded by `didSeedPreviousMemories`.
+    private func seedPreviousMemoriesIfNeeded() async {
+        guard !didSeedPreviousMemories else { return }
+        // Only the auto-extracted categories the LLM produces are useful
+        // dedup signal here; manual entries and tip/focus memories don't
+        // share the same prompt vocabulary.
+        do {
+            let recent = try await MemoryStorage.shared.getLocalMemories(
+                limit: maxPreviousMemories,
+                offset: 0
+            )
+            // Already ordered by createdAt DESC (newest first), matching
+            // the in-memory insert-at-front semantics in `handleResultWithScreenshot`.
+            let seeded: [ExtractedMemory] = recent.compactMap { server in
+                let category: ExtractedMemoryCategory
+                switch server.category {
+                case .interesting: category = .interesting
+                case .system, .manual: category = .system
+                }
+                return ExtractedMemory(
+                    content: server.content,
+                    category: category,
+                    sourceApp: server.sourceApp ?? "",
+                    confidence: server.confidence ?? 1.0
+                )
+            }
+            previousMemories = seeded
+            didSeedPreviousMemories = true
+            log("Memory: Seeded dedup buffer with \(seeded.count) recent memories from SQLite")
+        } catch {
+            // If the seed fails (DB not yet initialized, etc.) we still mark
+            // as seeded to avoid hammering on every frame; the next launch
+            // will retry. Behaviour degrades to the old (empty-buffer) path.
+            didSeedPreviousMemories = true
+            logError("Memory: Failed to seed dedup buffer from SQLite", error: error)
         }
     }
 
