@@ -52,9 +52,15 @@ actor TaskAssistant: ProactiveAssistant {
 
     /// Parse an inferred deadline string into a Date, or default to end of today.
     /// Tries ISO8601, then common natural language patterns.
+    ///
+    /// #124: When the model emits no `inferred_deadline` (nil or empty), the
+    /// Tasks doc promises the task defaults to end-of-day so it lands in the
+    /// *Today* bucket. Previously this branch returned `nil` and the task was
+    /// silently bucketed under *No Deadline*. We now fall back to
+    /// `Self.endOfToday()` to match the documented behavior.
     private func parseDueDate(from inferredDeadline: String?) -> Date? {
         guard let deadline = inferredDeadline, !deadline.isEmpty else {
-            return nil
+            return Self.endOfToday()
         }
         let startOfToday = Calendar.current.startOfDay(for: Date())
 
