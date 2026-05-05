@@ -114,23 +114,26 @@ final class InternalPostFailureTrackerTests: XCTestCase {
   func test_perCategoryIsolation() {
     tracker.reportFailure(.inflight)
     tracker.reportFailure(.inflight)
-    tracker.reportFailure(.queueDepth)
+    tracker.reportFailure(.gateState)
     XCTAssertEqual(tracker.failureCount(.inflight), 2)
-    XCTAssertEqual(tracker.failureCount(.queueDepth), 1)
-    XCTAssertEqual(tracker.failureCount(.gateState), 0)
+    XCTAssertEqual(tracker.failureCount(.gateState), 1)
     XCTAssertNil(reporter.lastError)
 
     tracker.reportSuccess(.inflight)
     XCTAssertEqual(tracker.failureCount(.inflight), 0)
     XCTAssertEqual(
-      tracker.failureCount(.queueDepth), 1,
+      tracker.failureCount(.gateState), 1,
       "success on one category must not reset another")
   }
 
   func test_categoryRawValuesMatchWireFormat() {
     XCTAssertEqual(InternalPostFailureTracker.Category.inflight.rawValue, "inflight")
-    XCTAssertEqual(InternalPostFailureTracker.Category.queueDepth.rawValue, "queue-depth")
     XCTAssertEqual(InternalPostFailureTracker.Category.gateState.rawValue, "gate-state")
+    // Issue #137: `queueDepth` category pruned — Activity snapshots are
+    // DB-authoritative; no Swift producer existed.
+    XCTAssertEqual(
+      InternalPostFailureTracker.Category.allCases.count, 2,
+      "only inflight + gate-state remain after #137 prune")
   }
 
   // MARK: - Fix 6 — new tests
@@ -161,8 +164,10 @@ final class InternalPostFailureTrackerTests: XCTestCase {
   }
 
   /// Each category's escalation re-arms independently of the others:
-  /// escalating .inflight, succeeding, escalating .queueDepth, and
-  /// succeeding must all fire fresh banners.
+  /// escalating .inflight, succeeding, escalating .gateState, and
+  /// succeeding must all fire fresh banners. Issue #137: this used to
+  /// pivot through `.queueDepth` but that category was pruned along with
+  /// the legacy Swift→Rust queue-depth POST.
   func test_reArm_perCategory_independent() {
     // Escalate .inflight.
     tracker.reportFailure(.inflight)
@@ -175,16 +180,16 @@ final class InternalPostFailureTrackerTests: XCTestCase {
     tracker.reportSuccess(.inflight)
     reporter.clearLastError()
 
-    // Escalate .queueDepth.
-    tracker.reportFailure(.queueDepth)
-    tracker.reportFailure(.queueDepth)
-    tracker.reportFailure(.queueDepth)
-    let qBanner = reporter.lastError
-    XCTAssertNotNil(qBanner)
-    XCTAssertTrue(qBanner?.contains("queue-depth") == true, "got: \(qBanner ?? "<nil>")")
+    // Escalate .gateState.
+    tracker.reportFailure(.gateState)
+    tracker.reportFailure(.gateState)
+    tracker.reportFailure(.gateState)
+    let gBanner = reporter.lastError
+    XCTAssertNotNil(gBanner)
+    XCTAssertTrue(gBanner?.contains("gate-state") == true, "got: \(gBanner ?? "<nil>")")
 
-    // Success on .queueDepth + clear banner.
-    tracker.reportSuccess(.queueDepth)
+    // Success on .gateState + clear banner.
+    tracker.reportSuccess(.gateState)
     reporter.clearLastError()
 
     // Re-escalate .inflight again — must fire fresh.

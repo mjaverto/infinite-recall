@@ -295,7 +295,8 @@ public final class BatteryAwareScheduler: ObservableObject {
     self.lastAutonomousAllow = self.allowAutonomousAIWork
 
     // Queue depth is read from `pending_work` by Activity snapshots; no
-    // Swift→Rust queue-depth bridge is needed here.
+    // Swift→Rust queue-depth bridge exists. Issue #137: the legacy
+    // `_internal/queue-depth` route + tracker category were pruned.
   }
 
   /// Stop watching for transitions. Mainly for tests.

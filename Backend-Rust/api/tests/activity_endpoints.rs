@@ -686,8 +686,10 @@ async fn inflight_loopback_round_trip() {
 }
 
 /// Activity queue counts are DB-authoritative: `/snapshot` reads
-/// `pending_work` directly and ignores the legacy `_internal/queue-depth`
-/// push payload.
+/// `pending_work` directly. Issue #137: the legacy
+/// `POST /v1/activity/_internal/queue-depth` route was pruned (no Swift
+/// producer); the test now also asserts the route is gone (404) so a
+/// future re-introduction is caught.
 #[tokio::test]
 async fn queue_depth_snapshot_reads_pending_work_not_loopback_cache() {
     let state = make_state(
@@ -716,7 +718,9 @@ async fn queue_depth_snapshot_reads_pending_work_not_loopback_cache() {
     let app = routes::router(state);
     let (k, v) = auth_header();
 
-    // Legacy push is accepted but must not override DB truth.
+    // Issue #137: the legacy `_internal/queue-depth` route is gone. POSTing
+    // to it must return 404 — a regression that re-adds the handler will
+    // fail this assertion.
     let body = json!({
         "depths": {
             "transcribe": { "queued": 99, "failed": 99 },
@@ -731,7 +735,11 @@ async fn queue_depth_snapshot_reads_pending_work_not_loopback_cache() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "legacy `_internal/queue-depth` route must stay pruned (issue #137)"
+    );
 
     let snap_req = Request::builder()
         .method(Method::GET)

@@ -11,12 +11,18 @@ protocol InternalPostFailureReporter: AnyObject {
     func reportInternalPostFailure(category: String, consecutive: Int)
 }
 
-/// Tracks consecutive failures of `_internal/*` POSTs (inflight, queue-depth,
-/// gate-state) so the user gets a banner when internal reporting is silently
-/// broken. Each category has its own counter; hitting `escalationThreshold`
+/// Tracks consecutive failures of `_internal/*` POSTs (inflight, gate-state)
+/// so the user gets a banner when internal reporting is silently broken.
+/// Each category has its own counter; hitting `escalationThreshold`
 /// consecutive failures fires once into the attached
 /// `InternalPostFailureReporter` (`ActivityMonitorService` in production).
 /// A subsequent success resets the counter and re-arms escalation.
+///
+/// Issue #137: the `queueDepth` category was pruned. Activity snapshots are
+/// now DB-authoritative (`snapshotWithAuthoritativeQueueDepth` reads
+/// `pending_work` directly), so the legacy Swift→Rust queue-depth POST has
+/// no producer and the legacy Rust `_internal/queue-depth` route was
+/// removed alongside it.
 @MainActor
 final class InternalPostFailureTracker {
     static let shared = InternalPostFailureTracker()
@@ -32,7 +38,6 @@ final class InternalPostFailureTracker {
 
     enum Category: String, CaseIterable {
         case inflight
-        case queueDepth = "queue-depth"
         case gateState = "gate-state"
     }
 
