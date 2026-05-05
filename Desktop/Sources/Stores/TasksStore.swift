@@ -1415,10 +1415,23 @@ class TasksStore: ObservableObject {
                 priority: task.priority,
                 category: task.category,
                 metadata: metadataDict,
-                recurrenceRule: task.recurrenceRule
+                recurrenceRule: task.recurrenceRule,
+                recurrenceParentId: task.recurrenceParentId
             )
             // Update local record with new backend ID
             try await ActionItemStorage.shared.syncTaskActionItems([created])
+            // CodeRabbit (PR #144): the in-memory array still holds the
+            // old `task` with the deleted backend ID after step 2. Without
+            // this swap, edit/toggle/delete on the restored row would call
+            // the backend with an ID that no longer exists. Replace the
+            // stale entry with the freshly-created backend record.
+            if task.completed {
+                if let idx = completedTasks.firstIndex(where: { $0.id == task.id }) {
+                    completedTasks[idx] = created
+                }
+            } else if let idx = incompleteTasks.firstIndex(where: { $0.id == task.id }) {
+                incompleteTasks[idx] = created
+            }
             log("TasksStore: Restored task via undo (new backend ID: \(created.id))")
         } catch {
             logError("TasksStore: Failed to re-create task on backend (local restore preserved)", error: error)

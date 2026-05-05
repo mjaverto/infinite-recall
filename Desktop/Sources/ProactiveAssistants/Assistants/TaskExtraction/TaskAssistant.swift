@@ -53,13 +53,17 @@ actor TaskAssistant: ProactiveAssistant {
     /// Parse an inferred deadline string into a Date, or default to end of today.
     /// Tries ISO8601, then common natural language patterns.
     ///
-    /// #124: When the model emits no `inferred_deadline` (nil or empty), the
-    /// Tasks doc promises the task defaults to end-of-day so it lands in the
-    /// *Today* bucket. Previously this branch returned `nil` and the task was
-    /// silently bucketed under *No Deadline*. We now fall back to
-    /// `Self.endOfToday()` to match the documented behavior.
+    /// #124: When the model emits no `inferred_deadline` (nil, empty, or
+    /// whitespace-only), the Tasks doc promises the task defaults to
+    /// end-of-day so it lands in the *Today* bucket. Previously this branch
+    /// returned `nil` and the task was silently bucketed under *No Deadline*.
+    /// We now fall back to `Self.endOfToday()` to match the documented
+    /// behavior. Whitespace-only inputs (`"   "`) are treated as missing per
+    /// CodeRabbit feedback on PR #144 — they should follow the same fallback
+    /// path as `nil` / `""`, not get passed to the parsers.
     private func parseDueDate(from inferredDeadline: String?) -> Date? {
-        guard let deadline = inferredDeadline, !deadline.isEmpty else {
+        let trimmed = inferredDeadline?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let deadline = trimmed, !deadline.isEmpty else {
             return Self.endOfToday()
         }
         let startOfToday = Calendar.current.startOfDay(for: Date())
