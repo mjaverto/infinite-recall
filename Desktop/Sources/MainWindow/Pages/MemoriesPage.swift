@@ -946,11 +946,20 @@ struct MemoriesPage: View {
       header
 
       // Content
-      if viewModel.isLoading && viewModel.memories.isEmpty {
+      //
+      // The empty-state branch must use `totalMemoriesCount` (mirrored from
+      // SQLite) rather than `memories.isEmpty`, otherwise the page flashes
+      // "No Memories Yet" during the cache-fetch window when the user opens
+      // the page already-filtered (#133). When a filter is active and matches
+      // nothing we want the no-results view, even if `memories` happens to be
+      // empty in that early window.
+      if viewModel.isLoading && viewModel.filteredMemories.isEmpty
+        && viewModel.memories.isEmpty
+      {
         loadingView
       } else if let error = viewModel.errorMessage {
         errorView(error)
-      } else if viewModel.memories.isEmpty {
+      } else if viewModel.totalMemoriesCount == 0 && !viewModel.isInFilteredMode {
         emptyState
       } else if viewModel.filteredMemories.isEmpty {
         noResultsView
