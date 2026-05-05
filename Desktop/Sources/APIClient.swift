@@ -365,7 +365,7 @@ enum APIError: LocalizedError {
       return "Local-only mode"
     case .daemonNotConfigured:
       return
-        "Infinite Recall daemon URL not configured (IR_API_URL is unset). Run scripts/run.sh to regenerate .env.app."
+        "Infinite Recall daemon URL not configured (IR_API_URL is unset). Run ./run.sh to regenerate .env.app."
     }
   }
 }

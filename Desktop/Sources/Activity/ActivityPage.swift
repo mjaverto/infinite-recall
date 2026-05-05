@@ -382,7 +382,8 @@ struct ActivityPage: View {
         // a daemon-related error organically on its next snapshot anyway.
         if let current = service.lastError,
            current.contains("daemon token unavailable")
-            || current.hasPrefix("snapshot failed:") {
+            || current.hasPrefix("snapshot failed:")
+            || current == APIError.daemonNotConfigured.localizedDescription {
             service.clearLastError()
         }
         await service.refreshNow()
