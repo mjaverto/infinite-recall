@@ -579,14 +579,28 @@ struct ConversationDetailView: View {
         isDeleting = true
         defer { isDeleting = false }
 
+        // Local-first: soft-delete in SQLite immediately so reload doesn't restore the row.
+        // Without this, `getLocalConversations` will re-surface the conversation on the
+        // next page revisit / app relaunch (the API delete is a no-op in local-only mode).
+        do {
+            try await TranscriptionStorage.shared.deleteByBackendId(conversation.id)
+        } catch {
+            log("Failed to soft-delete conversation locally: \(error)")
+        }
+
         do {
             try await APIClient.shared.deleteConversation(id: conversation.id)
-            await MainActor.run {
-                onDelete?()
-                onBack()
-            }
         } catch {
-            logError("Failed to delete conversation", error: error)
+            // localOnlyMode is expected here in the Infinite Recall fork; the SQLite
+            // soft-delete above is the source of truth. Surface only real failures.
+            if !isLocalOnlyError(error) {
+                logError("Failed to delete conversation", error: error)
+            }
+        }
+
+        await MainActor.run {
+            onDelete?()
+            onBack()
         }
     }
 
