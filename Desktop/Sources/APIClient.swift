@@ -19,12 +19,16 @@ actor APIClient {
   // chat AI, and title generation are on Python.
   // Set via IR_API_URL env var (in .env).
   //
-  // Throws `APIError.daemonNotConfigured` when `IR_API_URL` is unset so a
-  // missing daemon configuration surfaces as a clear UI banner (via
-  // `ActivityMonitorService.lastError`) instead of cascading into a
-  // misleading HTTP 404 / "Invalid response from server". Display-only
-  // call sites (e.g. `SettingsPage`) that don't actually issue HTTP can
-  // use `try?` and fall back to "" — they just won't render a Rust URL.
+  // When `IR_API_URL` is unset, defaults to the canonical local-daemon bind
+  // (`http://127.0.0.1:7331`, matching run.sh / scripts/com.infiniterecall.api.plist).
+  // The default is applied here — NOT via `setenv` at app launch — so other
+  // call sites that probe `getenv("IR_API_URL")` as a "remote daemon
+  // configured" sentinel (APIKeyService.isProxyMode,
+  // FloatingBarVoicePlaybackService, GeminiClient) keep their existing
+  // local-fallback behavior when no .env override is present.
+  //
+  // `daemonNotConfigured` remains as a defensive throw for the case where
+  // IR_API_URL is set to something that fails to parse downstream.
   var rustBackendURL: String {
     get throws {
       // First check getenv() for values set by setenv() in loadEnvironment()
@@ -38,8 +42,8 @@ actor APIClient {
         let normalized = envURL.hasSuffix("/") ? envURL : envURL + "/"
         return normalized
       }
-      NSLog("OMI API: IR_API_URL not set — Rust backend calls will fail")
-      throw APIError.daemonNotConfigured
+      NSLog("[APIClient] IR_API_URL not set; defaulting to local daemon http://127.0.0.1:7331")
+      return "http://127.0.0.1:7331/"
     }
   }
 

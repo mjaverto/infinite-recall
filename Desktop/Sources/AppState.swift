@@ -505,12 +505,6 @@ class AppState: ObservableObject {
       }
     }
 
-    // Default IR_API_URL to the canonical local-daemon bind (run.sh:67 / scripts/com.infiniterecall.api.plist:28) so APIClient/APIKeyService/FloatingBarVoicePlaybackService/GeminiClient see consistent state.
-    if getenv("IR_API_URL") == nil {
-      setenv("IR_API_URL", "http://127.0.0.1:7331", 1)
-      log("  Defaulted IR_API_URL=http://127.0.0.1:7331 (no .env override found)")
-    }
-
     log("Environment loaded (API keys will be fetched from backend after auth)")
   }
 
