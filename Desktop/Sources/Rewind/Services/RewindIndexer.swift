@@ -715,9 +715,17 @@ actor RewindIndexer {
 
     /// Extract frame metadata from a video chunk
     private func extractFramesFromChunk(_ chunkInfo: VideoChunkInfo) async throws -> [FrameMetadata] {
-        // Parse the chunk filename to extract timestamp info
-        // Format: chunk_YYYYMMDD_HHMMSS.hevc
-        guard let timestamp = parseChunkTimestamp(chunkInfo.filename) else {
+        // Parse the chunk filename + parent day directory to extract timestamp.
+        // Encoder writes chunks at: <videosDir>/YYYY-MM-DD/chunk_HHmmss.mp4
+        // (See VideoChunkEncoder.generateChunkPath.) The parent directory of
+        // the chunk file carries the date; the filename carries the time.
+        let dayDirectory = chunkInfo.fullPath
+            .deletingLastPathComponent()
+            .lastPathComponent
+        guard let timestamp = Self.parseChunkTimestamp(
+            filename: chunkInfo.filename,
+            dayDirectory: dayDirectory
+        ) else {
             return []
         }
 
@@ -739,28 +747,52 @@ actor RewindIndexer {
         return frames
     }
 
-    /// Parse timestamp from chunk filename
-    private func parseChunkTimestamp(_ filename: String) -> Date? {
-        // Expected format: chunk_YYYYMMDD_HHMMSS.hevc
-        guard filename.hasPrefix("chunk_"),
-              filename.hasSuffix(".hevc"),
-              filename.count == 26 else { return nil }  // "chunk_" (6) + 8 + "_" (1) + 6 + ".hevc" (5) = 26
-
-        let startIndex = filename.index(filename.startIndex, offsetBy: 6)
-        let dateEndIndex = filename.index(startIndex, offsetBy: 8)
-        let timeStartIndex = filename.index(dateEndIndex, offsetBy: 1)
-        let timeEndIndex = filename.index(timeStartIndex, offsetBy: 6)
-
-        let dateStr = String(filename[startIndex..<dateEndIndex])
-        let timeStr = String(filename[timeStartIndex..<timeEndIndex])
-
-        // Validate that both parts are numeric
-        guard dateStr.allSatisfy({ $0.isNumber }),
-              timeStr.allSatisfy({ $0.isNumber }) else { return nil }
-
+    /// Cached DateFormatter for `parseChunkTimestamp`. `DateFormatter` is
+    /// expensive to construct, and rebuild loops over every on-disk chunk,
+    /// so we keep one instance pinned to a fixed POSIX locale to avoid
+    /// user-locale calendar drift on a fixed-format input. `nonisolated(unsafe)`
+    /// is safe here: `DateFormatter` is documented as thread-safe for
+    /// reads on macOS 10.9+, and we only ever read `.date(from:)` after
+    /// configuring it once at file-scope initialization.
+    nonisolated(unsafe) private static let chunkTimestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMddHHmmss"
-        return formatter.date(from: dateStr + timeStr)
+        formatter.dateFormat = "yyyy-MM-dd HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
+    /// Parse timestamp from chunk filename + parent day directory.
+    ///
+    /// Authoritative on-disk layout (see `VideoChunkEncoder.generateChunkPath`):
+    ///   <videosDirectory>/YYYY-MM-DD/chunk_HHmmss.mp4
+    ///
+    /// The date comes from the parent directory ("2026-05-04"); the time
+    /// comes from the filename ("chunk_153012.mp4"). A historical `.hevc`
+    /// extension is accepted so a rebuild of older installs still works.
+    ///
+    /// Internal so unit tests can drive it directly.
+    static func parseChunkTimestamp(filename: String, dayDirectory: String) -> Date? {
+        // Day directory: "YYYY-MM-DD" (10 chars, two dashes).
+        guard dayDirectory.count == 10 else { return nil }
+        let dateChars = Array(dayDirectory)
+        guard dateChars[4] == "-", dateChars[7] == "-" else { return nil }
+        let yyyy = String(dateChars[0..<4])
+        let mm = String(dateChars[5..<7])
+        let dd = String(dateChars[8..<10])
+        guard yyyy.allSatisfy({ $0.isNumber }),
+              mm.allSatisfy({ $0.isNumber }),
+              dd.allSatisfy({ $0.isNumber }) else { return nil }
+
+        // Filename: "chunk_HHmmss.<ext>" — accept .mp4 (current) or .hevc (legacy).
+        guard filename.hasPrefix("chunk_") else { return nil }
+        let nameNoPrefix = filename.dropFirst("chunk_".count)
+        guard let dotIndex = nameNoPrefix.firstIndex(of: ".") else { return nil }
+        let timeStr = String(nameNoPrefix[..<dotIndex])
+        let ext = String(nameNoPrefix[nameNoPrefix.index(after: dotIndex)...]).lowercased()
+        guard ext == "mp4" || ext == "hevc" else { return nil }
+        guard timeStr.count == 6, timeStr.allSatisfy({ $0.isNumber }) else { return nil }
+
+        return chunkTimestampFormatter.date(from: "\(yyyy)-\(mm)-\(dd) \(timeStr)")
     }
 
     /// Get frame count from video file using AVFoundation

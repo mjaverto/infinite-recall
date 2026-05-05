@@ -39,6 +39,84 @@ struct LiveTranscriptPanel: View {
     }
 }
 
+/// Historical transcript panel — renders the words spoken at the moment
+/// `frameTimestamp` was captured. Reads from `transcription_segments` via
+/// `RewindDatabase.transcriptSegments(around:window:)`.
+///
+/// Rewind doc promises: "A transcript area (expandable) showing what was
+/// being said at the moment the current frame was captured." The Live
+/// panel cannot do this — it always shows the in-progress capture. This
+/// panel is the historical counterpart used when the user scrolls back
+/// to a frame that no longer corresponds to the live recording. (#123)
+struct HistoricalTranscriptPanel: View {
+    let frameTimestamp: Date
+    var window: TimeInterval = 5
+    var speakerNames: [Int: String] = [:]
+    var onSpeakerTapped: ((SpeakerSegment) -> Void)? = nil
+
+    @State private var segments: [SpeakerSegment] = []
+    @State private var didLoad = false
+
+    var body: some View {
+        Group {
+            if !didLoad {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if segments.isEmpty {
+                VStack(spacing: 16) {
+                    Image(systemName: "text.bubble")
+                        .scaledFont(size: 48)
+                        .foregroundColor(OmiColors.textTertiary)
+                        .opacity(0.5)
+                    Text("No transcript for this moment")
+                        .scaledFont(size: 16, weight: .medium)
+                        .foregroundColor(OmiColors.textSecondary)
+                    Text("Nothing was being recorded when this frame was captured.")
+                        .scaledFont(size: 13)
+                        .foregroundColor(OmiColors.textTertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(32)
+            } else {
+                LiveTranscriptView(
+                    segments: segments,
+                    speakerNames: speakerNames,
+                    onSpeakerTapped: onSpeakerTapped
+                )
+            }
+        }
+        .task(id: frameTimestamp) {
+            // Clear previous content before each refetch so a slow query
+            // can't leave stale segments visible (and tappable) while the
+            // user is scrubbing through frames.
+            await MainActor.run {
+                didLoad = false
+                segments = []
+            }
+            await reload()
+        }
+    }
+
+    private func reload() async {
+        do {
+            let fetched = try await RewindDatabase.shared.transcriptSegments(
+                around: frameTimestamp,
+                window: window
+            )
+            await MainActor.run {
+                segments = fetched
+                didLoad = true
+            }
+        } catch {
+            await MainActor.run {
+                segments = []
+                didLoad = true
+            }
+        }
+    }
+}
+
 /// Self-contained audio level waveforms that observe AudioLevelMonitor internally,
 /// so the parent view does NOT need to observe audio level changes.
 struct RecordingBarAudioLevels: View {

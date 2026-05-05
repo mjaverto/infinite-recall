@@ -534,7 +534,9 @@ actor RewindStorage {
 
         var chunks: [VideoChunkInfo] = []
 
-        // Enumerate all .hevc files in videos directory (including subdirectories)
+        // Enumerate all chunk files in videos directory (including subdirectories).
+        // VideoChunkEncoder writes fragmented MP4 (.mp4) — historical builds may
+        // have shipped .hevc, so accept both for robustness across upgrades.
         let enumerator = fileManager.enumerator(
             at: videosDirectory,
             includingPropertiesForKeys: [.isRegularFileKey, .creationDateKey],
@@ -542,7 +544,8 @@ actor RewindStorage {
         )
 
         while let fileURL = enumerator?.nextObject() as? URL {
-            guard fileURL.pathExtension == "hevc" else { continue }
+            let ext = fileURL.pathExtension.lowercased()
+            guard ext == "mp4" || ext == "hevc" else { continue }
 
             // Get relative path from videos directory
             let relativePath = fileURL.path.replacingOccurrences(of: videosDirectory.path + "/", with: "")
