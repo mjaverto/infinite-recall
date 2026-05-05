@@ -586,6 +586,11 @@ final class ImportConnectorStatusStore: ObservableObject {
         var lastSyncedAt: Date?
         var lastDeltaCount: Int?
         var availabilityText: String?
+        /// Set when the connector's most recent read or sync failed. When
+        /// non-nil, `snapshot()` flips `isConnected = false` so the UI can
+        /// surface a re-grant / repair affordance instead of falsely
+        /// claiming the integration is healthy. Cleared on successful sync.
+        var lastError: String?
     }
 
     struct Snapshot {
@@ -593,6 +598,7 @@ final class ImportConnectorStatusStore: ObservableObject {
         let actionTitle: String
         let primaryText: String
         let secondaryText: String?
+        let errorMessage: String?
     }
 
     @Published private var metricsByID: [String: ConnectorMetrics] = [:]
@@ -615,13 +621,21 @@ final class ImportConnectorStatusStore: ObservableObject {
 
     func snapshot(for connector: ImportConnector) -> Snapshot {
         let metrics = metricsByID[connector.id] ?? ConnectorMetrics()
+        // A latching `lastError` flips the connector to a re-grant state
+        // even if previous successful syncs left memory/source counts behind.
+        // Without this gate the card showed "Connected" forever after the
+        // first read failure (#126).
+        let hasError = metrics.lastError != nil
         let isConnected =
-            metrics.memoryCount.map { $0 > 0 } ?? false
-            || metrics.sourceCount.map { $0 > 0 } ?? false
-            || metrics.availabilityText != nil
-            || connector.id == "local-files"
+            !hasError
+            && (metrics.memoryCount.map { $0 > 0 } ?? false
+                || metrics.sourceCount.map { $0 > 0 } ?? false
+                || metrics.availabilityText != nil
+                || connector.id == "local-files")
         let actionTitle: String
-        if manualConnectorIDs.contains(connector.id) {
+        if hasError {
+            actionTitle = "Reconnect"
+        } else if manualConnectorIDs.contains(connector.id) {
             actionTitle = isConnected ? "Update" : "Connect"
         } else {
             actionTitle = isConnected ? "Sync now" : "Connect"
@@ -631,7 +645,8 @@ final class ImportConnectorStatusStore: ObservableObject {
             isConnected: isConnected,
             actionTitle: actionTitle,
             primaryText: primaryText(for: connector, metrics: metrics, isConnected: isConnected),
-            secondaryText: secondaryText(for: connector, metrics: metrics, isConnected: isConnected)
+            secondaryText: secondaryText(for: connector, metrics: metrics, isConnected: isConnected),
+            errorMessage: metrics.lastError
         )
     }
 
@@ -664,7 +679,49 @@ final class ImportConnectorStatusStore: ObservableObject {
         if let availabilityText {
             metrics.availabilityText = availabilityText
         }
+        // A successful sync invalidates any latched error from a previous
+        // failed read; re-rendering as "Connected" requires this to be cleared
+        // (otherwise `snapshot()` keeps the card pinned in the error state).
+        metrics.lastError = nil
         metricsByID[connectorID] = metrics
+    }
+
+    /// Latches an error state for a connector. The next `snapshot()` will
+    /// report `isConnected = false` and surface `errorMessage` in the UI.
+    /// Cleared by the next successful `markSynced` for the same connector.
+    func markFailed(connectorID: String, error: String) {
+        var metrics = metricsByID[connectorID] ?? ConnectorMetrics()
+        metrics.lastError = error
+        // Also drop stale availability text so the primary line doesn't keep
+        // claiming "Folder granted" / "Private notes accessible" while the
+        // read path is broken (#126).
+        metrics.availabilityText = nil
+        metricsByID[connectorID] = metrics
+    }
+
+    /// Disconnect flow (#131): clears every UserDefaults key this store ever
+    /// writes for `connectorID`, plus connector-specific extras (Apple Notes
+    /// folder grant, legacy onboarding paste counts). After this call the
+    /// connector card renders the same as a fresh install.
+    func clear(connectorID: String) {
+        defaults.removeObject(forKey: sourceCountKeyPrefix + connectorID)
+        defaults.removeObject(forKey: memoryCountKeyPrefix + connectorID)
+        defaults.removeObject(forKey: lastSyncedAtKeyPrefix + connectorID)
+        defaults.removeObject(forKey: lastDeltaCountKeyPrefix + connectorID)
+        defaults.removeObject(forKey: hasLastDeltaKeyPrefix + connectorID)
+
+        switch connectorID {
+        case "apple-notes":
+            defaults.removeObject(forKey: appleNotesFolderDefaultsKey)
+        case "chatgpt":
+            defaults.removeObject(forKey: onboardingChatGPTImportedMemoriesKey)
+        case "claude":
+            defaults.removeObject(forKey: onboardingClaudeImportedMemoriesKey)
+        default:
+            break
+        }
+
+        metricsByID[connectorID] = ConnectorMetrics()
     }
 
     func refresh() async {
@@ -754,17 +811,40 @@ final class ImportConnectorStatusStore: ObservableObject {
     private func refreshAppleNotesMetrics() async {
         do {
             let notes = try await AppleNotesReaderService.shared.readRecentNotes(maxResults: 250)
-            guard !notes.isEmpty else { return }
-
+            // A successful read — even one that returns zero notes — proves
+            // the integration is healthy. Normalize to a "0 notes / accessible"
+            // snapshot so a previous error or stale source count can't keep
+            // the card pinned in a reconnect / out-of-date state.
             var metrics = metricsByID["apple-notes"] ?? ConnectorMetrics()
             metrics.sourceCount = notes.count
             metrics.availabilityText = "Private notes accessible"
+            metrics.lastError = nil
             metricsByID["apple-notes"] = metrics
         } catch {
-            let folderPath = defaults.string(forKey: appleNotesFolderDefaultsKey) ?? ""
-            guard !folderPath.isEmpty else { return }
+            // #126: Previously this catch unconditionally re-asserted
+            // `availabilityText = "Folder granted"` whenever a folder path was
+            // remembered, which made the card render "Connected / Sync now"
+            // even after the underlying NoteStore read failed (schema upgrade,
+            // file moved, Full Disk Access revoked). Surface the real error so
+            // the user can re-grant access instead of silently failing.
+            //
+            // We only surface the error if the connector had prior state —
+            // a fresh-install user who has never connected Apple Notes
+            // shouldn't see a permission error on every page open. "Prior
+            // state" includes both a remembered folder grant AND any
+            // metrics from a Full-Disk-Access read path (which never sets
+            // the folder grant key), so the gate must check both.
             var metrics = metricsByID["apple-notes"] ?? ConnectorMetrics()
-            metrics.availabilityText = "Folder granted"
+            let folderPath = defaults.string(forKey: appleNotesFolderDefaultsKey) ?? ""
+            let hadPriorState =
+                metrics.sourceCount != nil
+                || metrics.memoryCount != nil
+                || metrics.lastSyncedAt != nil
+                || metrics.availabilityText != nil
+                || !folderPath.isEmpty
+            guard hadPriorState else { return }
+            metrics.availabilityText = nil
+            metrics.lastError = "Apple Notes read failed: \(error.localizedDescription). Re-grant access to repair."
             metricsByID["apple-notes"] = metrics
         }
     }
@@ -1217,6 +1297,7 @@ struct ImportConnectorSheet: View {
     let onDismiss: () -> Void
 
     @StateObject private var model = ImportConnectorSheetModel()
+    @State private var showDisconnectConfirmation = false
 
     private var snapshot: ImportConnectorStatusStore.Snapshot {
         statusStore.snapshot(for: connector)
@@ -1263,10 +1344,47 @@ struct ImportConnectorSheet: View {
 
             statusSection
 
+            disconnectSection
+
             Spacer(minLength: 0)
         }
         .padding(24)
         .background(OmiColors.backgroundPrimary)
+    }
+
+    /// Disconnect affordance (#131). Shown whenever the connector has any
+    /// persisted state — either a healthy connection, a latched error, or
+    /// stale onboarding paste counts. `local-files` is excluded because the
+    /// on-device index is the data itself, not a connection that can be
+    /// "forgotten" without separately wiping the index.
+    ///
+    /// Disconnect is destructive (it wipes UserDefaults state and the Apple
+    /// Notes folder grant), so it goes through a confirmation alert to
+    /// prevent accidental clicks.
+    @ViewBuilder
+    private var disconnectSection: some View {
+        let hasState =
+            snapshot.isConnected
+            || snapshot.errorMessage != nil
+            || snapshot.secondaryText != nil
+        if hasState && connector.id != "local-files" {
+            Button("Disconnect \(connector.title)") {
+                showDisconnectConfirmation = true
+            }
+            .buttonStyle(OnboardingCardButtonStyle(isPrimary: false))
+            .disabled(model.isRunning)
+            .alert(
+                "Disconnect \(connector.title)?",
+                isPresented: $showDisconnectConfirmation
+            ) {
+                Button("Disconnect", role: .destructive) {
+                    statusStore.clear(connectorID: connector.id)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This clears the saved connection state for \(connector.title). Memories already imported from this source are kept; you can prune them from the Memories page if you want.")
+            }
+        }
     }
 
     private var connectorActionContent: some View {
@@ -1442,6 +1560,13 @@ struct ImportConnectorSheet: View {
             Text(errorMessage)
                 .scaledFont(size: 12, weight: .medium)
                 .foregroundColor(OmiColors.warning)
+        } else if let storedError = snapshot.errorMessage {
+            // Surface the latched store-level error (#126). Distinct from
+            // model.errorMessage which only covers the in-flight import.
+            Text(storedError)
+                .scaledFont(size: 12, weight: .medium)
+                .foregroundColor(OmiColors.warning)
+                .fixedSize(horizontal: false, vertical: true)
         } else if snapshot.isConnected || snapshot.secondaryText != nil {
             statusCard {
                 VStack(alignment: .leading, spacing: 6) {
