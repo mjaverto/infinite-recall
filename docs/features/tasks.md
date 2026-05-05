@@ -56,7 +56,7 @@ A filter sidebar or bar sits alongside the list with controls for every dimensio
 
 **Deduplication and Goal promotion.** The `search_similar` call runs before any `extract_task` call. If a close match exists, the model updates the existing task rather than creating a duplicate. If the task aligns with an active Goal (configured in Settings > Advanced > Goals), it is promoted and linked to that goal so it appears in the Goals view as well.
 
-**Staging.** Extracted tasks land in `StagedTaskStorage` first. They are visible in your list immediately, flagged as AI-generated. You can keep, edit, or remove them. Removing a staged task sets the "Removed by AI" state rather than deleting the record, so the filter can surface it later if you want to review what the model dropped.
+**Staging.** Extracted tasks land in `StagedTaskStorage` first. They are visible in your list immediately, flagged as AI-generated. You can keep, edit, or remove them. Removing a staged task before it has been promoted is permanent — it is hard-deleted from the staging table and cannot be surfaced by the "Removed by AI" filter. The "Removed by AI" / "Removed by me" filter states only apply to tasks that have already been promoted into the main `action_items` table (where soft-delete columns exist).
 
 **Calendar-driven tasks.** Tasks with `calendar_driven` origin come from the local Calendar integration reading your events directly. The LLM does not extract these from a transcript; they arrive through a separate pipeline and are labeled accordingly.
 

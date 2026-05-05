@@ -1386,15 +1386,52 @@ class TasksStore: ObservableObject {
             incompleteTasks.insert(task, at: 0)
         }
 
-        // 3. Re-create on backend (hard-delete already removed it)
+        // 3. Re-create on backend (hard-delete already removed it).
+        //
+        // #127: Mirror createTask's full payload so undo doesn't silently
+        // strip source / category / tags / recurrenceRule / metadata.
+        // Without this, the next backend sync overwrites the local row with
+        // the skinny re-created copy and loses the user's metadata.
         do {
+            // Decode the existing metadata JSON back into a dictionary so it
+            // can be re-encoded by createActionItem. If the round-trip fails
+            // (malformed JSON, unexpected shape) fall back to reconstructing
+            // {tags: [...]} from the computed `tags` field so at least the
+            // tag list survives.
+            var metadataDict: [String: Any]? = nil
+            if let metadataJson = task.metadata,
+                let data = metadataJson.data(using: .utf8),
+                let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            {
+                metadataDict = parsed
+            } else if !task.tags.isEmpty {
+                metadataDict = ["tags": task.tags]
+            }
+
             let created = try await APIClient.shared.createActionItem(
                 description: task.description,
                 dueAt: task.dueAt,
-                priority: task.priority
+                source: task.source,
+                priority: task.priority,
+                category: task.category,
+                metadata: metadataDict,
+                recurrenceRule: task.recurrenceRule,
+                recurrenceParentId: task.recurrenceParentId
             )
             // Update local record with new backend ID
             try await ActionItemStorage.shared.syncTaskActionItems([created])
+            // CodeRabbit (PR #144): the in-memory array still holds the
+            // old `task` with the deleted backend ID after step 2. Without
+            // this swap, edit/toggle/delete on the restored row would call
+            // the backend with an ID that no longer exists. Replace the
+            // stale entry with the freshly-created backend record.
+            if task.completed {
+                if let idx = completedTasks.firstIndex(where: { $0.id == task.id }) {
+                    completedTasks[idx] = created
+                }
+            } else if let idx = incompleteTasks.firstIndex(where: { $0.id == task.id }) {
+                incompleteTasks[idx] = created
+            }
             log("TasksStore: Restored task via undo (new backend ID: \(created.id))")
         } catch {
             logError("TasksStore: Failed to re-create task on backend (local restore preserved)", error: error)
