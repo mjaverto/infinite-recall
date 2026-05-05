@@ -36,13 +36,15 @@ Rewind is a visual timeline of your screen activity. Scrub through screenshots c
 
 ### Screen capture
 
-Every approximately one second, the app uses macOS `ScreenCaptureKit` to capture the visible window at up to 3000×3000 px. Each frame is JPEG-encoded at 80% quality and written to disk under:
+Every approximately one second, the app uses macOS `ScreenCaptureKit` to capture the visible window at up to 3000×3000 px. Frames are not written individually as JPEGs; instead they are appended to a rolling H.265 fragmented-MP4 chunk by `VideoChunkEncoder` at ~1 fps. Each chunk caps at 60 seconds and is then finalized to disk under:
 
 ```
-~/Library/Application Support/Omi/users/{userId}/Screenshots/YYYY-MM-DD/screenshot_HHmmss_SSS.jpg
+~/Library/Application Support/Omi/users/{userId}/Videos/YYYY-MM-DD/chunk_HHmmss.mp4
 ```
 
-Date-bucketed folders keep the directory tree manageable and make retention cleanup efficient. Capture automatically pauses for any app on Rewind's excluded list (Settings → Rewind → Excluded Apps). Password managers and incognito windows are excluded by default.
+Per-frame metadata (timestamp, app name, window title, OCR results) is written to the SQLite `screenshots` table with `videoChunkPath` pointing at the chunk file and `frameOffset` selecting the frame inside it. Date-bucketed folders keep the directory tree manageable and make retention cleanup efficient. Capture automatically pauses for any app on Rewind's excluded list (Settings → Rewind → Excluded Apps). Password managers and incognito windows are excluded by default.
+
+A legacy single-JPEG path (`RewindStorage.saveScreenshot`, `screenshots.imagePath`) remains in the codebase for older databases that still reference per-frame JPEGs on disk; the live capture pipeline does not exercise it.
 
 ### OCR
 
@@ -66,7 +68,7 @@ Each sampled frame produces a row in the `visual_activity` table (backed by GRDB
 
 ### Retention
 
-On app launch, screenshots and `visual_activity` rows older than the configured retention window are pruned (Settings → Rewind → Data Retention; default 7 days, with options up to 30). There is also a soft cap of 30,000 rows in `visual_activity`; rows above that threshold are trimmed oldest-first automatically. Image files on disk are removed alongside their corresponding database rows.
+On app launch, screenshots and `visual_activity` rows older than the configured retention window are pruned (Settings → Rewind → Data Retention; default 7 days, with options up to 30). There is also a soft cap of 30,000 rows in `visual_activity`; rows above that threshold are trimmed oldest-first automatically. When every frame referencing a given video chunk has been deleted, the orphaned `Videos/YYYY-MM-DD/chunk_HHmmss.mp4` file is removed from disk as well (`RewindIndexer.runCleanup` → `RewindStorage.deleteVideoChunk`). Any legacy per-frame JPEGs still referenced by `screenshots.imagePath` are deleted alongside their rows.
 
 ### Transcript context
 
@@ -80,9 +82,12 @@ The on/off switch on the Rewind page calls into the same capture service used at
 
 - `Desktop/Sources/Rewind/UI/RewindPage.swift`
 - `Desktop/Sources/ScreenCaptureService.swift`
+- `Desktop/Sources/Rewind/Core/VideoChunkEncoder.swift`
 - `Desktop/Sources/Rewind/Core/RewindOCRService.swift`
 - `Desktop/Sources/AI/VisionLLMClient.swift`
 - `Desktop/Sources/Rewind/Services/VisualActivitySampler.swift`
 - `Desktop/Sources/Rewind/Services/VisualActivityIndexer.swift`
+- `Desktop/Sources/Rewind/Services/RewindIndexer.swift`
 - `Desktop/Sources/Rewind/Core/RewindDatabase.swift`
+- `Desktop/Sources/Rewind/Core/RewindStorage.swift`
 - `Desktop/Sources/Power/BatteryAwareScheduler.swift`
