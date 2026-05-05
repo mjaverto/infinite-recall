@@ -14,7 +14,7 @@ The Activity page is a live dashboard of what Infinite Recall is doing at any gi
 
 **Queued section.** Pending and failed work counts per job kind. Lets you see how much has accumulated while processing was paused.
 
-**Run now button.** Forces a single drain pass against the queue, bypassing the idle requirement. Not available under thermal cooldown or when the screen is locked.
+**Run now button.** Forces a single drain pass against the queue, bypassing the idle requirement and the battery / Low Power Mode gates. Not available under thermal cooldown or when the screen is locked.
 
 **Unload model memory button.** Evicts the loaded text and vision models from RAM. Useful when you need that memory back immediately. The model restarts automatically on its next call.
 
@@ -56,7 +56,7 @@ Pausing is per-kind or per-capture (Audio / Screen); there is no whole-pipeline 
 
 **Resource cards.** CPU and memory figures are sampled from three processes: the Swift app, `infinite-recall-api` (the local Rust daemon), and `mlx-lm.server`. The expandable CPU card breaks these out per process. The GPU card reflects system-wide usage rather than per-process, which is sufficient to see whether the vision model is active.
 
-**Run now.** Triggering this button forces one drain pass against the pending queue, bypassing the idle requirement. It deliberately refuses to override hard blockers: thermal cooldown (continuing would risk damaging the hardware) and screen lock (you may have walked away). Overriding idle-only gating is safe; overriding those two is not.
+**Run now.** Triggering this button forces one drain pass against the pending queue. The underlying `runOnceIgnoringPower()` bypasses the idle requirement and the battery / Low Power Mode gates so the user can spend a chunk of battery on demand. It deliberately refuses to override hard blockers: thermal cooldown (continuing would risk damaging the hardware) and screen lock (you may have walked away). Overriding idle and power gating is safe; overriding those two is not.
 
 **Unload model memory.** This calls `IdleAIController` to evict the loaded text and vision models from RAM — roughly 13–17 GB combined, depending on which models you have selected. The next call to either model triggers an automatic launchd restart within seconds, so there is no manual reload step.
 

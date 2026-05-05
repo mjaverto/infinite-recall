@@ -115,10 +115,18 @@ private let activityCorrectedGateLog = Logger(
 /// idle" while transcribe / OCR / extractMemory / extractActionItems are
 /// actively running. Pure helper; tests live in
 /// `Desktop/Tests/ActivityPagePowerGateTests.swift`.
-func activityLightweightWorkActive(kinds: [KindRow]) -> Bool {
+///
+/// CodeRabbit (PR #149): a paused lightweight kind still has `queued > 0`
+/// but the scheduler will stop at the per-kind pause gate, so the banner
+/// must NOT flip to "Idle processing — running" on the strength of those
+/// queued rows alone. In-flight work always counts (the row is already
+/// running); queued rows count only when not currently paused.
+func activityLightweightWorkActive(kinds: [KindRow], now: Date = Date()) -> Bool {
     kinds.contains { row in
-        row.kind.requiresAutonomousReadiness == false
-            && (row.queued > 0 || row.inFlight != nil)
+        guard row.kind.requiresAutonomousReadiness == false else { return false }
+        if row.inFlight != nil { return true }
+        let isPaused = (row.pausedUntil ?? .distantPast) > now
+        return !isPaused && row.queued > 0
     }
 }
 

@@ -314,7 +314,8 @@ final class ActivityPagePowerGateTests: XCTestCase {
     private func kindRow(
         _ kind: WorkKind,
         queued: UInt32 = 0,
-        inFlight: InFlight? = nil
+        inFlight: InFlight? = nil,
+        pausedUntil: Date? = nil
     ) -> KindRow {
         KindRow(
             kind: kind,
@@ -322,7 +323,7 @@ final class ActivityPagePowerGateTests: XCTestCase {
             queued: queued,
             failed: 0,
             lastDoneAt: nil,
-            pausedUntil: nil
+            pausedUntil: pausedUntil
         )
     }
 
@@ -363,6 +364,43 @@ final class ActivityPagePowerGateTests: XCTestCase {
     /// Empty kinds list — no work of any sort active.
     func test_lightweightActive_falseForEmpty() {
         XCTAssertFalse(activityLightweightWorkActive(kinds: []))
+    }
+
+    /// CodeRabbit (PR #149): a paused lightweight kind still has
+    /// `queued > 0`, but the scheduler will stop at the user's per-kind
+    /// pause gate, so the banner must not flip to "Idle processing —
+    /// running" on the strength of those queued rows alone.
+    func test_lightweightActive_falseForPausedTranscribeWithQueued() {
+        let pausedUntil = now.addingTimeInterval(60)
+        let kinds = [
+            kindRow(.transcribe, queued: 5, pausedUntil: pausedUntil),
+        ]
+        XCTAssertFalse(activityLightweightWorkActive(kinds: kinds, now: now))
+    }
+
+    /// In-flight work counts even on a paused kind — the row is already
+    /// running; the pause only stops the next dequeue.
+    func test_lightweightActive_trueForInFlightOnPausedKind() {
+        let pausedUntil = now.addingTimeInterval(60)
+        let kinds = [
+            kindRow(
+                .ocr,
+                queued: 5,
+                inFlight: InFlight(label: "OCR", startedAt: now),
+                pausedUntil: pausedUntil
+            ),
+        ]
+        XCTAssertTrue(activityLightweightWorkActive(kinds: kinds, now: now))
+    }
+
+    /// An *expired* pause (`pausedUntil < now`) must NOT suppress the
+    /// banner — the scheduler treats those rows as eligible.
+    func test_lightweightActive_trueForExpiredPause() {
+        let expired = now.addingTimeInterval(-60)
+        let kinds = [
+            kindRow(.transcribe, queued: 1, pausedUntil: expired),
+        ]
+        XCTAssertTrue(activityLightweightWorkActive(kinds: kinds, now: now))
     }
 
     /// Pin the kind classification: only `.summarize` / `.extractKG`
