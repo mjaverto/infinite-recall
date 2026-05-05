@@ -345,4 +345,47 @@ final class PowerWorkBridgeTests: XCTestCase {
 
         XCTAssertEqual(insertCount, 1, "Insert ran before mark failed")
     }
+
+    // MARK: - #120: voice-extracted source mapping
+
+    /// `transcription_sessions.source = "omi"` → `"transcription:omi"` so the
+    /// task lands in the *Transcription Omi* filter bucket on TasksPage.
+    func test_taskSourceForSessionSource_omi_mapsToTranscriptionOmi() {
+        XCTAssertEqual(PowerWorkBridge.taskSourceForSessionSource("omi"), "transcription:omi")
+    }
+
+    /// `transcription_sessions.source = "desktop"` → `"transcription:desktop"`.
+    func test_taskSourceForSessionSource_desktop_mapsToTranscriptionDesktop() {
+        XCTAssertEqual(PowerWorkBridge.taskSourceForSessionSource("desktop"), "transcription:desktop")
+    }
+
+    /// Anything else (nil, "unknown", legacy values) falls back to the
+    /// pre-#120 "conversation" bucket so non-omi/desktop voice paths still
+    /// match the legacy behavior.
+    func test_taskSourceForSessionSource_unknown_fallsBackToConversation() {
+        XCTAssertEqual(PowerWorkBridge.taskSourceForSessionSource(nil), "conversation")
+        XCTAssertEqual(PowerWorkBridge.taskSourceForSessionSource("unknown"), "conversation")
+        XCTAssertEqual(PowerWorkBridge.taskSourceForSessionSource("phone"), "conversation")
+    }
+
+    /// End-to-end through the seam: when `loadSessionSource` returns "omi",
+    /// the inserted record carries `source = "transcription:omi"`. This is
+    /// the regression guard for #120 — the previous code hard-coded
+    /// `"conversation"` and the Tasks UI's source filters never matched.
+    func test_processExtractActionItems_resolvesSessionSourceForInsertedRecord() async throws {
+        var inserted: [ActionItemRecord] = []
+
+        try await PowerWorkBridge._processExtractActionItems(
+            sessionId: 99,
+            loadTranscript: { _ in String(repeating: "x", count: 200) },
+            loadSessionSource: { _ in "omi" },
+            extractItems: { _, _ in [Self.makeItem("voice task")] },
+            insert: { record in inserted.append(record) },
+            markExtracted: { _ in }
+        )
+
+        XCTAssertEqual(inserted.count, 1)
+        XCTAssertEqual(inserted.first?.source, "transcription:omi",
+                       "voice-extracted task must map omi session → transcription:omi (fixes #120)")
+    }
 }

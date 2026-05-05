@@ -860,6 +860,9 @@ final class PowerWorkBridge {
             loadTranscript: { id in
                 try await ConversationTranscriptLoader.loadAssembled(sessionId: id)
             },
+            loadSessionSource: { id in
+                try await loadTranscriptionSessionSource(sessionId: id)
+            },
             extractItems: { transcript, id in
                 try await callExtractActionItemsLLM(truncated: transcript, sessionId: id)
             },
@@ -870,6 +873,43 @@ final class PowerWorkBridge {
                 try await ConversationActionItemsBackfillService.shared.markSessionExtracted(sessionId: id)
             }
         )
+    }
+
+    /// Reads `transcription_sessions.source` for the given session and maps
+    /// it to the canonical task `source` string used by the Tasks UI filters
+    /// (`transcription:omi`, `transcription:desktop`). Falls back to
+    /// `conversation` for any other / unknown ConversationSource value, so
+    /// non-omi/desktop voice paths still match the legacy bucket.
+    ///
+    /// See issue #120: voice-extracted tasks were always inserted with
+    /// `source = "conversation"`, making them invisible to the user-facing
+    /// Transcription Omi / Transcription Desktop filters.
+    fileprivate static func loadTranscriptionSessionSource(sessionId: Int64) async throws -> String? {
+        guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
+            return nil
+        }
+        let raw: String? = try await dbQueue.read { db -> String? in
+            try String.fetchOne(
+                db,
+                sql: "SELECT source FROM transcription_sessions WHERE id = ? AND deleted = 0",
+                arguments: [sessionId]
+            )
+        }
+        return raw
+    }
+
+    /// Map a `transcription_sessions.source` raw value to the canonical
+    /// task-source string the Tasks UI / API expect.
+    /// - `"omi"` → `"transcription:omi"`
+    /// - `"desktop"` → `"transcription:desktop"`
+    /// - anything else (including nil) → `"conversation"` (legacy bucket;
+    ///   matches pre-#120 behavior so non-omi/desktop paths keep working).
+    nonisolated static func taskSourceForSessionSource(_ raw: String?) -> String {
+        switch raw {
+        case "omi": return "transcription:omi"
+        case "desktop": return "transcription:desktop"
+        default: return "conversation"
+        }
     }
 
     /// Testable seam: same body as `processExtractActionItems` but with all
@@ -886,6 +926,7 @@ final class PowerWorkBridge {
     static func _processExtractActionItems(
         sessionId: Int64,
         loadTranscript: (Int64) async throws -> String?,
+        loadSessionSource: (Int64) async throws -> String? = { _ in nil },
         extractItems: (String, Int64) async throws -> [LLMActionItem],
         insert: (ActionItemRecord) async throws -> Void,
         markExtracted: (Int64) async throws -> Void
@@ -937,6 +978,20 @@ final class PowerWorkBridge {
         // successfully. Acceptable trade-off vs. permanent silent loss; a
         // follow-up should add a `(conversationId, hash(description))`
         // upsert.
+        // #120: Resolve the canonical task-source string from
+        // transcription_sessions.source so voice-extracted items match the
+        // Tasks UI's "Transcription Omi" / "Transcription Desktop" filters.
+        // Failures fall back silently to the legacy "conversation" bucket so
+        // a transient DB read error does not also block the LLM result.
+        let sessionSourceRaw: String?
+        do {
+            sessionSourceRaw = try await loadSessionSource(sessionId)
+        } catch {
+            logError("PowerWorkBridge: .extractActionItems — loadSessionSource failed for session \(sessionId), defaulting to 'conversation'", error: error)
+            sessionSourceRaw = nil
+        }
+        let resolvedTaskSource = Self.taskSourceForSessionSource(sessionSourceRaw)
+
         let validPriorities: Set<String> = ["high", "medium", "low"]
         var inserted = 0
         var anyInsertFailed = false
@@ -959,7 +1014,7 @@ final class PowerWorkBridge {
 
             let record = ActionItemRecord(
                 description: description,
-                source: "conversation",
+                source: resolvedTaskSource,
                 conversationId: String(sessionId),
                 priority: priority,
                 category: item.category,
