@@ -1184,4 +1184,68 @@ actor TranscriptionStorage {
             return try query.fetchCount(database)
         }
     }
+
+    // MARK: - Local Search
+
+    /// Search conversations against local SQLite storage (issue #139).
+    ///
+    /// Matches against the session's `title`, `overview`, and any segment text
+    /// in `transcription_segments`. Case-insensitive substring search via SQL
+    /// LIKE — sufficient for the single-user, on-device dataset and avoids
+    /// adding an FTS5 mirror to the migration chain. Returns sessions sorted
+    /// by `startedAt` desc with a single de-dup pass so a session that matches
+    /// in both the title and a segment only appears once.
+    func searchConversationsLocally(
+        query: String,
+        limit: Int = 50,
+        includeDiscarded: Bool = false
+    ) async throws -> [ServerConversation] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let db = try await ensureInitialized()
+
+        // Escape SQL LIKE wildcards so a literal `%foo` doesn't behave magically.
+        let escaped = trimmed
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let pattern = "%\(escaped)%"
+
+        let discardedClause = includeDiscarded ? "" : "AND s.discarded = 0"
+
+        return try await db.read { database -> [ServerConversation] in
+            let sql = """
+                SELECT DISTINCT s.id
+                  FROM transcription_sessions s
+                  LEFT JOIN transcription_segments seg ON seg.sessionId = s.id
+                 WHERE s.deleted = 0
+                   \(discardedClause)
+                   AND (
+                        s.title    LIKE ? ESCAPE '\\'
+                     OR s.overview LIKE ? ESCAPE '\\'
+                     OR seg.text   LIKE ? ESCAPE '\\'
+                   )
+                 ORDER BY s.startedAt DESC
+                 LIMIT ?
+                """
+            let rows = try Row.fetchAll(
+                database,
+                sql: sql,
+                arguments: [pattern, pattern, pattern, limit]
+            )
+            let ids: [Int64] = rows.compactMap { $0["id"] }
+            guard !ids.isEmpty else { return [] }
+
+            // Fetch full session records preserving the ordering above.
+            let sessions = try TranscriptionSessionRecord
+                .filter(ids.contains(Column("id")))
+                .fetchAll(database)
+            let byId = Dictionary(uniqueKeysWithValues: sessions.compactMap { s -> (Int64, TranscriptionSessionRecord)? in
+                guard let sid = s.id else { return nil }
+                return (sid, s)
+            })
+            return ids.compactMap { byId[$0]?.toServerConversation(segments: []) }
+        }
+    }
 }

@@ -473,18 +473,19 @@ struct ConversationsPage: View {
 
     Task {
       do {
-        let result = try await APIClient.shared.searchConversations(
+        // Local-first (issue #139): the API path short-circuits to an empty
+        // result in local-only mode, so search the on-device SQLite store
+        // directly. Matches against title, overview, and segment text.
+        let results = try await TranscriptionStorage.shared.searchConversationsLocally(
           query: query,
-          page: 1,
-          perPage: 50,
+          limit: 50,
           includeDiscarded: false
         )
-        log("Search: Found \(result.items.count) results")
-        searchResults = result.items
+        log("Search: Found \(results.count) local results")
+        searchResults = results
         isSearching = false
       } catch {
         logError("Search: Failed", error: error)
-        // Infinite Recall fork: local-only mode — return empty result instead of throwing
         if !isLocalOnlyError(error) {
           searchError = error.localizedDescription
         }
