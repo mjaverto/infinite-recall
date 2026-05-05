@@ -25,6 +25,24 @@ public enum WorkKind: String, Codable, CaseIterable, Hashable {
     /// kind was scheduler-internal only, producing the count mismatch
     /// reported in the bug.
     case extractKG = "extract_kg"
+
+    /// Issue #134: kinds that need both AC power AND user idle to run.
+    /// `BatteryAwareScheduler.drain()` only releases-back-to-queue rows
+    /// whose kind returns `true` here when `allowAutonomousAIWork` is
+    /// false; transcribe / OCR / extractMemory / extractActionItems run
+    /// on AC even while the user is actively typing.
+    ///
+    /// Single source of truth — `BatteryAwareScheduler` delegates to this
+    /// at the `PendingWork.Kind` boundary. The Activity-page banner reads
+    /// it directly so the two cannot drift.
+    public var requiresAutonomousReadiness: Bool {
+        switch self {
+        case .summarize, .extractKG:
+            return true
+        case .transcribe, .ocr, .extractMemory, .extractActionItems:
+            return false
+        }
+    }
 }
 
 public enum CaptureKind: String, Codable, CaseIterable, Hashable {

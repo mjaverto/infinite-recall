@@ -308,4 +308,73 @@ final class ActivityPagePowerGateTests: XCTestCase {
             "Non-onBattery snapshot blocks must pass through unchanged regardless of resources."
         )
     }
+
+    // MARK: - Issue #134: lightweight-work-active predicate
+
+    private func kindRow(
+        _ kind: WorkKind,
+        queued: UInt32 = 0,
+        inFlight: InFlight? = nil
+    ) -> KindRow {
+        KindRow(
+            kind: kind,
+            inFlight: inFlight,
+            queued: queued,
+            failed: 0,
+            lastDoneAt: nil,
+            pausedUntil: nil
+        )
+    }
+
+    /// Issue #134 regression: with `Blocked(.deviceActive)` and a queued
+    /// `transcribe` row (a non-autonomous kind), the helper must report
+    /// "lightweight active" so the banner doesn't say "Waiting for idle"
+    /// while the In-flight section shows transcribe running.
+    func test_lightweightActive_trueForQueuedTranscribe() {
+        let kinds = [
+            kindRow(.transcribe, queued: 1),
+            kindRow(.summarize, queued: 5),
+        ]
+        XCTAssertTrue(activityLightweightWorkActive(kinds: kinds))
+    }
+
+    /// In-flight (not just queued) lightweight work must also count.
+    func test_lightweightActive_trueForInFlightOcr() {
+        let kinds = [
+            kindRow(
+                .ocr,
+                queued: 0,
+                inFlight: InFlight(label: "OCR", startedAt: now)
+            ),
+        ]
+        XCTAssertTrue(activityLightweightWorkActive(kinds: kinds))
+    }
+
+    /// Heavy-only queues (`.summarize` / `.extractKG`) must NOT trigger
+    /// the lightweight banner copy — those genuinely wait for idle.
+    func test_lightweightActive_falseWhenOnlyHeavyKindsQueued() {
+        let kinds = [
+            kindRow(.summarize, queued: 3),
+            kindRow(.extractKG, queued: 2),
+        ]
+        XCTAssertFalse(activityLightweightWorkActive(kinds: kinds))
+    }
+
+    /// Empty kinds list — no work of any sort active.
+    func test_lightweightActive_falseForEmpty() {
+        XCTAssertFalse(activityLightweightWorkActive(kinds: []))
+    }
+
+    /// Pin the kind classification: only `.summarize` / `.extractKG`
+    /// require autonomous (idle) readiness; the other four are
+    /// lightweight. Drift between this and `BatteryAwareScheduler.drain()`
+    /// is the original #134 bug class.
+    func test_workKindRequiresAutonomousReadinessClassification() {
+        XCTAssertTrue(WorkKind.summarize.requiresAutonomousReadiness)
+        XCTAssertTrue(WorkKind.extractKG.requiresAutonomousReadiness)
+        XCTAssertFalse(WorkKind.transcribe.requiresAutonomousReadiness)
+        XCTAssertFalse(WorkKind.ocr.requiresAutonomousReadiness)
+        XCTAssertFalse(WorkKind.extractMemory.requiresAutonomousReadiness)
+        XCTAssertFalse(WorkKind.extractActionItems.requiresAutonomousReadiness)
+    }
 }

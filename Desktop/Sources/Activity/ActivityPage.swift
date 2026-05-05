@@ -108,6 +108,20 @@ private let activityCorrectedGateLog = Logger(
     category: "ActivityCorrectedGate"
 )
 
+/// Issue #134: true when at least one lightweight (non-autonomous) work
+/// kind has queued or in-flight rows. The `BatteryAwareScheduler` drains
+/// these on AC even when `Blocked(.deviceActive)` (only `.summarize` and
+/// `.extractKG` need user-idle), so the banner must not say "Waiting for
+/// idle" while transcribe / OCR / extractMemory / extractActionItems are
+/// actively running. Pure helper; tests live in
+/// `Desktop/Tests/ActivityPagePowerGateTests.swift`.
+func activityLightweightWorkActive(kinds: [KindRow]) -> Bool {
+    kinds.contains { row in
+        row.kind.requiresAutonomousReadiness == false
+            && (row.queued > 0 || row.inFlight != nil)
+    }
+}
+
 func activityShouldShowRunNowButton(
     snapshotGate: GateState?,
     correctedGate: GateState?,
@@ -405,7 +419,7 @@ struct ActivityPage: View {
     // MARK: - Banner
 
     private var gateBanner: some View {
-        let info = bannerInfo(for: gate, queued: totalQueued)
+        let info = bannerInfo(for: gate, queued: totalQueued, kinds: kinds)
         return HStack(alignment: .top, spacing: 12) {
             Image(systemName: info.icon)
                 .scaledFont(size: 20)
@@ -477,7 +491,11 @@ struct ActivityPage: View {
         let color: Color
     }
 
-    private func bannerInfo(for gate: GateState?, queued: UInt32) -> BannerInfo {
+    private func bannerInfo(
+        for gate: GateState?,
+        queued: UInt32,
+        kinds: [KindRow]
+    ) -> BannerInfo {
         guard let gate = gate else {
             return BannerInfo(
                 icon: "ellipsis.circle",
@@ -506,18 +524,38 @@ struct ActivityPage: View {
                 color: OmiColors.textSecondary
             )
         case .blocked(let reason, _, let waitingFor):
-            return blockedBannerInfo(reason: reason, waitingFor: waitingFor, queued: queued)
+            return blockedBannerInfo(
+                reason: reason,
+                waitingFor: waitingFor,
+                queued: queued,
+                kinds: kinds
+            )
         }
     }
 
     private func blockedBannerInfo(
         reason: BlockReason,
         waitingFor: WaitCondition,
-        queued: UInt32
+        queued: UInt32,
+        kinds: [KindRow]
     ) -> BannerInfo {
         let detail = waitingForDescription(waitingFor)
         switch reason {
         case .deviceActive:
+            // Issue #134: only `.summarize` / `.extractKG` actually wait for
+            // idle; lightweight kinds (transcribe / OCR / extractMemory /
+            // extractActionItems) drain on AC even while typing. If any
+            // lightweight row has queued or in-flight work, the banner must
+            // reflect that the queue is actively draining instead of
+            // contradicting the In-flight section with "Waiting for idle".
+            if activityLightweightWorkActive(kinds: kinds) {
+                return BannerInfo(
+                    icon: "checkmark.circle.fill",
+                    title: "Idle processing — running",
+                    detail: "\(queued) item\(queued == 1 ? "" : "s") in queue. Heavy work waits for \(detail).",
+                    color: OmiColors.success
+                )
+            }
             return BannerInfo(
                 icon: "keyboard.fill",
                 title: "Waiting for idle — \(queued) item\(queued == 1 ? "" : "s") queued",
