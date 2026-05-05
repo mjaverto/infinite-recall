@@ -811,17 +811,10 @@ final class ImportConnectorStatusStore: ObservableObject {
     private func refreshAppleNotesMetrics() async {
         do {
             let notes = try await AppleNotesReaderService.shared.readRecentNotes(maxResults: 250)
-            guard !notes.isEmpty else {
-                // Empty result with no thrown error is still a healthy state —
-                // clear any stale error from a previous broken read.
-                if metricsByID["apple-notes"]?.lastError != nil {
-                    var metrics = metricsByID["apple-notes"] ?? ConnectorMetrics()
-                    metrics.lastError = nil
-                    metricsByID["apple-notes"] = metrics
-                }
-                return
-            }
-
+            // A successful read — even one that returns zero notes — proves
+            // the integration is healthy. Normalize to a "0 notes / accessible"
+            // snapshot so a previous error or stale source count can't keep
+            // the card pinned in a reconnect / out-of-date state.
             var metrics = metricsByID["apple-notes"] ?? ConnectorMetrics()
             metrics.sourceCount = notes.count
             metrics.availabilityText = "Private notes accessible"
@@ -834,9 +827,22 @@ final class ImportConnectorStatusStore: ObservableObject {
             // even after the underlying NoteStore read failed (schema upgrade,
             // file moved, Full Disk Access revoked). Surface the real error so
             // the user can re-grant access instead of silently failing.
-            let folderPath = defaults.string(forKey: appleNotesFolderDefaultsKey) ?? ""
-            guard !folderPath.isEmpty else { return }
+            //
+            // We only surface the error if the connector had prior state —
+            // a fresh-install user who has never connected Apple Notes
+            // shouldn't see a permission error on every page open. "Prior
+            // state" includes both a remembered folder grant AND any
+            // metrics from a Full-Disk-Access read path (which never sets
+            // the folder grant key), so the gate must check both.
             var metrics = metricsByID["apple-notes"] ?? ConnectorMetrics()
+            let folderPath = defaults.string(forKey: appleNotesFolderDefaultsKey) ?? ""
+            let hadPriorState =
+                metrics.sourceCount != nil
+                || metrics.memoryCount != nil
+                || metrics.lastSyncedAt != nil
+                || metrics.availabilityText != nil
+                || !folderPath.isEmpty
+            guard hadPriorState else { return }
             metrics.availabilityText = nil
             metrics.lastError = "Apple Notes read failed: \(error.localizedDescription). Re-grant access to repair."
             metricsByID["apple-notes"] = metrics

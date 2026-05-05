@@ -30,7 +30,7 @@ The Apps page is how you connect Infinite Recall to other data sources on your M
 
 ## Behind the scenes
 
-**Local-first by design.** Infinite Recall does not talk to a remote app marketplace. The Featured section exists for a future catalog; in the current build it is always empty. The real work happens in Imports and My Apps. Every memory that an Imports connector creates is written to the local GRDB store via `MemoryStorage.insertLocalMemory` — nothing leaves the device.
+**Local-first by design.** Infinite Recall does not talk to a remote app marketplace. The Featured section exists for a future catalog; in the current build it is always empty. The real work happens in Imports and My Apps. Every memory that an Imports connector creates is written to the local GRDB store via `MemoryStorage.insertLocalMemory` first; if you have My Apps export destinations configured (webhook URLs or filesystem folders), the local write can then be mirrored to those user-chosen destinations. Nothing is sent to a marketplace, telemetry endpoint, or Anthropic/Google/Apple cloud — only to the destinations you explicitly enable.
 
 ### Imports connectors
 
