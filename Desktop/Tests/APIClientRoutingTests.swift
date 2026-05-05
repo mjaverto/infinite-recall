@@ -145,19 +145,16 @@ final class APIClientRoutingTests: XCTestCase {
         XCTAssertEqual(url, "http://localhost:8787/")
     }
 
-    /// Was `testRustBackendURLReturnsEmptyWhenNotSet` — flipped to assert the
-    /// new throwing contract (see `APIError.daemonNotConfigured`).
-    func testRustBackendURLThrowsDaemonNotConfiguredWhenNotSet() async {
+    /// Was `testRustBackendURLThrowsDaemonNotConfiguredWhenNotSet` — flipped
+    /// again: `rustBackendURL` now defaults to the canonical local-daemon
+    /// bind when `IR_API_URL` is unset, so other env-var-presence sentinels
+    /// (APIKeyService.isProxyMode, FloatingBarVoicePlaybackService,
+    /// GeminiClient) keep their local-fallback behavior.
+    func testRustBackendURLDefaultsToLocalDaemonWhenNotSet() async throws {
         unsetenv("IR_API_URL")
         let client = APIClient()
-        do {
-            _ = try await client.rustBackendURL
-            XCTFail("Expected APIError.daemonNotConfigured to be thrown")
-        } catch APIError.daemonNotConfigured {
-            // Expected.
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
+        let url = try await client.rustBackendURL
+        XCTAssertEqual(url, "http://127.0.0.1:7331/")
     }
 
     func testBaseURLAndRustBackendURLAreIndependent() async throws {
@@ -537,35 +534,17 @@ final class APIClientRoutingTests: XCTestCase {
 
     // MARK: - APIError.daemonNotConfigured
 
-    /// Regression: when `IR_API_URL` is unset, `getActivitySnapshot` should
-    /// fail with the typed `APIError.daemonNotConfigured` instead of cascading
-    /// into `APIError.invalidResponse` (which renders to the user as a generic
-    /// "Invalid response from server" — or worse, an HTTP 404 once a
-    /// malformed URL escapes to the network layer).
-    func testGetActivitySnapshotThrowsDaemonNotConfiguredWhenIRApiUrlUnset() async {
-        // Override the setUp() seed: this single test needs the env var
-        // truly unset so the throwing-helper path is exercised.
-        unsetenv("IR_API_URL")
-        defer {
-            // Restore the routing-tests baseline so following tests still
-            // see the seeded value.
-            setenv("IR_API_URL", "http://rust-test:9002", 1)
-        }
-
-        let client = APIClient()
-        do {
-            _ = try await client.getActivitySnapshot()
-            XCTFail("Expected APIError.daemonNotConfigured to be thrown")
-        } catch APIError.daemonNotConfigured {
-            // Expected — also confirm the user-facing message is the one
-            // Lane 4 / the Activity panel will rely on.
-            XCTAssertEqual(
-                APIError.daemonNotConfigured.localizedDescription,
-                "Infinite Recall daemon URL not configured (IR_API_URL is unset). Run scripts/run.sh to regenerate .env.app."
-            )
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
+    /// `rustBackendURL` no longer throws when `IR_API_URL` is unset — it
+    /// defaults to the canonical local-daemon bind (see
+    /// `testRustBackendURLDefaultsToLocalDaemonWhenNotSet`). The
+    /// `daemonNotConfigured` enum case is retained as a defensive throw for
+    /// future call sites; assert its user-facing message wording so the
+    /// Activity-panel banner copy stays in sync with `./run.sh`.
+    func testDaemonNotConfiguredErrorMessageMentionsRunScript() {
+        XCTAssertEqual(
+            APIError.daemonNotConfigured.localizedDescription,
+            "Infinite Recall daemon URL not configured (IR_API_URL is unset). Run ./run.sh to regenerate .env.app."
+        )
     }
 }
 

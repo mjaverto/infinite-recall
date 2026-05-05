@@ -903,6 +903,11 @@ elif [ -f ".env.app" ]; then
     cp -f .env.app "$APP_BUNDLE/Contents/Resources/.env"
 else
     touch "$APP_BUNDLE/Contents/Resources/.env"
+    if [ -z "$TUNNEL_URL" ] && [ -z "$IR_API_URL" ] && [ -z "$EFFECTIVE_API_URL" ]; then
+        echo "WARNING: No .env.app or .env.app.dev found AND no IR_API_URL/TUNNEL_URL set." >&2
+        echo "WARNING: Shipping an empty .env — the app will fall back to its built-in IR_API_URL default (http://127.0.0.1:7331)." >&2
+        echo "WARNING: If you intended a remote backend, create .env.app with IR_API_URL=... before rebuilding." >&2
+    fi
 fi
 # Set IR_API_URL: tunnel URL if available, otherwise from .env or local backend
 if [ -n "$TUNNEL_URL" ]; then
