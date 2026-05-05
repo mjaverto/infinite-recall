@@ -3478,6 +3478,54 @@ actor RewindDatabase {
         }
     }
 
+    // MARK: - Per-Frame Transcript Context (issue #123)
+
+    /// Fetch transcript segments whose absolute time window
+    /// `[session.startedAt + startTime, session.startedAt + endTime]`
+    /// overlaps `[timestamp - window, timestamp + window]`.
+    ///
+    /// Returns segments shaped as `SpeakerSegment` so the existing
+    /// `LiveTranscriptView` UI can render them directly. `start`/`end`
+    /// in the returned segments are kept as relative-to-session seconds
+    /// (matching what the live monitor produces) so the time labels keep
+    /// the same MM:SS format the user sees during live recording.
+    func transcriptSegments(
+        around timestamp: Date,
+        window: TimeInterval = 5
+    ) throws -> [SpeakerSegment] {
+        guard let dbQueue = dbQueue else {
+            throw RewindError.databaseNotInitialized
+        }
+
+        return try dbQueue.read { db in
+            let sql = """
+                SELECT seg.segmentId, seg.speaker, seg.text, seg.startTime,
+                       seg.endTime, seg.isUser, seg.personId
+                FROM transcription_segments seg
+                JOIN transcription_sessions s ON s.id = seg.sessionId
+                WHERE unixepoch(s.startedAt) + seg.endTime   >= unixepoch(?) - ?
+                  AND unixepoch(s.startedAt) + seg.startTime <= unixepoch(?) + ?
+                ORDER BY s.startedAt ASC, seg.segmentOrder ASC
+                """
+            let rows = try Row.fetchAll(
+                db,
+                sql: sql,
+                arguments: [timestamp, window, timestamp, window]
+            )
+            return rows.map { row in
+                SpeakerSegment(
+                    segmentId: row["segmentId"],
+                    speaker: row["speaker"] ?? 0,
+                    text: row["text"] ?? "",
+                    start: row["startTime"] ?? 0,
+                    end: row["endTime"] ?? 0,
+                    isUser: row["isUser"] ?? false,
+                    personId: row["personId"]
+                )
+            }
+        }
+    }
+
     // MARK: - Delete Result Types
 
     /// Result of bulk screenshot deletion (for cleanup)

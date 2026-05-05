@@ -84,6 +84,23 @@ struct RewindPage: View {
         return names
     }
 
+    /// Timestamp to feed to `HistoricalTranscriptPanel` when the user is
+    /// browsing a frame whose moment-in-time has already passed. Returns
+    /// `nil` to mean "show the live panel": no frame selected, OR the
+    /// selected frame is the most-recent loaded frame AND audio capture
+    /// is currently active (so the live panel is the right surface for
+    /// what's being said right now). See issue #123 for the doc promise
+    /// this implements.
+    private var historicalTranscriptTimestamp: Date? {
+        guard let selected = viewModel.selectedScreenshot else { return nil }
+        let isLiveCapturing = appState?.isTranscribing == true
+        let isLatestLoaded = viewModel.screenshots.first?.id == selected.id
+        if isLiveCapturing && isLatestLoaded {
+            return nil
+        }
+        return selected.timestamp
+    }
+
     var body: some View {
         ZStack {
             // Background
@@ -1201,14 +1218,32 @@ struct RewindPage: View {
                 let notesWidth = max(minPanelWidth, totalWidth - transcriptWidth - 1)
 
                 HStack(spacing: 0) {
-                    // Left: Live transcript
+                    // Left: Transcript pane.
+                    //
+                    // Issue #123: when the user is looking at a historical
+                    // frame, surface the words spoken at that frame's
+                    // timestamp (RewindDatabase.transcriptSegments). Fall
+                    // back to the Live panel only when the user is on the
+                    // newest frame and audio capture is currently active —
+                    // matches the doc promise that the transcript area
+                    // tracks the "current frame".
                     VStack(spacing: 0) {
-                        LiveTranscriptPanel(
-                            speakerNames: speakerNames,
-                            onSpeakerTapped: { segment in
-                                selectedSpeakerSegment = segment
-                            }
-                        )
+                        if let frameTimestamp = historicalTranscriptTimestamp {
+                            HistoricalTranscriptPanel(
+                                frameTimestamp: frameTimestamp,
+                                speakerNames: speakerNames,
+                                onSpeakerTapped: { segment in
+                                    selectedSpeakerSegment = segment
+                                }
+                            )
+                        } else {
+                            LiveTranscriptPanel(
+                                speakerNames: speakerNames,
+                                onSpeakerTapped: { segment in
+                                    selectedSpeakerSegment = segment
+                                }
+                            )
+                        }
                     }
                     .frame(width: transcriptWidth)
                     .background(OmiColors.backgroundPrimary)

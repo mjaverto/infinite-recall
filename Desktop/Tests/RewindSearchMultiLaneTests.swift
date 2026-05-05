@@ -24,33 +24,44 @@ final class RewindSearchMultiLaneTests: XCTestCase {
     }
 
     func testSearchMatchesViaOCRTextLane() async throws {
-        let now = Date()
-        let id = try await RewindDatabase.shared.insertScreenshot(Screenshot(
+        let now = Date(timeIntervalSince1970: 1_700_100_000)
+        try await RewindDatabase.shared.insertScreenshot(Screenshot(
             timestamp: now,
             appName: "Safari",
             windowTitle: "Tab",
             imagePath: "",
-            ocrText: "tutorial bingo zebra",
+            ocrText: "tutorial flamingoOCR zebra",
             isIndexed: true
-        )).id
+        ))
 
-        let results = try await RewindDatabase.shared.search(query: "bingo")
-        XCTAssertTrue(results.contains(where: { $0.id == id }), "OCR-text match must surface")
+        let results = try await RewindDatabase.shared.search(query: "flamingoOCR")
+        XCTAssertTrue(
+            results.contains(where: { abs($0.timestamp.timeIntervalSince(now)) < 1 }),
+            "OCR-text match must surface"
+        )
     }
 
     func testSearchMatchesViaVisualActivitySummary() async throws {
         guard let dbQueue = await RewindDatabase.shared.getDatabaseQueue() else {
             throw XCTSkip("database queue unavailable")
         }
-        let now = Date()
-        let id = try await RewindDatabase.shared.insertScreenshot(Screenshot(
+        let now = Date(timeIntervalSince1970: 1_700_200_000)
+        try await RewindDatabase.shared.insertScreenshot(Screenshot(
             timestamp: now,
             appName: "Safari",
             windowTitle: "Tab",
             imagePath: "",
             ocrText: nil,
             isIndexed: true
-        )).id!
+        ))
+        let id: Int64 = try await dbQueue.read { db in
+            try Int64.fetchOne(
+                db,
+                sql: "SELECT id FROM screenshots WHERE timestamp = ?",
+                arguments: [now]
+            ) ?? 0
+        }
+        XCTAssertNotEqual(id, 0, "screenshot row should have been inserted")
 
         // Insert a visual_activity row whose summary contains a unique token
         // that is NOT present anywhere in the screenshots table — only the
@@ -85,14 +96,22 @@ final class RewindSearchMultiLaneTests: XCTestCase {
         let sessionStart = Date(timeIntervalSince1970: 1_700_000_000)
         let frameTime = sessionStart.addingTimeInterval(10)
 
-        let id = try await RewindDatabase.shared.insertScreenshot(Screenshot(
+        try await RewindDatabase.shared.insertScreenshot(Screenshot(
             timestamp: frameTime,
             appName: "Zoom",
             windowTitle: "Standup",
             imagePath: "",
             ocrText: nil,
             isIndexed: true
-        )).id!
+        ))
+        let id: Int64 = try await dbQueue.read { db in
+            try Int64.fetchOne(
+                db,
+                sql: "SELECT id FROM screenshots WHERE timestamp = ?",
+                arguments: [frameTime]
+            ) ?? 0
+        }
+        XCTAssertNotEqual(id, 0)
 
         let sessionId = try await dbQueue.write { db -> Int64 in
             try db.execute(
