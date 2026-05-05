@@ -747,6 +747,20 @@ actor RewindIndexer {
         return frames
     }
 
+    /// Cached DateFormatter for `parseChunkTimestamp`. `DateFormatter` is
+    /// expensive to construct, and rebuild loops over every on-disk chunk,
+    /// so we keep one instance pinned to a fixed POSIX locale to avoid
+    /// user-locale calendar drift on a fixed-format input. `nonisolated(unsafe)`
+    /// is safe here: `DateFormatter` is documented as thread-safe for
+    /// reads on macOS 10.9+, and we only ever read `.date(from:)` after
+    /// configuring it once at file-scope initialization.
+    nonisolated(unsafe) private static let chunkTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
     /// Parse timestamp from chunk filename + parent day directory.
     ///
     /// Authoritative on-disk layout (see `VideoChunkEncoder.generateChunkPath`):
@@ -778,12 +792,7 @@ actor RewindIndexer {
         guard ext == "mp4" || ext == "hevc" else { return nil }
         guard timeStr.count == 6, timeStr.allSatisfy({ $0.isNumber }) else { return nil }
 
-        let formatter = DateFormatter()
-        // Match the encoder's formatter (no timezone/locale overrides — interprets
-        // wall-clock components in the device's current calendar/timezone, which
-        // is what the encoder used when it wrote the path).
-        formatter.dateFormat = "yyyy-MM-dd HHmmss"
-        return formatter.date(from: "\(yyyy)-\(mm)-\(dd) \(timeStr)")
+        return chunkTimestampFormatter.date(from: "\(yyyy)-\(mm)-\(dd) \(timeStr)")
     }
 
     /// Get frame count from video file using AVFoundation

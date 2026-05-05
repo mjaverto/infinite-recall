@@ -38,7 +38,7 @@ Rewind is a visual timeline of your screen activity. Scrub through screenshots c
 
 Every approximately one second, the app uses macOS `ScreenCaptureKit` to capture the visible window at up to 3000×3000 px. Frames are not written individually as JPEGs; instead they are appended to a rolling H.265 fragmented-MP4 chunk by `VideoChunkEncoder` at ~1 fps. Each chunk caps at 60 seconds and is then finalized to disk under:
 
-```
+```text
 ~/Library/Application Support/Omi/users/{userId}/Videos/YYYY-MM-DD/chunk_HHmmss.mp4
 ```
 

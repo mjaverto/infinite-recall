@@ -2695,9 +2695,11 @@ actor RewindDatabase {
                 )
                 """)
 
-            // Backfill with any segments that already exist.
+            // Backfill with any segments that already exist. INSERT OR IGNORE
+            // keeps the migration idempotent if a partial backfill ever ran
+            // (e.g. via manual intervention or a future migration replay).
             try db.execute(sql: """
-                INSERT INTO transcription_segments_fts(rowid, text)
+                INSERT OR IGNORE INTO transcription_segments_fts(rowid, text)
                 SELECT id, text FROM transcription_segments
                 """)
 
@@ -3388,6 +3390,9 @@ actor RewindDatabase {
             var matchedIds = Set<Int64>()
 
             // Lane 1: OCR / appName / windowTitle (existing behavior).
+            // ORDER BY timestamp DESC ensures that when the lane has more
+            // than `limit` matches, we keep the newest ones — recency is
+            // the merge key for the final union.
             do {
                 var sql = """
                     SELECT screenshots.id FROM screenshots
@@ -3395,7 +3400,7 @@ actor RewindDatabase {
                     WHERE screenshots_fts MATCH ?
                     """
                 sql += filterSQL
-                sql += " LIMIT ?"
+                sql += " ORDER BY screenshots.timestamp DESC LIMIT ?"
                 var args: [DatabaseValueConvertible] = [expandedQuery]
                 args.append(contentsOf: filterArgs)
                 args.append(limit)
@@ -3414,7 +3419,7 @@ actor RewindDatabase {
                     WHERE visual_activity_fts MATCH ?
                     """
                 sql += filterSQL
-                sql += " LIMIT ?"
+                sql += " ORDER BY screenshots.timestamp DESC LIMIT ?"
                 var args: [DatabaseValueConvertible] = [expandedQuery]
                 args.append(contentsOf: filterArgs)
                 args.append(limit)
@@ -3427,25 +3432,33 @@ actor RewindDatabase {
             // [session.startedAt + segment.startTime, session.startedAt + segment.endTime];
             // we surface every screenshot whose timestamp falls inside that
             // window (with a small ±1s pad so frames captured near the
-            // boundary still match). `unixepoch(s.startedAt)` is used so the
-            // arithmetic works regardless of how GRDB stores the column.
+            // boundary still match). The session is joined directly (no
+            // correlated subquery), and the date arithmetic is moved to the
+            // RHS via `datetime(..., 'unixepoch')` so SQLite can still use
+            // the index on `screenshots.timestamp`.
             do {
                 let pad = 1.0
+                // Join transcription_sessions / transcription_segments by their
+                // FK; the screenshots table is joined-by-time via the BETWEEN
+                // clause. The date-arithmetic has been moved to the right-hand
+                // side via `datetime(..., 'unixepoch')` so SQLite can use the
+                // `screenshots.timestamp` index instead of full-scanning.
+                //
+                // NOTE: the FTS5 table is referenced unaliased — FTS5 expects
+                // the MATCH operator's LHS to name the virtual table itself,
+                // not a SELECT-alias.
                 var sql = """
-                    SELECT screenshots.id FROM screenshots
-                    JOIN transcription_segments seg
-                      ON unixepoch(screenshots.timestamp)
-                         BETWEEN unixepoch(
-                             (SELECT s.startedAt FROM transcription_sessions s WHERE s.id = seg.sessionId)
-                         ) + seg.startTime - ?
-                         AND unixepoch(
-                             (SELECT s.startedAt FROM transcription_sessions s WHERE s.id = seg.sessionId)
-                         ) + seg.endTime + ?
-                    JOIN transcription_segments_fts ON seg.id = transcription_segments_fts.rowid
+                    SELECT screenshots.id FROM transcription_segments_fts
+                    JOIN transcription_segments seg ON seg.id = transcription_segments_fts.rowid
+                    JOIN transcription_sessions s ON s.id = seg.sessionId
+                    JOIN screenshots
+                      ON screenshots.timestamp BETWEEN
+                          datetime(unixepoch(s.startedAt) + seg.startTime - ?, 'unixepoch')
+                          AND datetime(unixepoch(s.startedAt) + seg.endTime + ?, 'unixepoch')
                     WHERE transcription_segments_fts MATCH ?
                     """
                 sql += filterSQL
-                sql += " LIMIT ?"
+                sql += " ORDER BY screenshots.timestamp DESC LIMIT ?"
                 var args: [DatabaseValueConvertible] = [pad, pad, expandedQuery]
                 args.append(contentsOf: filterArgs)
                 args.append(limit)

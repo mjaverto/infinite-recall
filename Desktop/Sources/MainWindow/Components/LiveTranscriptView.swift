@@ -86,7 +86,16 @@ struct HistoricalTranscriptPanel: View {
                 )
             }
         }
-        .task(id: frameTimestamp) { await reload() }
+        .task(id: frameTimestamp) {
+            // Clear previous content before each refetch so a slow query
+            // can't leave stale segments visible (and tappable) while the
+            // user is scrubbing through frames.
+            await MainActor.run {
+                didLoad = false
+                segments = []
+            }
+            await reload()
+        }
     }
 
     private func reload() async {

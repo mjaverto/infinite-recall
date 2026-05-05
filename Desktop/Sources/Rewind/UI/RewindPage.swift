@@ -94,8 +94,14 @@ struct RewindPage: View {
     private var historicalTranscriptTimestamp: Date? {
         guard let selected = viewModel.selectedScreenshot else { return nil }
         let isLiveCapturing = appState?.isTranscribing == true
-        let isLatestLoaded = viewModel.screenshots.first?.id == selected.id
-        if isLiveCapturing && isLatestLoaded {
+        // `getScreenshotsSampled` returns rows in ascending order, so the
+        // newest loaded frame is `.last`, not `.first`. Combine with an
+        // isToday check so the newest frame on a *previous* day (still
+        // historical) doesn't get mistaken for the live frame whenever
+        // capture happens to be active.
+        let isLatestLoaded = viewModel.screenshots.last?.id == selected.id
+        let isToday = Calendar.current.isDateInToday(selected.timestamp)
+        if isLiveCapturing && isToday && isLatestLoaded {
             return nil
         }
         return selected.timestamp
