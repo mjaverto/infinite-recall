@@ -68,12 +68,9 @@ pub struct QueueDepth {
     pub failed: u32,
 }
 
-/// Body for `POST /v1/activity/_internal/queue-depth`. Matches frozen
-/// interface I1; the entire `depths` map replaces the previous state.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QueueDepthUpdate {
-    pub depths: HashMap<String, QueueDepth>,
-}
+// Issue #137: `QueueDepthUpdate` (the body type for the legacy
+// `_internal/queue-depth` POST) was pruned. Activity snapshots are
+// DB-authoritative; no Swift producer ever pushed to the route.
 
 fn is_missing_pending_work_table_error(error: &RusqliteError) -> bool {
     matches!(
@@ -319,18 +316,10 @@ pub async fn inflight(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /v1/activity/_internal/queue-depth` — legacy Swift → Rust loopback.
-///
-/// Activity snapshots are now DB-authoritative and do not read this payload.
-/// Keep accepting the old route as a compatibility no-op so older Swift builds
-/// do not fail their internal reporter while users upgrade both processes.
-pub async fn internal_queue_depth(
-    State(_state): State<AppState>,
-    Json(body): Json<QueueDepthUpdate>,
-) -> StatusCode {
-    let _ = body.depths.len();
-    StatusCode::NO_CONTENT
-}
+// Issue #137: `internal_queue_depth` handler pruned. Activity snapshots are
+// DB-authoritative (see `pending_work_depths_by_kind` above) and no Swift
+// build ever produces this POST in the IR app — Swift's
+// `InternalPostFailureTracker` no longer carries a `queue-depth` category.
 
 /// `POST /v1/activity/_internal/gate-state` — Swift → Rust loopback.
 ///

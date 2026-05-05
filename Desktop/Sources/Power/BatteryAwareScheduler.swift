@@ -295,7 +295,8 @@ public final class BatteryAwareScheduler: ObservableObject {
     self.lastAutonomousAllow = self.allowAutonomousAIWork
 
     // Queue depth is read from `pending_work` by Activity snapshots; no
-    // Swift→Rust queue-depth bridge is needed here.
+    // Swift→Rust queue-depth bridge exists. Issue #137: the legacy
+    // `_internal/queue-depth` route + tracker category were pruned.
   }
 
   /// Stop watching for transitions. Mainly for tests.
@@ -589,14 +590,13 @@ public final class BatteryAwareScheduler: ObservableObject {
   }
 
   /// Returns true for kinds gated by `allowAutonomousAIWork`.
-  /// Currently: `.summarize`. Future autonomous-LLM kinds should be added here.
+  /// Currently: `.summarize` and `.extractKG`. Issue #134: delegates to
+  /// `WorkKind.requiresAutonomousReadiness` so the Activity-page banner
+  /// (`ActivityPage.swift`) and the scheduler's drain loop cannot drift
+  /// — the doc paragraph at `docs/features/activity.md` "What runs on AC
+  /// vs. idle+AC" is anchored by the `WorkKind` extension.
   fileprivate static func requiresAutonomousReadiness(_ kind: PendingWork.Kind) -> Bool {
-    switch kind {
-    case .summarize, .extractKG:
-      return true
-    case .transcribe, .ocr, .extractMemory, .extractActionItems:
-      return false
-    }
+    toWireWorkKind(kind)?.requiresAutonomousReadiness ?? true
   }
 
   /// Map the scheduler's local `PendingWork.Kind` to the wire-level

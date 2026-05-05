@@ -103,6 +103,12 @@ pub enum ThermalState {
 /// `GateState::Blocked` — the `Allowed` variant doesn't carry one,
 /// because "we're allowed to drain" doesn't have a sub-reason
 /// (issue #35: collapse `{allowed: bool, reason: enum}` into a sum).
+///
+/// Issue #128: `ManualPause` was pruned. There is no whole-pipeline pause
+/// in IR — pausing is per-kind or per-capture (`CapturePauseGate` +
+/// `paused_until` on the row, NOT the gate state). The wire variant had
+/// no Swift producer and the corresponding banner / `disablesRunNowOverride`
+/// branches were dead code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockReason {
@@ -114,8 +120,6 @@ pub enum BlockReason {
     Thermal,
     /// Screen locked / session inactive.
     Locked,
-    /// User manually paused via the Activity tab.
-    ManualPause,
     /// Initial state before the first gate-state report from Swift
     /// arrives. Should only be observed during the brief boot window
     /// (~3s — one `ProcessingGateReporter` poll cycle). External POSTs
@@ -245,7 +249,7 @@ pub struct ResourceSample {
 /// Snapshot of the idle/processing gate at sample time.
 ///
 /// Issue #35: was a `{allowed: bool, reason: enum, waiting_for: Option<String>}`
-/// struct that permitted illegal states like `{allowed: true, reason: ManualPause}`
+/// struct that permitted illegal states like `{allowed: true, reason: Locked}`
 /// or `Blocked` with no `waiting_for`. Now a sum type — each variant carries
 /// exactly the data that's meaningful for it.
 ///
@@ -437,12 +441,12 @@ mod tests {
 
     #[test]
     fn block_reason_every_variant_round_trips() {
+        // Issue #128: `ManualPause` pruned — see `BlockReason` docstring.
         for (r, wire) in [
             (BlockReason::DeviceActive, "device_active"),
             (BlockReason::OnBattery, "on_battery"),
             (BlockReason::Thermal, "thermal"),
             (BlockReason::Locked, "locked"),
-            (BlockReason::ManualPause, "manual_pause"),
             (BlockReason::Initializing, "initializing"),
         ] {
             assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{wire}\""));

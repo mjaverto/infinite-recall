@@ -25,7 +25,7 @@ extension BlockReason {
     /// masked by battery state.
     var outranksOnBattery: Bool {
         switch self {
-        case .thermal, .locked, .deviceActive, .manualPause: return true
+        case .thermal, .locked, .deviceActive: return true
         case .onBattery, .initializing: return false
         }
     }
@@ -37,7 +37,7 @@ extension BlockReason {
     /// pressure (`ProcessingGateReporter.swift:120`).
     var disablesRunNowOverride: Bool {
         switch self {
-        case .thermal, .locked, .manualPause: return true
+        case .thermal, .locked: return true
         case .deviceActive, .onBattery, .initializing: return false
         }
     }
@@ -107,6 +107,28 @@ private let activityCorrectedGateLog = Logger(
     subsystem: "me.omi.desktop",
     category: "ActivityCorrectedGate"
 )
+
+/// Issue #134: true when at least one lightweight (non-autonomous) work
+/// kind has queued or in-flight rows. The `BatteryAwareScheduler` drains
+/// these on AC even when `Blocked(.deviceActive)` (only `.summarize` and
+/// `.extractKG` need user-idle), so the banner must not say "Waiting for
+/// idle" while transcribe / OCR / extractMemory / extractActionItems are
+/// actively running. Pure helper; tests live in
+/// `Desktop/Tests/ActivityPagePowerGateTests.swift`.
+///
+/// CodeRabbit (PR #149): a paused lightweight kind still has `queued > 0`
+/// but the scheduler will stop at the per-kind pause gate, so the banner
+/// must NOT flip to "Idle processing — running" on the strength of those
+/// queued rows alone. In-flight work always counts (the row is already
+/// running); queued rows count only when not currently paused.
+func activityLightweightWorkActive(kinds: [KindRow], now: Date = Date()) -> Bool {
+    kinds.contains { row in
+        guard row.kind.requiresAutonomousReadiness == false else { return false }
+        if row.inFlight != nil { return true }
+        let isPaused = (row.pausedUntil ?? .distantPast) > now
+        return !isPaused && row.queued > 0
+    }
+}
 
 func activityShouldShowRunNowButton(
     snapshotGate: GateState?,
@@ -405,7 +427,7 @@ struct ActivityPage: View {
     // MARK: - Banner
 
     private var gateBanner: some View {
-        let info = bannerInfo(for: gate, queued: totalQueued)
+        let info = bannerInfo(for: gate, queued: totalQueued, kinds: kinds)
         return HStack(alignment: .top, spacing: 12) {
             Image(systemName: info.icon)
                 .scaledFont(size: 20)
@@ -477,7 +499,11 @@ struct ActivityPage: View {
         let color: Color
     }
 
-    private func bannerInfo(for gate: GateState?, queued: UInt32) -> BannerInfo {
+    private func bannerInfo(
+        for gate: GateState?,
+        queued: UInt32,
+        kinds: [KindRow]
+    ) -> BannerInfo {
         guard let gate = gate else {
             return BannerInfo(
                 icon: "ellipsis.circle",
@@ -506,18 +532,38 @@ struct ActivityPage: View {
                 color: OmiColors.textSecondary
             )
         case .blocked(let reason, _, let waitingFor):
-            return blockedBannerInfo(reason: reason, waitingFor: waitingFor, queued: queued)
+            return blockedBannerInfo(
+                reason: reason,
+                waitingFor: waitingFor,
+                queued: queued,
+                kinds: kinds
+            )
         }
     }
 
     private func blockedBannerInfo(
         reason: BlockReason,
         waitingFor: WaitCondition,
-        queued: UInt32
+        queued: UInt32,
+        kinds: [KindRow]
     ) -> BannerInfo {
         let detail = waitingForDescription(waitingFor)
         switch reason {
         case .deviceActive:
+            // Issue #134: only `.summarize` / `.extractKG` actually wait for
+            // idle; lightweight kinds (transcribe / OCR / extractMemory /
+            // extractActionItems) drain on AC even while typing. If any
+            // lightweight row has queued or in-flight work, the banner must
+            // reflect that the queue is actively draining instead of
+            // contradicting the In-flight section with "Waiting for idle".
+            if activityLightweightWorkActive(kinds: kinds) {
+                return BannerInfo(
+                    icon: "checkmark.circle.fill",
+                    title: "Idle processing — running",
+                    detail: "\(queued) item\(queued == 1 ? "" : "s") in queue. Heavy work waits for \(detail).",
+                    color: OmiColors.success
+                )
+            }
             return BannerInfo(
                 icon: "keyboard.fill",
                 title: "Waiting for idle — \(queued) item\(queued == 1 ? "" : "s") queued",
@@ -558,13 +604,6 @@ struct ActivityPage: View {
                 title: "Screen locked — \(queued) item\(queued == 1 ? "" : "s") queued",
                 detail: detail,
                 color: OmiColors.warning
-            )
-        case .manualPause:
-            return BannerInfo(
-                icon: "pause.circle.fill",
-                title: "Manually paused",
-                detail: detail,
-                color: OmiColors.error
             )
         case .initializing:
             // Issue #32: with the Swift→Rust gate-state bridge live, the
@@ -1122,7 +1161,6 @@ struct ActivityPage: View {
             return "Waiting for AC power."
         case .thermal:      return "Waiting for thermal cooldown."
         case .locked:       return "Resumes when you unlock."
-        case .manualPause:  return "Manually paused."
         case .initializing: return "Reading idle / power / thermal state."
         }
     }

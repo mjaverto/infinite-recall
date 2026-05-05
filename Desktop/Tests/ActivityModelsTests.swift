@@ -308,12 +308,13 @@ final class ActivityModelsTests: XCTestCase {
         // before the first `ProcessingGateReporter` POST arrives — it MUST
         // decode + encode like every other variant so the UI can render an
         // honest "initializing" banner.
+        // Issue #128: `manual_pause` pruned — no Swift producer ever
+        // emitted `Blocked(.manualPause, ...)`. See `BlockReason` docstring.
         let cases: [(String, BlockReason)] = [
             ("device_active", .deviceActive),
             ("on_battery",    .onBattery),
             ("thermal",       .thermal),
             ("locked",        .locked),
-            ("manual_pause",  .manualPause),
             ("initializing",  .initializing),
         ]
         for (wire, expected) in cases {

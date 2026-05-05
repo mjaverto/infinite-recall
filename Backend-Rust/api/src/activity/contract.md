@@ -111,7 +111,7 @@ so the field is silently absent when the daemon doesn't know the kind.
 
 `GateState` is an internally-tagged sum on the `state` field. The pre-#35
 flat shape (`{allowed: bool, reason: enum, waiting_for: string?}`) is gone:
-it permitted illegal combinations like `{allowed: true, reason: "manual_pause"}`
+it permitted illegal combinations like `{allowed: true, reason: "locked"}`
 and a stringly-typed `waiting_for`.
 
 ```json
@@ -148,7 +148,7 @@ and a stringly-typed `waiting_for`.
 | `ResourceSample.thermal_state` / `ThermalState` | `nominal`, `fair`, `serious`, `critical` |
 | `ProcessBreakdown.kind` / `ProcessKind` (optional) | `core`, `local_model`, `unknown` (field omitted when daemon doesn't classify; both Rust and Swift decoders fold any future wire value into `unknown` for forward-compat) |
 | `GateState` (variant tag on `state`) | `allowed`, `blocked` |
-| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `manual_pause`, `initializing` |
+| `GateState.reason` / `BlockReason` (only when `state="blocked"`) | `device_active`, `on_battery`, `thermal`, `locked`, `initializing` (issue #128: `manual_pause` pruned — no producer existed) |
 
 ### `PauseRequest` / `ResumeRequest`
 

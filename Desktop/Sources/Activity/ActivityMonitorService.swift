@@ -179,9 +179,11 @@ public final class ActivityMonitorService: ObservableObject, InternalPostFailure
         await fetchOnce()
     }
 
-    /// Surface a banner when `_internal/*` POSTs (inflight, queue-depth,
-    /// gate-state) have failed `consecutive` times in a row. Routed through
+    /// Surface a banner when `_internal/*` POSTs (inflight, gate-state) have
+    /// failed `consecutive` times in a row. Routed through
     /// `InternalPostFailureTracker` so duplicate counters don't drift.
+    /// (Issue #137: queue-depth was pruned — Activity snapshots are now
+    /// DB-authoritative via `snapshotWithAuthoritativeQueueDepth`.)
     func reportInternalPostFailure(category: String, consecutive: Int) {
         lastError = "Internal reporting failing: \(category) (\(consecutive) consecutive failures)"
     }

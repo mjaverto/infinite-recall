@@ -51,10 +51,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/activity/pause", post(activity::pause))
         .route("/v1/activity/resume", post(activity::resume))
         .route("/v1/activity/_internal/inflight", post(activity::inflight))
-        .route(
-            "/v1/activity/_internal/queue-depth",
-            post(activity::internal_queue_depth),
-        )
+        // Issue #137: `_internal/queue-depth` route pruned — Activity
+        // snapshots are DB-authoritative; no Swift producer exists.
         // === /activity:A ===
         // === activity:32 ===
         // Swift→Rust loopback for the processing gate (issue #32).
