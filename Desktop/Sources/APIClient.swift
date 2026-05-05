@@ -1490,6 +1490,35 @@ extension APIClient {
       windowTitle: windowTitle,
       headline: headline
     )
+    // Infinite Recall fork: in local-only mode the cloud /v3/memories endpoint
+    // is unreachable, and the generic post() short-circuit can't synthesize a
+    // non-optional `id` for CreateMemoryResponse, so it would throw
+    // localOnlyMode and every Imports / Reader / Assistant caller would catch
+    // it and report `saved=0`. Instead, persist the memory to the local GRDB
+    // store (the same table MemoryAssistant already writes to via
+    // MemoryStorage.insertLocalMemory), then return a synthetic
+    // CreateMemoryResponse keyed off the local row id.
+    if isLocalOnlyMode {
+      let record = MemoryRecord(
+        backendSynced: false,
+        content: content,
+        category: category?.rawValue ?? "system",
+        manuallyAdded: source == nil && sourceApp == nil,
+        source: source,
+        confidence: confidence,
+        reasoning: reasoning,
+        sourceApp: sourceApp,
+        windowTitle: windowTitle,
+        contextSummary: contextSummary,
+        currentActivity: currentActivity,
+        headline: headline
+      )
+      var withTags = record
+      withTags.setTags(tags)
+      let inserted = try await MemoryStorage.shared.insertLocalMemory(withTags)
+      let localID = inserted.id.map { "local-\($0)" } ?? "local-\(UUID().uuidString)"
+      return CreateMemoryResponse(id: localID, message: "Saved locally")
+    }
     return try await post("v3/memories", body: body)
   }
 
