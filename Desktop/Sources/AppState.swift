@@ -2067,6 +2067,24 @@ class AppState: ObservableObject {
     isLoadingConversations = true
     conversationsError = nil
 
+    // Compute the date-filter window from `selectedDateFilter` once so both
+    // the conversations query and the count query see the same bounds.
+    // Calendar.startOfDay returns the beginning of the user's local day; the
+    // upper bound is the start of the next day, giving a half-open range
+    // [startOfDay, startOfNextDay) that the SQL filter compares against
+    // `startedAt`. (Issue #138)
+    let filterStartDate: Date?
+    let filterEndDate: Date?
+    if let filterDate = selectedDateFilter {
+      let calendar = Calendar.current
+      let start = calendar.startOfDay(for: filterDate)
+      filterStartDate = start
+      filterEndDate = calendar.date(byAdding: .day, value: 1, to: start)
+    } else {
+      filterStartDate = nil
+      filterEndDate = nil
+    }
+
     // Step 1: Load from local cache first (instant display)
     // Use timeout to avoid blocking UI if database is initializing (e.g. recovery)
     do {
@@ -2077,7 +2095,9 @@ class AppState: ObservableObject {
             limit: 50,
             starredOnly: self.showStarredOnly,
             folderId: self.selectedFolderId,
-            discardedOnly: self.showDiscardedOnly
+            discardedOnly: self.showDiscardedOnly,
+            startDate: filterStartDate,
+            endDate: filterEndDate
           )
         }
         group.addTask {
@@ -2089,60 +2109,65 @@ class AppState: ObservableObject {
         return result
       }
 
-      if !cachedConversations.isEmpty {
-        conversations = cachedConversations
-        log("Conversations: Loaded \(cachedConversations.count) from local cache (instant)")
+      // Always commit the local-cache result — even when empty — so that
+      // applying a filter that excludes every row clears the previous list
+      // state instead of leaving stale rows on screen. (Issues #138, #142)
+      conversations = cachedConversations
+      log("Conversations: Loaded \(cachedConversations.count) from local cache (instant)")
 
-        // Batch-fetch first-segment text per session for inline preview.
-        // Only need this for `local-N` ids (no overview yet); rows backed by
-        // a real backendId still benefit if their structured.overview is
-        // empty. Either way this is one SQL pass for the visible page.
-        let sessionIds: [Int64] = cachedConversations.compactMap { conv in
-          guard conv.id.hasPrefix("local-"),
-            let n = Int64(conv.id.dropFirst("local-".count))
-          else { return nil }
-          return n
-        }
-        if !sessionIds.isEmpty {
-          do {
-            let textsBySessionId = try await TranscriptionStorage.shared.getFirstSegmentTexts(
-              sessionIds: sessionIds)
-            var previews: [String: String] = [:]
-            for (sid, text) in textsBySessionId {
-              let preview = String(text.prefix(120))
-              previews["local-\(sid)"] = preview
-            }
-            conversationPreviews = previews
-          } catch {
-            logError("Conversations: Failed to load previews", error: error)
-          }
-        }
-
-        // Get local count (matches the active filter so the header total
-        // reflects what the user is currently looking at).
-        let localCount = try await TranscriptionStorage.shared.getLocalConversationsCount(
-          starredOnly: showStarredOnly,
-          discardedOnly: showDiscardedOnly)
-        totalConversationsCount = localCount
-
-        // Passive "(N hidden)" hint: count discarded rows separately so the
-        // Conversations header can offer a way to reach them via the chip.
-        // When the chip is ON the primary count above already counts the
-        // discarded rows, so skip the redundant query.
-        if !showDiscardedOnly {
-          do {
-            discardedConversationsCount = try await TranscriptionStorage.shared
-              .getLocalConversationsCount(discardedOnly: true)
-          } catch {
-            logError("Conversations: Failed to load discarded count", error: error)
-          }
-        }
-
-        // Stop loading state so UI shows cached data immediately
-        isLoadingConversations = false
-        // Notify sidebar immediately so loading indicator clears with cached data
-        NotificationCenter.default.post(name: .conversationsPageDidLoad, object: nil)
+      // Batch-fetch first-segment text per session for inline preview.
+      // Only need this for `local-N` ids (no overview yet); rows backed by
+      // a real backendId still benefit if their structured.overview is
+      // empty. Either way this is one SQL pass for the visible page.
+      let sessionIds: [Int64] = cachedConversations.compactMap { conv in
+        guard conv.id.hasPrefix("local-"),
+          let n = Int64(conv.id.dropFirst("local-".count))
+        else { return nil }
+        return n
       }
+      if !sessionIds.isEmpty {
+        do {
+          let textsBySessionId = try await TranscriptionStorage.shared.getFirstSegmentTexts(
+            sessionIds: sessionIds)
+          var previews: [String: String] = [:]
+          for (sid, text) in textsBySessionId {
+            let preview = String(text.prefix(120))
+            previews["local-\(sid)"] = preview
+          }
+          conversationPreviews = previews
+        } catch {
+          logError("Conversations: Failed to load previews", error: error)
+        }
+      } else {
+        conversationPreviews = [:]
+      }
+
+      // Get local count (matches the active filter so the header total
+      // reflects what the user is currently looking at).
+      let localCount = try await TranscriptionStorage.shared.getLocalConversationsCount(
+        starredOnly: showStarredOnly,
+        discardedOnly: showDiscardedOnly,
+        startDate: filterStartDate,
+        endDate: filterEndDate)
+      totalConversationsCount = localCount
+
+      // Passive "(N hidden)" hint: count discarded rows separately so the
+      // Conversations header can offer a way to reach them via the chip.
+      // When the chip is ON the primary count above already counts the
+      // discarded rows, so skip the redundant query.
+      if !showDiscardedOnly {
+        do {
+          discardedConversationsCount = try await TranscriptionStorage.shared
+            .getLocalConversationsCount(discardedOnly: true)
+        } catch {
+          logError("Conversations: Failed to load discarded count", error: error)
+        }
+      }
+
+      // Stop loading state so UI shows cached data immediately
+      isLoadingConversations = false
+      // Notify sidebar immediately so loading indicator clears with cached data
+      NotificationCenter.default.post(name: .conversationsPageDidLoad, object: nil)
     } catch {
       log("Conversations: Local cache unavailable, falling back to API")
       // Continue to API fetch even if local fails

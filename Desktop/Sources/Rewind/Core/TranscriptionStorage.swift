@@ -1089,7 +1089,9 @@ actor TranscriptionStorage {
         starredOnly: Bool = false,
         folderId: String? = nil,
         includeDiscarded: Bool = false,
-        discardedOnly: Bool = false
+        discardedOnly: Bool = false,
+        startDate: Date? = nil,
+        endDate: Date? = nil
     ) async throws -> [ServerConversation] {
         let db = try await ensureInitialized()
 
@@ -1120,6 +1122,17 @@ actor TranscriptionStorage {
                 query = query.filter(Column("folderId") == folderId)
             }
 
+            // Local-first date filter (issue #138): the calendar chip writes to
+            // `selectedDateFilter` but the row was never re-read here — every
+            // date selection returned the same 50-row window. Caller passes a
+            // half-open [startDate, endDate) window computed from the picker.
+            if let startDate = startDate {
+                query = query.filter(Column("startedAt") >= startDate)
+            }
+            if let endDate = endDate {
+                query = query.filter(Column("startedAt") < endDate)
+            }
+
             let sessions = try query
                 .order(Column("startedAt").desc)
                 .limit(limit, offset: offset)
@@ -1138,7 +1151,9 @@ actor TranscriptionStorage {
     func getLocalConversationsCount(
         starredOnly: Bool = false,
         includeDiscarded: Bool = false,
-        discardedOnly: Bool = false
+        discardedOnly: Bool = false,
+        startDate: Date? = nil,
+        endDate: Date? = nil
     ) async throws -> Int {
         let db = try await ensureInitialized()
 
@@ -1157,6 +1172,13 @@ actor TranscriptionStorage {
 
             if starredOnly {
                 query = query.filter(Column("starred") == true)
+            }
+
+            if let startDate = startDate {
+                query = query.filter(Column("startedAt") >= startDate)
+            }
+            if let endDate = endDate {
+                query = query.filter(Column("startedAt") < endDate)
             }
 
             return try query.fetchCount(database)
