@@ -1297,6 +1297,7 @@ struct ImportConnectorSheet: View {
     let onDismiss: () -> Void
 
     @StateObject private var model = ImportConnectorSheetModel()
+    @State private var showDisconnectConfirmation = false
 
     private var snapshot: ImportConnectorStatusStore.Snapshot {
         statusStore.snapshot(for: connector)
@@ -1356,6 +1357,10 @@ struct ImportConnectorSheet: View {
     /// stale onboarding paste counts. `local-files` is excluded because the
     /// on-device index is the data itself, not a connection that can be
     /// "forgotten" without separately wiping the index.
+    ///
+    /// Disconnect is destructive (it wipes UserDefaults state and the Apple
+    /// Notes folder grant), so it goes through a confirmation alert to
+    /// prevent accidental clicks.
     @ViewBuilder
     private var disconnectSection: some View {
         let hasState =
@@ -1364,10 +1369,21 @@ struct ImportConnectorSheet: View {
             || snapshot.secondaryText != nil
         if hasState && connector.id != "local-files" {
             Button("Disconnect \(connector.title)") {
-                statusStore.clear(connectorID: connector.id)
+                showDisconnectConfirmation = true
             }
             .buttonStyle(OnboardingCardButtonStyle(isPrimary: false))
             .disabled(model.isRunning)
+            .alert(
+                "Disconnect \(connector.title)?",
+                isPresented: $showDisconnectConfirmation
+            ) {
+                Button("Disconnect", role: .destructive) {
+                    statusStore.clear(connectorID: connector.id)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This clears the saved connection state for \(connector.title). Memories already imported from this source are kept; you can prune them from the Memories page if you want.")
+            }
         }
     }
 

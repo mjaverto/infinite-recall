@@ -1502,7 +1502,7 @@ extension APIClient {
       let record = MemoryRecord(
         backendSynced: false,
         content: content,
-        category: category?.rawValue ?? "system",
+        category: category?.rawValue ?? MemoryCategory.system.rawValue,
         manuallyAdded: source == nil && sourceApp == nil,
         source: source,
         confidence: confidence,
