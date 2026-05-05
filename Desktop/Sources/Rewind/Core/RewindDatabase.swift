@@ -2680,6 +2680,54 @@ actor RewindDatabase {
             }
         }
 
+        // Migration: full-text-search index over transcription_segments.text so
+        // Rewind search can match phrases that only occur in spoken transcript
+        // (issue #119). External-content FTS5 with triggers keeps storage flat
+        // and stays in sync with `transcription_segments`. The index is
+        // populated on first migration with whatever rows already exist.
+        migrator.registerMigration("createTranscriptionSegmentsFTS") { db in
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE IF NOT EXISTS transcription_segments_fts USING fts5(
+                    text,
+                    content='transcription_segments',
+                    content_rowid='id',
+                    tokenize='unicode61'
+                )
+                """)
+
+            // Backfill with any segments that already exist.
+            try db.execute(sql: """
+                INSERT INTO transcription_segments_fts(rowid, text)
+                SELECT id, text FROM transcription_segments
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS transcription_segments_ai
+                AFTER INSERT ON transcription_segments BEGIN
+                    INSERT INTO transcription_segments_fts(rowid, text)
+                    VALUES (new.id, new.text);
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS transcription_segments_ad
+                AFTER DELETE ON transcription_segments BEGIN
+                    INSERT INTO transcription_segments_fts(transcription_segments_fts, rowid, text)
+                    VALUES ('delete', old.id, old.text);
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER IF NOT EXISTS transcription_segments_au
+                AFTER UPDATE ON transcription_segments BEGIN
+                    INSERT INTO transcription_segments_fts(transcription_segments_fts, rowid, text)
+                    VALUES ('delete', old.id, old.text);
+                    INSERT INTO transcription_segments_fts(rowid, text)
+                    VALUES (new.id, new.text);
+                END
+                """)
+        }
+
         try migrator.migrate(queue)
     }
 
@@ -3311,35 +3359,122 @@ actor RewindDatabase {
         }
 
         return try dbQueue.read { db in
-            var sql = """
-                SELECT screenshots.* FROM screenshots
-                JOIN screenshots_fts ON screenshots.id = screenshots_fts.rowid
-                WHERE screenshots_fts MATCH ?
-                """
-            var arguments: [DatabaseValueConvertible] = [expandedQuery]
+            // Issue #119: search is supposed to span OCR/title/app text,
+            // vision-model summaries (visual_activity_fts), and spoken
+            // transcript text (transcription_segments_fts). We collect
+            // matching screenshot ids from each lane, then return the
+            // unioned screenshots ordered by timestamp DESC. BM25 ranking
+            // across heterogeneous FTS tables isn't comparable, so we use
+            // recency as the merge key — same as the existing OCR + vector
+            // merge in `RewindViewModel.performSearch`.
 
-            // App filter (exact match, separate from FTS)
+            // Build the optional filter clause shared by all three lanes.
+            // Lane queries reference `screenshots.<col>` on the joined table.
+            var filterSQL = ""
+            var filterArgs: [DatabaseValueConvertible] = []
             if let app = appFilter {
-                sql += " AND screenshots.appName = ?"
-                arguments.append(app)
+                filterSQL += " AND screenshots.appName = ?"
+                filterArgs.append(app)
             }
-
-            // Time range filtering
             if let start = startDate {
-                sql += " AND screenshots.timestamp >= ?"
-                arguments.append(start)
+                filterSQL += " AND screenshots.timestamp >= ?"
+                filterArgs.append(start)
             }
-
             if let end = endDate {
-                sql += " AND screenshots.timestamp <= ?"
-                arguments.append(end)
+                filterSQL += " AND screenshots.timestamp <= ?"
+                filterArgs.append(end)
             }
 
-            // Order by relevance (BM25) then by timestamp
-            sql += " ORDER BY bm25(screenshots_fts) ASC, screenshots.timestamp DESC LIMIT ?"
-            arguments.append(limit)
+            var matchedIds = Set<Int64>()
 
-            return try Screenshot.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+            // Lane 1: OCR / appName / windowTitle (existing behavior).
+            do {
+                var sql = """
+                    SELECT screenshots.id FROM screenshots
+                    JOIN screenshots_fts ON screenshots.id = screenshots_fts.rowid
+                    WHERE screenshots_fts MATCH ?
+                    """
+                sql += filterSQL
+                sql += " LIMIT ?"
+                var args: [DatabaseValueConvertible] = [expandedQuery]
+                args.append(contentsOf: filterArgs)
+                args.append(limit)
+                let ids = try Int64.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                matchedIds.formUnion(ids)
+            }
+
+            // Lane 2: vision-model summary / uiState / OCR snapshot via
+            // visual_activity_fts. The FTS table has existed since migration
+            // #createVisualActivityFTS but no production search path used it.
+            do {
+                var sql = """
+                    SELECT screenshots.id FROM screenshots
+                    JOIN visual_activity ON visual_activity.screenshotId = screenshots.id
+                    JOIN visual_activity_fts ON visual_activity.id = visual_activity_fts.rowid
+                    WHERE visual_activity_fts MATCH ?
+                    """
+                sql += filterSQL
+                sql += " LIMIT ?"
+                var args: [DatabaseValueConvertible] = [expandedQuery]
+                args.append(contentsOf: filterArgs)
+                args.append(limit)
+                let ids = try Int64.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                matchedIds.formUnion(ids)
+            }
+
+            // Lane 3: spoken transcript via transcription_segments_fts. Each
+            // matching segment maps to an absolute time window
+            // [session.startedAt + segment.startTime, session.startedAt + segment.endTime];
+            // we surface every screenshot whose timestamp falls inside that
+            // window (with a small ±1s pad so frames captured near the
+            // boundary still match). `unixepoch(s.startedAt)` is used so the
+            // arithmetic works regardless of how GRDB stores the column.
+            do {
+                let pad = 1.0
+                var sql = """
+                    SELECT screenshots.id FROM screenshots
+                    JOIN transcription_segments seg
+                      ON unixepoch(screenshots.timestamp)
+                         BETWEEN unixepoch(
+                             (SELECT s.startedAt FROM transcription_sessions s WHERE s.id = seg.sessionId)
+                         ) + seg.startTime - ?
+                         AND unixepoch(
+                             (SELECT s.startedAt FROM transcription_sessions s WHERE s.id = seg.sessionId)
+                         ) + seg.endTime + ?
+                    JOIN transcription_segments_fts ON seg.id = transcription_segments_fts.rowid
+                    WHERE transcription_segments_fts MATCH ?
+                    """
+                sql += filterSQL
+                sql += " LIMIT ?"
+                var args: [DatabaseValueConvertible] = [pad, pad, expandedQuery]
+                args.append(contentsOf: filterArgs)
+                args.append(limit)
+                // Transcript FTS is best-effort: a missing/old DB without the
+                // table or a bad MATCH expression should not poison the
+                // OCR + visual lanes.
+                if let ids = try? Int64.fetchAll(db, sql: sql, arguments: StatementArguments(args)) {
+                    matchedIds.formUnion(ids)
+                }
+            }
+
+            guard !matchedIds.isEmpty else { return [] }
+
+            // Resolve to Screenshot rows ordered by recency, capped at `limit`.
+            let idList = Array(matchedIds)
+            let placeholders = Array(repeating: "?", count: idList.count).joined(separator: ",")
+            var resolveArgs: [DatabaseValueConvertible] = idList
+            resolveArgs.append(limit)
+            let resolveSQL = """
+                SELECT * FROM screenshots
+                WHERE id IN (\(placeholders))
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """
+            return try Screenshot.fetchAll(
+                db,
+                sql: resolveSQL,
+                arguments: StatementArguments(resolveArgs)
+            )
         }
     }
 
