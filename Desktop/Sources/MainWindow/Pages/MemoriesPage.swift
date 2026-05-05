@@ -690,15 +690,55 @@ class MemoriesViewModel: ObservableObject {
   }
 
   func createMemory() async {
-    guard !newMemoryText.isEmpty else { return }
+    let trimmed = newMemoryText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
 
+    // Local-first: persist to SQLite first so the memory survives even when
+    // the backend is unreachable (the documented dev/local-only mode). The
+    // API call becomes a best-effort sync. Mirrors the auto-extraction flow
+    // in `MemoryAssistant.saveMemoryToSQLite` -> `syncMemoryToBackend`.
+    let record = MemoryRecord(
+      backendSynced: false,
+      content: trimmed,
+      category: "manual",
+      manuallyAdded: true,
+      source: "desktop"
+    )
+
+    let inserted: MemoryRecord
     do {
-      _ = try await APIClient.shared.createMemory(content: newMemoryText)
-      showingAddMemory = false
-      newMemoryText = ""
-      await loadMemories()
+      inserted = try await MemoryStorage.shared.insertLocalMemory(record)
     } catch {
-      logError("Failed to create memory", error: error)
+      // Local insert failed — surface to the user instead of silently
+      // swallowing. Keep the sheet open so they can retry.
+      logError("Failed to create memory locally", error: error)
+      errorMessage = "Couldn't save memory: \(error.localizedDescription)"
+      return
+    }
+
+    // Local insert succeeded — dismiss sheet, show in list immediately.
+    showingAddMemory = false
+    newMemoryText = ""
+    if let serverMemory = inserted.toServerMemory() {
+      memories.insert(serverMemory, at: 0)
+      memories.sort { $0.createdAt > $1.createdAt }
+    } else {
+      // Fallback: refresh the list from cache.
+      await loadMemories()
+    }
+
+    // Best-effort sync to backend in the background. If it succeeds we
+    // record the backendId so future fetches don't create duplicates.
+    if let recordId = inserted.id {
+      Task.detached(priority: .utility) {
+        do {
+          let response = try await APIClient.shared.createMemory(content: trimmed)
+          try await MemoryStorage.shared.markSynced(id: recordId, backendId: response.id)
+        } catch {
+          // Local-only mode: API may be stubbed/unreachable. Log and move on.
+          logError("Manual memory: backend sync failed (will stay local)", error: error)
+        }
+      }
     }
   }
 
