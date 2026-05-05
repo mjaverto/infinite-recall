@@ -567,11 +567,25 @@ struct ConversationDetailView: View {
         isUpdatingTitle = true
         defer { isUpdatingTitle = false }
 
+        // Local-first (issue #141): the detail-view rename had no SQLite path,
+        // so even when the API succeeded the title would be re-overwritten by
+        // the next local cache load. Persist to SQLite first; treat the API
+        // call as best-effort (no-op in local-only mode).
         do {
-            try await APIClient.shared.updateConversationTitle(id: conversation.id, title: editedTitle)
+            try await TranscriptionStorage.shared.updateTitleByBackendId(
+                conversation.id, title: editedTitle)
             onTitleUpdated?(editedTitle)
         } catch {
-            logError("Failed to update title", error: error)
+            logError("Failed to persist title locally", error: error)
+            return
+        }
+
+        do {
+            try await APIClient.shared.updateConversationTitle(id: conversation.id, title: editedTitle)
+        } catch {
+            if !isLocalOnlyError(error) {
+                logError("Failed to update title remotely", error: error)
+            }
         }
     }
 
