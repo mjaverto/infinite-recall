@@ -798,17 +798,18 @@ struct ConversationsPage: View {
 
     do {
       let ids = Array(selectedConversationIds)
-      let response = try await APIClient.shared.mergeConversations(ids: ids)
+      // Local-first (issue #140): perform the merge against on-device SQLite.
+      // Re-parents segments / audio_chunks / speaker_embeddings onto the
+      // earliest source, soft-deletes the others, and clears the target's
+      // title/overview so the LLM enrichment pipeline regenerates a fresh
+      // combined summary.
+      let mergedBackendId = try await TranscriptionStorage.shared
+        .mergeConversationsLocally(sourceBackendIds: ids)
+      log("Merge completed locally; target=\(mergedBackendId)")
 
-      log("Merge completed: \(response.message)")
-
-      // Show warning if there was one
-      if let warning = response.warning {
-        log("Merge warning: \(warning)")
-      }
-
-      // Refresh conversations to show the merged one
-      await appState.refreshConversations()
+      // Reload conversations from local cache so the merged row replaces
+      // the originals in the list.
+      await appState.loadConversations()
 
       // Exit multi-select mode
       withAnimation(.easeInOut(duration: 0.2)) {

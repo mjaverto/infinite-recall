@@ -1248,4 +1248,136 @@ actor TranscriptionStorage {
             return ids.compactMap { byId[$0]?.toServerConversation(segments: []) }
         }
     }
+
+    // MARK: - Local Merge
+
+    /// Locally merge multiple conversations into a single target session (issue #140).
+    ///
+    /// Picks the earliest `startedAt` row in `sourceBackendIds` as the target,
+    /// re-parents all `transcription_segments`, `audio_chunks`
+    /// (`transcriptionSessionId`), and `speaker_embeddings` rows from the
+    /// other sources onto the target, then soft-deletes the sources. Title
+    /// and overview are cleared so the LLM-enrichment pipeline can regenerate
+    /// a fresh combined summary.
+    ///
+    /// All work runs in a single GRDB write transaction so a failure leaves
+    /// the on-disk state untouched.
+    ///
+    /// - Returns: the backendId of the merged target session (caller can refresh).
+    @discardableResult
+    func mergeConversationsLocally(sourceBackendIds: [String]) async throws -> String {
+        guard sourceBackendIds.count >= 2 else {
+            throw TranscriptionStorageError.invalidState("Need at least 2 conversations to merge")
+        }
+
+        let db = try await ensureInitialized()
+
+        return try await db.write { database -> String in
+            // Resolve backendIds -> session rows. Ignore any backendIds that
+            // don't resolve (already-deleted, stale UI selection).
+            let sessions = try TranscriptionSessionRecord
+                .filter(sourceBackendIds.contains(Column("backendId")))
+                .filter(Column("deleted") == false)
+                .fetchAll(database)
+            guard sessions.count >= 2 else {
+                throw TranscriptionStorageError.invalidState("Fewer than 2 valid sessions to merge")
+            }
+
+            // Pick the earliest-started session as the merge target.
+            let sorted = sessions.sorted { $0.startedAt < $1.startedAt }
+            guard var target = sorted.first, let targetId = target.id else {
+                throw TranscriptionStorageError.invalidState("Target session has no id")
+            }
+            let sourceIds: [Int64] = sorted.dropFirst().compactMap { $0.id }
+            guard !sourceIds.isEmpty else {
+                throw TranscriptionStorageError.invalidState("No source sessions resolved")
+            }
+
+            // Build the IN-clause once.
+            let placeholders = sourceIds.map { _ in "?" }.joined(separator: ", ")
+            let args = StatementArguments([targetId] + sourceIds)
+
+            // Re-parent transcription_segments. The merged session's segment
+            // ordering follows source-session start time then original
+            // segmentOrder; we renumber after re-parent so the detail view
+            // renders the combined transcript in chronological order.
+            try database.execute(
+                sql: "UPDATE transcription_segments SET sessionId = ? WHERE sessionId IN (\(placeholders))",
+                arguments: args
+            )
+
+            // Renumber segmentOrder across the unioned set so the merged view
+            // shows segments in (sessionStartedAt, originalOrder) order.
+            // Because GRDB doesn't expose ROW_NUMBER cleanly across all SQLite
+            // builds we ship, we do it in Swift: fetch ids in the desired
+            // order, then write them back with sequential `segmentOrder`.
+            let allSessionIds: [Int64] = [targetId] + sourceIds
+            let allArgs = StatementArguments(allSessionIds)
+            let allPlaceholders = allSessionIds.map { _ in "?" }.joined(separator: ", ")
+            // Use the original session start time to order across the merged set.
+            // After re-parenting above all sessionIds are == targetId, so we can't
+            // recover original start order from the row itself. We already reset
+            // sessionId; segmentOrder is the only remaining ordering hint, so
+            // dedupe-renumber by (startTime, segmentOrder).
+            // Re-fetch in the desired order and renumber.
+            let segmentRows = try Row.fetchAll(
+                database,
+                sql: """
+                    SELECT id FROM transcription_segments
+                     WHERE sessionId IN (\(allPlaceholders))
+                     ORDER BY startTime ASC, segmentOrder ASC, id ASC
+                    """,
+                arguments: allArgs
+            )
+            for (idx, row) in segmentRows.enumerated() {
+                guard let sid: Int64 = row["id"] else { continue }
+                try database.execute(
+                    sql: "UPDATE transcription_segments SET segmentOrder = ? WHERE id = ?",
+                    arguments: [idx, sid]
+                )
+            }
+
+            // Re-parent always-on audio_chunks (transcriptionSessionId).
+            try database.execute(
+                sql: "UPDATE audio_chunks SET transcriptionSessionId = ? WHERE transcriptionSessionId IN (\(placeholders))",
+                arguments: args
+            )
+
+            // Re-parent speaker_embeddings (sessionId).
+            try database.execute(
+                sql: "UPDATE speaker_embeddings SET sessionId = ? WHERE sessionId IN (\(placeholders))",
+                arguments: args
+            )
+
+            // Sum durations onto the target. We treat finishedAt as the merged
+            // session's last finishedAt across the set so the duration math in
+            // the detail view stays in range.
+            let latestFinishedAt = sorted.compactMap { $0.finishedAt }.max()
+
+            // Mark sources as soft-deleted so they disappear from the list but
+            // don't break any persisted FK references.
+            try database.execute(
+                sql: "UPDATE transcription_sessions SET deleted = 1, updatedAt = ? WHERE id IN (\(placeholders))",
+                arguments: StatementArguments([Date()] + sourceIds)
+            )
+
+            // Reset target metadata so a fresh enrichment pass picks up the
+            // newly combined transcript and rewrites title/overview/etc.
+            target.title = nil
+            target.overview = nil
+            target.emoji = nil
+            target.category = nil
+            target.actionItemsJson = nil
+            target.eventsJson = nil
+            target.summaryState = "unavailable"
+            if let finished = latestFinishedAt {
+                target.finishedAt = finished
+            }
+            target.updatedAt = Date()
+            try target.update(database)
+
+            log("TranscriptionStorage: Merged \(sourceIds.count) source sessions into target \(targetId)")
+            return target.backendId ?? "local-\(targetId)"
+        }
+    }
 }
