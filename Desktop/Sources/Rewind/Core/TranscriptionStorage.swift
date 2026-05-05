@@ -1152,6 +1152,7 @@ actor TranscriptionStorage {
         starredOnly: Bool = false,
         includeDiscarded: Bool = false,
         discardedOnly: Bool = false,
+        folderId: String? = nil,
         startDate: Date? = nil,
         endDate: Date? = nil
     ) async throws -> Int {
@@ -1172,6 +1173,13 @@ actor TranscriptionStorage {
 
             if starredOnly {
                 query = query.filter(Column("starred") == true)
+            }
+
+            // Folder filter must mirror `getLocalConversations` so the header
+            // count doesn't drift from the visible list when a folder chip is
+            // active. (CodeRabbit feedback on PR #147)
+            if let folderId = folderId {
+                query = query.filter(Column("folderId") == folderId)
             }
 
             if let startDate = startDate {
@@ -1297,40 +1305,43 @@ actor TranscriptionStorage {
             let placeholders = sourceIds.map { _ in "?" }.joined(separator: ", ")
             let args = StatementArguments([targetId] + sourceIds)
 
-            // Re-parent transcription_segments. The merged session's segment
-            // ordering follows source-session start time then original
-            // segmentOrder; we renumber after re-parent so the detail view
-            // renders the combined transcript in chronological order.
+            // CodeRabbit feedback (PR #147): capture the cross-session
+            // chronology BEFORE re-parenting. Once every segment has
+            // `sessionId = targetId` we lose the per-session offset and
+            // can only sort by intra-session `startTime`, which resets near
+            // zero for each original recording — so a later conversation's
+            // segments would jump ahead of an earlier conversation's. Build
+            // the final ordering up front by joining each segment to its
+            // owning session's `startedAt`, sorting by
+            // (session.startedAt, segment.segmentOrder, segment.startTime, id),
+            // and use that to renumber after the UPDATE.
+            let allSessionIds: [Int64] = [targetId] + sourceIds
+            let allPlaceholders = allSessionIds.map { _ in "?" }.joined(separator: ", ")
+            let orderingRows = try Row.fetchAll(
+                database,
+                sql: """
+                    SELECT seg.id AS id
+                      FROM transcription_segments seg
+                      JOIN transcription_sessions sess ON sess.id = seg.sessionId
+                     WHERE seg.sessionId IN (\(allPlaceholders))
+                     ORDER BY sess.startedAt ASC,
+                              seg.segmentOrder ASC,
+                              seg.startTime ASC,
+                              seg.id ASC
+                    """,
+                arguments: StatementArguments(allSessionIds)
+            )
+            let orderedSegmentIds: [Int64] = orderingRows.compactMap { $0["id"] }
+
+            // Re-parent transcription_segments onto the target.
             try database.execute(
                 sql: "UPDATE transcription_segments SET sessionId = ? WHERE sessionId IN (\(placeholders))",
                 arguments: args
             )
 
-            // Renumber segmentOrder across the unioned set so the merged view
-            // shows segments in (sessionStartedAt, originalOrder) order.
-            // Because GRDB doesn't expose ROW_NUMBER cleanly across all SQLite
-            // builds we ship, we do it in Swift: fetch ids in the desired
-            // order, then write them back with sequential `segmentOrder`.
-            let allSessionIds: [Int64] = [targetId] + sourceIds
-            let allArgs = StatementArguments(allSessionIds)
-            let allPlaceholders = allSessionIds.map { _ in "?" }.joined(separator: ", ")
-            // Use the original session start time to order across the merged set.
-            // After re-parenting above all sessionIds are == targetId, so we can't
-            // recover original start order from the row itself. We already reset
-            // sessionId; segmentOrder is the only remaining ordering hint, so
-            // dedupe-renumber by (startTime, segmentOrder).
-            // Re-fetch in the desired order and renumber.
-            let segmentRows = try Row.fetchAll(
-                database,
-                sql: """
-                    SELECT id FROM transcription_segments
-                     WHERE sessionId IN (\(allPlaceholders))
-                     ORDER BY startTime ASC, segmentOrder ASC, id ASC
-                    """,
-                arguments: allArgs
-            )
-            for (idx, row) in segmentRows.enumerated() {
-                guard let sid: Int64 = row["id"] else { continue }
+            // Renumber using the pre-captured ordering so the merged
+            // transcript reads in true chronological order across sources.
+            for (idx, sid) in orderedSegmentIds.enumerated() {
                 try database.execute(
                     sql: "UPDATE transcription_segments SET segmentOrder = ? WHERE id = ?",
                     arguments: [idx, sid]

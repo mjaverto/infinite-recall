@@ -343,4 +343,80 @@ final class ConversationsClusterRegressionTests: XCTestCase {
         let visible = try fetchInDateWindow(queue, startDate: nil, endDate: nil)
         XCTAssertEqual(visible, [target])
     }
+
+    /// Cross-session chronology must be preserved during merge (CodeRabbit
+    /// feedback on PR #147). Prior to the fix, the renumber step ran AFTER
+    /// the re-parent UPDATE, so every segment had `sessionId = targetId` and
+    /// the only remaining ordering signal was per-session `startTime`, which
+    /// resets near zero for each recording. This let later sessions jump
+    /// ahead of earlier ones in the merged transcript.
+    ///
+    /// Regression: capture the ordering keys (session.startedAt, segmentOrder)
+    /// BEFORE the UPDATE and renumber from that pre-captured order.
+    func testMerge_PreservesCrossSessionChronology() throws {
+        let queue = try makeQueue()
+        let now = Date()
+        let earlier = now.addingTimeInterval(-3600)
+
+        let earlySess = try insertSession(queue, backendId: "local-1", startedAt: earlier)
+        let lateSess = try insertSession(queue, backendId: "local-2", startedAt: now)
+        // Each session's segments have intra-session startTime starting near 0.
+        // Without preserving session.startedAt, sorting by segment.startTime
+        // alone would interleave them by startTime, dropping cross-session
+        // chronology.
+        let earlySegA = try insertSegment(queue, sessionId: earlySess, text: "early-A", order: 0, startTime: 0)
+        let earlySegB = try insertSegment(queue, sessionId: earlySess, text: "early-B", order: 1, startTime: 5)
+        let lateSegA = try insertSegment(queue, sessionId: lateSess, text: "late-A", order: 0, startTime: 0)
+        let lateSegB = try insertSegment(queue, sessionId: lateSess, text: "late-B", order: 1, startTime: 5)
+
+        // Mirror production merge: capture ordering keys BEFORE re-parent,
+        // then renumber from that captured order.
+        let allSessionIds: [Int64] = [earlySess, lateSess]
+        let orderedIds: [Int64] = try queue.read { db in
+            try Int64.fetchAll(
+                db,
+                sql: """
+                    SELECT seg.id AS id
+                      FROM transcription_segments seg
+                      JOIN transcription_sessions sess ON sess.id = seg.sessionId
+                     WHERE seg.sessionId IN (?, ?)
+                     ORDER BY sess.startedAt ASC,
+                              seg.segmentOrder ASC,
+                              seg.startTime ASC,
+                              seg.id ASC
+                    """,
+                arguments: StatementArguments(allSessionIds)
+            )
+        }
+        XCTAssertEqual(
+            orderedIds,
+            [earlySegA, earlySegB, lateSegA, lateSegB],
+            "pre-capture must order by session.startedAt then segmentOrder"
+        )
+
+        try queue.write { db in
+            try db.execute(
+                sql: "UPDATE transcription_segments SET sessionId = ? WHERE sessionId IN (?)",
+                arguments: [earlySess, lateSess]
+            )
+            for (idx, sid) in orderedIds.enumerated() {
+                try db.execute(
+                    sql: "UPDATE transcription_segments SET segmentOrder = ? WHERE id = ?",
+                    arguments: [idx, sid]
+                )
+            }
+        }
+
+        let postOrder: [Int64] = try queue.read { db in
+            try Int64.fetchAll(
+                db,
+                sql: "SELECT id FROM transcription_segments ORDER BY segmentOrder ASC"
+            )
+        }
+        XCTAssertEqual(
+            postOrder,
+            [earlySegA, earlySegB, lateSegA, lateSegB],
+            "merged transcript must read earlier session in full before later session"
+        )
+    }
 }

@@ -811,6 +811,15 @@ struct ConversationsPage: View {
       // the originals in the list.
       await appState.loadConversations()
 
+      // CodeRabbit feedback (PR #147): when merging from search mode the
+      // page renders `searchResults` (not `appState.conversations`), so the
+      // main-list reload above isn't enough — the merged-away source rows
+      // would stay visible until the user retypes. Re-run the active search
+      // so its snapshot reflects the post-merge store.
+      if !searchQuery.isEmpty {
+        performSearch(query: searchDebouncer.debouncedQuery)
+      }
+
       // Exit multi-select mode
       withAnimation(.easeInOut(duration: 0.2)) {
         isMultiSelectMode = false

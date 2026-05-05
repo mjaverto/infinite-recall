@@ -2147,6 +2147,7 @@ class AppState: ObservableObject {
       let localCount = try await TranscriptionStorage.shared.getLocalConversationsCount(
         starredOnly: showStarredOnly,
         discardedOnly: showDiscardedOnly,
+        folderId: selectedFolderId,
         startDate: filterStartDate,
         endDate: filterEndDate)
       totalConversationsCount = localCount

@@ -209,6 +209,12 @@ struct ConversationRowView: View {
       await MainActor.run {
         appState.setConversationStarred(conversation.id, starred: newStarred)
       }
+      // CodeRabbit feedback (PR #147): when the user unstars a row while the
+      // Starred-only chip is active the row no longer matches the filter, so
+      // reload the list to drop it instead of leaving a stale entry on screen.
+      if !newStarred && appState.showStarredOnly {
+        await appState.loadConversations()
+      }
     } catch {
       log("Failed to persist starred status locally: \(error)")
       isStarring = false
