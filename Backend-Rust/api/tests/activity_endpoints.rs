@@ -990,12 +990,12 @@ async fn enum_round_trip_via_wire() {
 
     // Issue #35: `GateReason` is gone, replaced by `BlockReason` (only
     // the Blocked variant carries one — Allowed has no sub-reason).
+    // Issue #128: `ManualPause` pruned — see `BlockReason` docstring.
     for (reason, wire) in [
         (t::BlockReason::DeviceActive, "device_active"),
         (t::BlockReason::OnBattery, "on_battery"),
         (t::BlockReason::Thermal, "thermal"),
         (t::BlockReason::Locked, "locked"),
-        (t::BlockReason::ManualPause, "manual_pause"),
         (t::BlockReason::Initializing, "initializing"),
     ] {
         let s = serde_json::to_string(&reason).unwrap();

@@ -110,16 +110,22 @@ public enum ProcessKind: String, Codable, Hashable {
 }
 
 /// Issue #35: the pre-#35 `GateReason` (`idle/device_active/on_battery/
-/// thermal/locked/manual_pause/none/stub`) was a stringly-typed enum that
-/// existed alongside an `allowed: Bool` permitting illegal combos like
-/// `{allowed: true, reason: .manualPause}`. Replaced by `GateState`
-/// (sum type) + `BlockReason` (only meaningful when blocked).
+/// thermal/locked/none/stub`) was a stringly-typed enum that
+/// existed alongside an `allowed: Bool` permitting illegal combos.
+/// Replaced by `GateState` (sum type) + `BlockReason` (only meaningful
+/// when blocked).
+///
+/// Issue #128: the `manualPause` case was pruned. The doc lists seven gate
+/// states but no Swift code path ever produced `Blocked(.manualPause, ...)`
+/// — there is no "pause all processing" toggle, only per-kind/per-capture
+/// pauses (which flow through `CapturePauseGate` and the snapshot's
+/// `paused_until` field, not the gate state). The wire enum, banner copy,
+/// and `disablesRunNowOverride` predicate were dead branches.
 public enum BlockReason: String, Codable, Hashable, CaseIterable {
     case deviceActive = "device_active"
     case onBattery = "on_battery"
     case thermal
     case locked
-    case manualPause = "manual_pause"
     /// Initial state before the first gate-state report from Swift
     /// arrives. Should only be observed during the brief boot window
     /// (~3s — one `ProcessingGateReporter` poll cycle). External POSTs

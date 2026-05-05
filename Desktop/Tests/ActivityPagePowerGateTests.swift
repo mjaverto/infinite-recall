@@ -73,7 +73,9 @@ final class ActivityPagePowerGateTests: XCTestCase {
         let res = resources(onBattery: false, lowPower: true)
         let corrected = GateState.blocked(reason: .onBattery, since: now, waitingFor: .acPower)
 
-        for reason in [BlockReason.thermal, .locked, .manualPause] {
+        // Issue #128: `.manualPause` pruned (no producer existed). The
+        // remaining "Run now hidden" reasons are thermal + screen-locked.
+        for reason in [BlockReason.thermal, .locked] {
             let snapshotGate = GateState.blocked(
                 reason: reason,
                 since: now,

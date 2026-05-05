@@ -25,7 +25,7 @@ extension BlockReason {
     /// masked by battery state.
     var outranksOnBattery: Bool {
         switch self {
-        case .thermal, .locked, .deviceActive, .manualPause: return true
+        case .thermal, .locked, .deviceActive: return true
         case .onBattery, .initializing: return false
         }
     }
@@ -37,7 +37,7 @@ extension BlockReason {
     /// pressure (`ProcessingGateReporter.swift:120`).
     var disablesRunNowOverride: Bool {
         switch self {
-        case .thermal, .locked, .manualPause: return true
+        case .thermal, .locked: return true
         case .deviceActive, .onBattery, .initializing: return false
         }
     }
@@ -558,13 +558,6 @@ struct ActivityPage: View {
                 title: "Screen locked — \(queued) item\(queued == 1 ? "" : "s") queued",
                 detail: detail,
                 color: OmiColors.warning
-            )
-        case .manualPause:
-            return BannerInfo(
-                icon: "pause.circle.fill",
-                title: "Manually paused",
-                detail: detail,
-                color: OmiColors.error
             )
         case .initializing:
             // Issue #32: with the Swift→Rust gate-state bridge live, the
@@ -1122,7 +1115,6 @@ struct ActivityPage: View {
             return "Waiting for AC power."
         case .thermal:      return "Waiting for thermal cooldown."
         case .locked:       return "Resumes when you unlock."
-        case .manualPause:  return "Manually paused."
         case .initializing: return "Reading idle / power / thermal state."
         }
     }
