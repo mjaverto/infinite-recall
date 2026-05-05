@@ -722,6 +722,16 @@ class MemoriesViewModel: ObservableObject {
     if let serverMemory = inserted.toServerMemory() {
       memories.insert(serverMemory, at: 0)
       memories.sort { $0.createdAt > $1.createdAt }
+      // The `memories` array is the unfiltered source; when a search query or
+      // tag filter is active the visible list is sourced from `searchResults`
+      // / `filteredFromDatabase`, so the new memory wouldn't appear without
+      // re-running those queries.
+      if !searchText.isEmpty {
+        await performSearch()
+      }
+      if !selectedTags.isEmpty {
+        await loadFilteredMemoriesFromDatabase()
+      }
     } else {
       // Fallback: refresh the list from cache.
       await loadMemories()
@@ -729,10 +739,14 @@ class MemoriesViewModel: ObservableObject {
 
     // Best-effort sync to backend in the background. If it succeeds we
     // record the backendId so future fetches don't create duplicates.
+    // Pass `category: .manual` so the backend record matches the local one.
     if let recordId = inserted.id {
       Task.detached(priority: .utility) {
         do {
-          let response = try await APIClient.shared.createMemory(content: trimmed)
+          let response = try await APIClient.shared.createMemory(
+            content: trimmed,
+            category: .manual
+          )
           try await MemoryStorage.shared.markSynced(id: recordId, backendId: response.id)
         } catch {
           // Local-only mode: API may be stubbed/unreachable. Log and move on.
@@ -959,7 +973,13 @@ struct MemoriesPage: View {
         loadingView
       } else if let error = viewModel.errorMessage {
         errorView(error)
-      } else if viewModel.totalMemoriesCount == 0 && !viewModel.isInFilteredMode {
+      } else if viewModel.totalMemoriesCount == 0 && viewModel.memories.isEmpty
+        && !viewModel.isInFilteredMode
+      {
+        // Guard with `memories.isEmpty` too — `totalMemoriesCount` is
+        // refreshed asynchronously from `loadTagCountsFromDatabase`, so it
+        // can lag behind the cache load and otherwise flash the empty state
+        // for a frame after `memories` has actually arrived.
         emptyState
       } else if viewModel.filteredMemories.isEmpty {
         noResultsView
