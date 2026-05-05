@@ -1386,12 +1386,36 @@ class TasksStore: ObservableObject {
             incompleteTasks.insert(task, at: 0)
         }
 
-        // 3. Re-create on backend (hard-delete already removed it)
+        // 3. Re-create on backend (hard-delete already removed it).
+        //
+        // #127: Mirror createTask's full payload so undo doesn't silently
+        // strip source / category / tags / recurrenceRule / metadata.
+        // Without this, the next backend sync overwrites the local row with
+        // the skinny re-created copy and loses the user's metadata.
         do {
+            // Decode the existing metadata JSON back into a dictionary so it
+            // can be re-encoded by createActionItem. If the round-trip fails
+            // (malformed JSON, unexpected shape) fall back to reconstructing
+            // {tags: [...]} from the computed `tags` field so at least the
+            // tag list survives.
+            var metadataDict: [String: Any]? = nil
+            if let metadataJson = task.metadata,
+                let data = metadataJson.data(using: .utf8),
+                let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            {
+                metadataDict = parsed
+            } else if !task.tags.isEmpty {
+                metadataDict = ["tags": task.tags]
+            }
+
             let created = try await APIClient.shared.createActionItem(
                 description: task.description,
                 dueAt: task.dueAt,
-                priority: task.priority
+                source: task.source,
+                priority: task.priority,
+                category: task.category,
+                metadata: metadataDict,
+                recurrenceRule: task.recurrenceRule
             )
             // Update local record with new backend ID
             try await ActionItemStorage.shared.syncTaskActionItems([created])
