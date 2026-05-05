@@ -567,11 +567,25 @@ struct ConversationDetailView: View {
         isUpdatingTitle = true
         defer { isUpdatingTitle = false }
 
+        // Local-first (issue #141): the detail-view rename had no SQLite path,
+        // so even when the API succeeded the title would be re-overwritten by
+        // the next local cache load. Persist to SQLite first; treat the API
+        // call as best-effort (no-op in local-only mode).
         do {
-            try await APIClient.shared.updateConversationTitle(id: conversation.id, title: editedTitle)
+            try await TranscriptionStorage.shared.updateTitleByBackendId(
+                conversation.id, title: editedTitle)
             onTitleUpdated?(editedTitle)
         } catch {
-            logError("Failed to update title", error: error)
+            logError("Failed to persist title locally", error: error)
+            return
+        }
+
+        do {
+            try await APIClient.shared.updateConversationTitle(id: conversation.id, title: editedTitle)
+        } catch {
+            if !isLocalOnlyError(error) {
+                logError("Failed to update title remotely", error: error)
+            }
         }
     }
 
@@ -579,14 +593,28 @@ struct ConversationDetailView: View {
         isDeleting = true
         defer { isDeleting = false }
 
+        // Local-first: soft-delete in SQLite immediately so reload doesn't restore the row.
+        // Without this, `getLocalConversations` will re-surface the conversation on the
+        // next page revisit / app relaunch (the API delete is a no-op in local-only mode).
+        do {
+            try await TranscriptionStorage.shared.deleteByBackendId(conversation.id)
+        } catch {
+            log("Failed to soft-delete conversation locally: \(error)")
+        }
+
         do {
             try await APIClient.shared.deleteConversation(id: conversation.id)
-            await MainActor.run {
-                onDelete?()
-                onBack()
-            }
         } catch {
-            logError("Failed to delete conversation", error: error)
+            // localOnlyMode is expected here in the Infinite Recall fork; the SQLite
+            // soft-delete above is the source of truth. Surface only real failures.
+            if !isLocalOnlyError(error) {
+                logError("Failed to delete conversation", error: error)
+            }
+        }
+
+        await MainActor.run {
+            onDelete?()
+            onBack()
         }
     }
 

@@ -473,18 +473,19 @@ struct ConversationsPage: View {
 
     Task {
       do {
-        let result = try await APIClient.shared.searchConversations(
+        // Local-first (issue #139): the API path short-circuits to an empty
+        // result in local-only mode, so search the on-device SQLite store
+        // directly. Matches against title, overview, and segment text.
+        let results = try await TranscriptionStorage.shared.searchConversationsLocally(
           query: query,
-          page: 1,
-          perPage: 50,
+          limit: 50,
           includeDiscarded: false
         )
-        log("Search: Found \(result.items.count) results")
-        searchResults = result.items
+        log("Search: Found \(results.count) local results")
+        searchResults = results
         isSearching = false
       } catch {
         logError("Search: Failed", error: error)
-        // Infinite Recall fork: local-only mode — return empty result instead of throwing
         if !isLocalOnlyError(error) {
           searchError = error.localizedDescription
         }
@@ -797,17 +798,27 @@ struct ConversationsPage: View {
 
     do {
       let ids = Array(selectedConversationIds)
-      let response = try await APIClient.shared.mergeConversations(ids: ids)
+      // Local-first (issue #140): perform the merge against on-device SQLite.
+      // Re-parents segments / audio_chunks / speaker_embeddings onto the
+      // earliest source, soft-deletes the others, and clears the target's
+      // title/overview so the LLM enrichment pipeline regenerates a fresh
+      // combined summary.
+      let mergedBackendId = try await TranscriptionStorage.shared
+        .mergeConversationsLocally(sourceBackendIds: ids)
+      log("Merge completed locally; target=\(mergedBackendId)")
 
-      log("Merge completed: \(response.message)")
+      // Reload conversations from local cache so the merged row replaces
+      // the originals in the list.
+      await appState.loadConversations()
 
-      // Show warning if there was one
-      if let warning = response.warning {
-        log("Merge warning: \(warning)")
+      // CodeRabbit feedback (PR #147): when merging from search mode the
+      // page renders `searchResults` (not `appState.conversations`), so the
+      // main-list reload above isn't enough — the merged-away source rows
+      // would stay visible until the user retypes. Re-run the active search
+      // so its snapshot reflects the post-merge store.
+      if !searchQuery.isEmpty {
+        performSearch(query: searchDebouncer.debouncedQuery)
       }
-
-      // Refresh conversations to show the merged one
-      await appState.refreshConversations()
 
       // Exit multi-select mode
       withAnimation(.easeInOut(duration: 0.2)) {

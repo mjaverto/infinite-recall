@@ -199,18 +199,35 @@ struct ConversationRowView: View {
     isStarring = true
     let newStarred = !conversation.starred
 
+    // Local-first (issue #141): persist to SQLite FIRST. The API mutation
+    // throws `localOnlyMode` from `buildHeaders` before any HTTP call, which
+    // previously short-circuited the whole `do` block and left the star
+    // toggle silently reverting on every reload.
     do {
-      try await APIClient.shared.setConversationStarred(id: conversation.id, starred: newStarred)
-
-      // Sync to local SQLite cache so reload doesn't revert the change
       try await TranscriptionStorage.shared.updateStarredByBackendId(
         conversation.id, starred: newStarred)
-
       await MainActor.run {
         appState.setConversationStarred(conversation.id, starred: newStarred)
       }
+      // CodeRabbit feedback (PR #147): when the user unstars a row while the
+      // Starred-only chip is active the row no longer matches the filter, so
+      // reload the list to drop it instead of leaving a stale entry on screen.
+      if !newStarred && appState.showStarredOnly {
+        await appState.loadConversations()
+      }
     } catch {
-      log("Failed to update starred status: \(error)")
+      log("Failed to persist starred status locally: \(error)")
+      isStarring = false
+      return
+    }
+
+    // Best-effort remote sync (no-op in local-only mode).
+    do {
+      try await APIClient.shared.setConversationStarred(id: conversation.id, starred: newStarred)
+    } catch {
+      if !isLocalOnlyError(error) {
+        log("Failed to update starred status remotely: \(error)")
+      }
     }
 
     isStarring = false
@@ -281,19 +298,27 @@ struct ConversationRowView: View {
     guard !isUpdatingTitle, !editedTitle.isEmpty else { return }
     isUpdatingTitle = true
 
+    // Local-first (issue #141): persist to SQLite FIRST so the rename sticks
+    // even when the API mutation throws `localOnlyMode`.
     do {
-      try await APIClient.shared.updateConversationTitle(id: conversation.id, title: editedTitle)
-
-      // Sync to local SQLite cache so reload doesn't revert the change
       try await TranscriptionStorage.shared.updateTitleByBackendId(
         conversation.id, title: editedTitle)
-
       await MainActor.run {
         appState.updateConversationTitle(conversation.id, title: editedTitle)
       }
-      log("Updated conversation title to: \(editedTitle)")
+      log("Updated conversation title locally to: \(editedTitle)")
     } catch {
-      log("Failed to update title: \(error)")
+      log("Failed to persist title locally: \(error)")
+      isUpdatingTitle = false
+      return
+    }
+
+    do {
+      try await APIClient.shared.updateConversationTitle(id: conversation.id, title: editedTitle)
+    } catch {
+      if !isLocalOnlyError(error) {
+        log("Failed to update title remotely: \(error)")
+      }
     }
 
     isUpdatingTitle = false

@@ -21,6 +21,22 @@ struct ConversationListView: View {
 
   var appState: AppState
 
+  /// True when any filter chip is active (issue #142). Used to show a
+  /// "no matching conversations" panel instead of the brand-new-user empty
+  /// state when a filter excludes every row.
+  private var hasActiveFilter: Bool {
+    appState.showStarredOnly
+      || appState.selectedDateFilter != nil
+      || appState.selectedFolderId != nil
+      || appState.showDiscardedOnly
+  }
+
+  /// Caller-action that clears all chip filters at once. Wired through
+  /// `appState.clearFilters()`; rendered only when a filter is active.
+  private func clearFilters() {
+    Task { await appState.clearFilters() }
+  }
+
   private static let groupDateFormatter: DateFormatter = {
     let f = DateFormatter()
     f.dateFormat = "MMM d, yyyy"
@@ -97,7 +113,13 @@ struct ConversationListView: View {
       } else if let error = error, conversations.isEmpty {
         errorView(error)
       } else if conversations.isEmpty {
-        emptyView
+        // Issue #142: distinguish a genuinely empty store from a filter
+        // that happens to match nothing.
+        if hasActiveFilter {
+          noFilterResultsView
+        } else {
+          emptyView
+        }
       } else {
         conversationList
       }
@@ -163,6 +185,63 @@ struct ConversationListView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(32)
+  }
+
+  /// Shown when the store has rows but the active filter excludes all of
+  /// them (issue #142). Distinct from `emptyView` so the user knows the
+  /// list is filtered, not genuinely empty.
+  private var noFilterResultsView: some View {
+    VStack(spacing: 16) {
+      Image(systemName: "line.3.horizontal.decrease.circle")
+        .scaledFont(size: 48)
+        .foregroundColor(OmiColors.textTertiary)
+
+      Text("No matching conversations")
+        .scaledFont(size: 18, weight: .semibold)
+        .foregroundColor(OmiColors.textPrimary)
+
+      Text(activeFilterDescription)
+        .scaledFont(size: 14)
+        .foregroundColor(OmiColors.textTertiary)
+        .multilineTextAlignment(.center)
+
+      Button(action: clearFilters) {
+        Text("Clear filters")
+          .scaledFont(size: 13, weight: .medium)
+          .foregroundColor(OmiColors.textPrimary)
+          .padding(.horizontal, 16)
+          .padding(.vertical, 8)
+          .omiControlSurface(fill: OmiColors.userBubble, radius: OmiChrome.chipRadius)
+      }
+      .buttonStyle(.plain)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .padding(32)
+  }
+
+  /// Human-readable summary of the active filter chips for the no-results
+  /// panel. Reads `appState` rather than receiving the filter set as
+  /// parameters so the description stays in sync with `hasActiveFilter`.
+  private var activeFilterDescription: String {
+    var parts: [String] = []
+    if appState.showStarredOnly { parts.append("starred only") }
+    if appState.showDiscardedOnly { parts.append("discarded only") }
+    if let date = appState.selectedDateFilter {
+      let formatter = DateFormatter()
+      formatter.dateFormat = "MMM d, yyyy"
+      parts.append("on \(formatter.string(from: date))")
+    }
+    if let folderId = appState.selectedFolderId,
+       let folder = folders.first(where: { $0.id == folderId })
+    {
+      parts.append("in \"\(folder.name)\"")
+    } else if appState.selectedFolderId != nil {
+      parts.append("in selected folder")
+    }
+    if parts.isEmpty {
+      return "No conversations match the current filters."
+    }
+    return "No conversations match: " + parts.joined(separator: ", ") + "."
   }
 
   private var conversationListContent: some View {

@@ -1089,7 +1089,9 @@ actor TranscriptionStorage {
         starredOnly: Bool = false,
         folderId: String? = nil,
         includeDiscarded: Bool = false,
-        discardedOnly: Bool = false
+        discardedOnly: Bool = false,
+        startDate: Date? = nil,
+        endDate: Date? = nil
     ) async throws -> [ServerConversation] {
         let db = try await ensureInitialized()
 
@@ -1120,6 +1122,17 @@ actor TranscriptionStorage {
                 query = query.filter(Column("folderId") == folderId)
             }
 
+            // Local-first date filter (issue #138): the calendar chip writes to
+            // `selectedDateFilter` but the row was never re-read here — every
+            // date selection returned the same 50-row window. Caller passes a
+            // half-open [startDate, endDate) window computed from the picker.
+            if let startDate = startDate {
+                query = query.filter(Column("startedAt") >= startDate)
+            }
+            if let endDate = endDate {
+                query = query.filter(Column("startedAt") < endDate)
+            }
+
             let sessions = try query
                 .order(Column("startedAt").desc)
                 .limit(limit, offset: offset)
@@ -1138,7 +1151,10 @@ actor TranscriptionStorage {
     func getLocalConversationsCount(
         starredOnly: Bool = false,
         includeDiscarded: Bool = false,
-        discardedOnly: Bool = false
+        discardedOnly: Bool = false,
+        folderId: String? = nil,
+        startDate: Date? = nil,
+        endDate: Date? = nil
     ) async throws -> Int {
         let db = try await ensureInitialized()
 
@@ -1159,7 +1175,220 @@ actor TranscriptionStorage {
                 query = query.filter(Column("starred") == true)
             }
 
+            // Folder filter must mirror `getLocalConversations` so the header
+            // count doesn't drift from the visible list when a folder chip is
+            // active. (CodeRabbit feedback on PR #147)
+            if let folderId = folderId {
+                query = query.filter(Column("folderId") == folderId)
+            }
+
+            if let startDate = startDate {
+                query = query.filter(Column("startedAt") >= startDate)
+            }
+            if let endDate = endDate {
+                query = query.filter(Column("startedAt") < endDate)
+            }
+
             return try query.fetchCount(database)
+        }
+    }
+
+    // MARK: - Local Search
+
+    /// Search conversations against local SQLite storage (issue #139).
+    ///
+    /// Matches against the session's `title`, `overview`, and any segment text
+    /// in `transcription_segments`. Case-insensitive substring search via SQL
+    /// LIKE — sufficient for the single-user, on-device dataset and avoids
+    /// adding an FTS5 mirror to the migration chain. Returns sessions sorted
+    /// by `startedAt` desc with a single de-dup pass so a session that matches
+    /// in both the title and a segment only appears once.
+    func searchConversationsLocally(
+        query: String,
+        limit: Int = 50,
+        includeDiscarded: Bool = false
+    ) async throws -> [ServerConversation] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let db = try await ensureInitialized()
+
+        // Escape SQL LIKE wildcards so a literal `%foo` doesn't behave magically.
+        let escaped = trimmed
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let pattern = "%\(escaped)%"
+
+        let discardedClause = includeDiscarded ? "" : "AND s.discarded = 0"
+
+        return try await db.read { database -> [ServerConversation] in
+            let sql = """
+                SELECT DISTINCT s.id
+                  FROM transcription_sessions s
+                  LEFT JOIN transcription_segments seg ON seg.sessionId = s.id
+                 WHERE s.deleted = 0
+                   \(discardedClause)
+                   AND (
+                        s.title    LIKE ? ESCAPE '\\'
+                     OR s.overview LIKE ? ESCAPE '\\'
+                     OR seg.text   LIKE ? ESCAPE '\\'
+                   )
+                 ORDER BY s.startedAt DESC
+                 LIMIT ?
+                """
+            let rows = try Row.fetchAll(
+                database,
+                sql: sql,
+                arguments: [pattern, pattern, pattern, limit]
+            )
+            let ids: [Int64] = rows.compactMap { $0["id"] }
+            guard !ids.isEmpty else { return [] }
+
+            // Fetch full session records preserving the ordering above.
+            let sessions = try TranscriptionSessionRecord
+                .filter(ids.contains(Column("id")))
+                .fetchAll(database)
+            let byId = Dictionary(uniqueKeysWithValues: sessions.compactMap { s -> (Int64, TranscriptionSessionRecord)? in
+                guard let sid = s.id else { return nil }
+                return (sid, s)
+            })
+            return ids.compactMap { byId[$0]?.toServerConversation(segments: []) }
+        }
+    }
+
+    // MARK: - Local Merge
+
+    /// Locally merge multiple conversations into a single target session (issue #140).
+    ///
+    /// Picks the earliest `startedAt` row in `sourceBackendIds` as the target,
+    /// re-parents all `transcription_segments`, `audio_chunks`
+    /// (`transcriptionSessionId`), and `speaker_embeddings` rows from the
+    /// other sources onto the target, then soft-deletes the sources. Title
+    /// and overview are cleared so the LLM-enrichment pipeline can regenerate
+    /// a fresh combined summary.
+    ///
+    /// All work runs in a single GRDB write transaction so a failure leaves
+    /// the on-disk state untouched.
+    ///
+    /// - Returns: the backendId of the merged target session (caller can refresh).
+    @discardableResult
+    func mergeConversationsLocally(sourceBackendIds: [String]) async throws -> String {
+        guard sourceBackendIds.count >= 2 else {
+            throw TranscriptionStorageError.invalidState("Need at least 2 conversations to merge")
+        }
+
+        let db = try await ensureInitialized()
+
+        return try await db.write { database -> String in
+            // Resolve backendIds -> session rows. Ignore any backendIds that
+            // don't resolve (already-deleted, stale UI selection).
+            let sessions = try TranscriptionSessionRecord
+                .filter(sourceBackendIds.contains(Column("backendId")))
+                .filter(Column("deleted") == false)
+                .fetchAll(database)
+            guard sessions.count >= 2 else {
+                throw TranscriptionStorageError.invalidState("Fewer than 2 valid sessions to merge")
+            }
+
+            // Pick the earliest-started session as the merge target.
+            let sorted = sessions.sorted { $0.startedAt < $1.startedAt }
+            guard var target = sorted.first, let targetId = target.id else {
+                throw TranscriptionStorageError.invalidState("Target session has no id")
+            }
+            let sourceIds: [Int64] = sorted.dropFirst().compactMap { $0.id }
+            guard !sourceIds.isEmpty else {
+                throw TranscriptionStorageError.invalidState("No source sessions resolved")
+            }
+
+            // Build the IN-clause once.
+            let placeholders = sourceIds.map { _ in "?" }.joined(separator: ", ")
+            let args = StatementArguments([targetId] + sourceIds)
+
+            // CodeRabbit feedback (PR #147): capture the cross-session
+            // chronology BEFORE re-parenting. Once every segment has
+            // `sessionId = targetId` we lose the per-session offset and
+            // can only sort by intra-session `startTime`, which resets near
+            // zero for each original recording — so a later conversation's
+            // segments would jump ahead of an earlier conversation's. Build
+            // the final ordering up front by joining each segment to its
+            // owning session's `startedAt`, sorting by
+            // (session.startedAt, segment.segmentOrder, segment.startTime, id),
+            // and use that to renumber after the UPDATE.
+            let allSessionIds: [Int64] = [targetId] + sourceIds
+            let allPlaceholders = allSessionIds.map { _ in "?" }.joined(separator: ", ")
+            let orderingRows = try Row.fetchAll(
+                database,
+                sql: """
+                    SELECT seg.id AS id
+                      FROM transcription_segments seg
+                      JOIN transcription_sessions sess ON sess.id = seg.sessionId
+                     WHERE seg.sessionId IN (\(allPlaceholders))
+                     ORDER BY sess.startedAt ASC,
+                              seg.segmentOrder ASC,
+                              seg.startTime ASC,
+                              seg.id ASC
+                    """,
+                arguments: StatementArguments(allSessionIds)
+            )
+            let orderedSegmentIds: [Int64] = orderingRows.compactMap { $0["id"] }
+
+            // Re-parent transcription_segments onto the target.
+            try database.execute(
+                sql: "UPDATE transcription_segments SET sessionId = ? WHERE sessionId IN (\(placeholders))",
+                arguments: args
+            )
+
+            // Renumber using the pre-captured ordering so the merged
+            // transcript reads in true chronological order across sources.
+            for (idx, sid) in orderedSegmentIds.enumerated() {
+                try database.execute(
+                    sql: "UPDATE transcription_segments SET segmentOrder = ? WHERE id = ?",
+                    arguments: [idx, sid]
+                )
+            }
+
+            // Re-parent always-on audio_chunks (transcriptionSessionId).
+            try database.execute(
+                sql: "UPDATE audio_chunks SET transcriptionSessionId = ? WHERE transcriptionSessionId IN (\(placeholders))",
+                arguments: args
+            )
+
+            // Re-parent speaker_embeddings (sessionId).
+            try database.execute(
+                sql: "UPDATE speaker_embeddings SET sessionId = ? WHERE sessionId IN (\(placeholders))",
+                arguments: args
+            )
+
+            // Sum durations onto the target. We treat finishedAt as the merged
+            // session's last finishedAt across the set so the duration math in
+            // the detail view stays in range.
+            let latestFinishedAt = sorted.compactMap { $0.finishedAt }.max()
+
+            // Mark sources as soft-deleted so they disappear from the list but
+            // don't break any persisted FK references.
+            try database.execute(
+                sql: "UPDATE transcription_sessions SET deleted = 1, updatedAt = ? WHERE id IN (\(placeholders))",
+                arguments: StatementArguments([Date()] + sourceIds)
+            )
+
+            // Reset target metadata so a fresh enrichment pass picks up the
+            // newly combined transcript and rewrites title/overview/etc.
+            target.title = nil
+            target.overview = nil
+            target.emoji = nil
+            target.category = nil
+            target.actionItemsJson = nil
+            target.eventsJson = nil
+            target.summaryState = "unavailable"
+            if let finished = latestFinishedAt {
+                target.finishedAt = finished
+            }
+            target.updatedAt = Date()
+            try target.update(database)
+
+            log("TranscriptionStorage: Merged \(sourceIds.count) source sessions into target \(targetId)")
+            return target.backendId ?? "local-\(targetId)"
         }
     }
 }
