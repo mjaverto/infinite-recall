@@ -196,11 +196,19 @@ class MemoryAssistantSettings {
         }
     }
 
-    /// Interval between memory extraction analyses in seconds
+    /// Interval between memory extraction analyses in seconds.
+    ///
+    /// Uses `object(forKey:)` rather than `double(forKey:)` so that an
+    /// explicitly persisted `0` (extract on every frame) is honored instead
+    /// of being collapsed into the missing-key case (#125). Negative values
+    /// are still treated as absent — the registered default applies.
     var extractionInterval: TimeInterval {
         get {
-            let value = UserDefaults.standard.double(forKey: extractionIntervalKey)
-            return value > 0 ? value : defaultExtractionInterval
+            guard let raw = UserDefaults.standard.object(forKey: extractionIntervalKey) as? NSNumber else {
+                return defaultExtractionInterval
+            }
+            let value = raw.doubleValue
+            return value >= 0 ? value : defaultExtractionInterval
         }
         set {
             UserDefaults.standard.set(newValue, forKey: extractionIntervalKey)
@@ -209,11 +217,19 @@ class MemoryAssistantSettings {
         }
     }
 
-    /// Minimum confidence threshold for reporting memories
+    /// Minimum confidence threshold for reporting memories.
+    ///
+    /// Uses `object(forKey:)` rather than `double(forKey:)` so that an
+    /// explicitly persisted `0` (accept any confidence) is honored instead
+    /// of being collapsed into the missing-key case (#125). Negative values
+    /// fall back to the registered default.
     var minConfidence: Double {
         get {
-            let value = UserDefaults.standard.double(forKey: minConfidenceKey)
-            return value > 0 ? value : defaultMinConfidence
+            guard let raw = UserDefaults.standard.object(forKey: minConfidenceKey) as? NSNumber else {
+                return defaultMinConfidence
+            }
+            let value = raw.doubleValue
+            return value >= 0 ? value : defaultMinConfidence
         }
         set {
             UserDefaults.standard.set(newValue, forKey: minConfidenceKey)
